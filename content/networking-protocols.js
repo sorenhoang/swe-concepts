@@ -162,3 +162,169 @@ $ dig +trace api.example.com    # walk root → TLD → authoritative yourself</
 
 <p><strong>Related:</strong> <a href="#load-balancing">Load Balancing</a> · <a href="#cdn">CDN</a> · <a href="#service-discovery">Service Discovery</a> · <a href="#failover">Failover</a> · <a href="#multi-region-deployment">Multi-Region Deployment</a></p>
 `;
+
+CONTENT["tcp-vs-udp"] = `
+<p class="tldr"><strong>TL;DR</strong>: TCP and UDP are the two main ways to send data between programs over IP. <strong>TCP</strong> is a phone call: you connect first, everything arrives complete and in order, and lost pieces are re-sent. <strong>UDP</strong> is a postcard: no connection, no confirmation, and no guarantee it arrives, but it's fast and simple.</p>
+
+<h2>The problem it solves</h2>
+<p>IP, the layer below, only moves individual <strong>packets</strong> from one machine to another, on a best-effort basis. Packets can be lost, duplicated, delayed, or arrive out of order, and IP doesn't care which <em>program</em> on the machine they're for.</p>
+<p>The transport layer adds <strong>ports</strong> (so the packet reaches the right process, e.g. <code>:443</code> for HTTPS) and then makes a choice:</p>
+<ul>
+  <li><strong>TCP</strong> builds a reliable, ordered <em>byte stream</em> on top of unreliable packets. Perfect when every byte matters: web pages, API calls, database queries, file transfers.</li>
+  <li><strong>UDP</strong> adds almost nothing: ports, a length, and a checksum. Each message (a <em>datagram</em>) is sent on its own. Perfect when speed matters more than completeness, or when the application wants to handle reliability itself.</li>
+</ul>
+
+<h2>How it works</h2>
+<p><strong>TCP</strong> starts with a <strong>3-way handshake</strong> (SYN → SYN-ACK → ACK) so both sides agree on starting sequence numbers. After that, every byte is numbered; the receiver acknowledges (ACKs) what it got, and the sender re-sends anything not acknowledged in time. Closing is its own exchange (FIN/ACK in each direction). <strong>UDP</strong> skips all of it: the first packet already carries data.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 430" role="img" aria-label="TCP: three-way handshake, data with acknowledgement, then connection close. UDP: datagrams sent without handshake, one is lost and never re-sent">
+  <defs><marker id="arr-tcp-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="185" y="22" text-anchor="middle" class="title">TCP</text>
+  <text x="605" y="22" text-anchor="middle" class="title">UDP</text>
+  <path class="line" d="M390 10 V420" style="stroke: var(--line)"/>
+
+  <rect class="box" x="20" y="34" width="100" height="36" rx="8"/><text x="70" y="57" text-anchor="middle">Client</text>
+  <rect class="box" x="250" y="34" width="100" height="36" rx="8"/><text x="300" y="57" text-anchor="middle">Server</text>
+  <path class="line dashed" d="M70 70 V420 M300 70 V420" style="stroke: var(--line)"/>
+  <text x="185" y="96" text-anchor="middle" class="small">SYN</text>
+  <path class="line accent" d="M70 102 H298" marker-end="url(#arr-tcp-1)"/>
+  <text x="185" y="130" text-anchor="middle" class="small">SYN-ACK</text>
+  <path class="line accent" d="M300 136 H72" marker-end="url(#arr-tcp-1)"/>
+  <text x="185" y="164" text-anchor="middle" class="small">ACK</text>
+  <path class="line accent" d="M70 170 H298" marker-end="url(#arr-tcp-1)"/>
+  <text x="185" y="190" text-anchor="middle" class="small">connected: 1 round trip spent</text>
+  <text x="185" y="222" text-anchor="middle">data (bytes 1–1460)</text>
+  <path class="line ok" d="M70 228 H298" marker-end="url(#arr-tcp-1)"/>
+  <text x="185" y="256" text-anchor="middle" class="small">ACK 1461 (got it)</text>
+  <path class="line dashed" d="M300 262 H72" marker-end="url(#arr-tcp-1)"/>
+  <text x="185" y="300" text-anchor="middle" class="small">FIN</text>
+  <path class="line" d="M70 306 H298" marker-end="url(#arr-tcp-1)"/>
+  <text x="185" y="334" text-anchor="middle" class="small">ACK, then FIN</text>
+  <path class="line" d="M300 340 H72" marker-end="url(#arr-tcp-1)"/>
+  <text x="185" y="368" text-anchor="middle" class="small">ACK</text>
+  <path class="line" d="M70 374 H298" marker-end="url(#arr-tcp-1)"/>
+  <text x="185" y="404" text-anchor="middle" class="small">client waits in TIME_WAIT before the port is reused</text>
+
+  <rect class="box" x="440" y="34" width="100" height="36" rx="8"/><text x="490" y="57" text-anchor="middle">Client</text>
+  <rect class="box" x="670" y="34" width="100" height="36" rx="8"/><text x="720" y="57" text-anchor="middle">Server</text>
+  <path class="line dashed" d="M490 70 V420 M720 70 V420" style="stroke: var(--line)"/>
+  <text x="605" y="96" text-anchor="middle">datagram 1</text>
+  <path class="line ok" d="M490 102 H718" marker-end="url(#arr-tcp-1)"/>
+  <text x="605" y="130" text-anchor="middle">datagram 2</text>
+  <path class="line ok" d="M490 136 H718" marker-end="url(#arr-tcp-1)"/>
+  <text x="545" y="164" text-anchor="middle">datagram 3</text>
+  <path class="line bad" d="M490 170 H600"/>
+  <text x="612" y="175" class="small">✗ lost</text>
+  <text x="605" y="198" text-anchor="middle">datagram 4</text>
+  <path class="line ok" d="M490 204 H718" marker-end="url(#arr-tcp-1)"/>
+  <rect class="box muted" x="450" y="250" width="310" height="96" rx="10"/>
+  <text x="605" y="276" text-anchor="middle">no handshake, data from packet one</text>
+  <text x="605" y="298" text-anchor="middle">no ACK, no retransmit, no ordering</text>
+  <text x="605" y="320" text-anchor="middle">nobody knows datagram 3 is gone</text>
+  <text x="605" y="338" text-anchor="middle" class="small">(unless the application checks itself)</text>
+</svg>
+<figcaption>TCP spends a round trip to connect and confirms delivery. UDP just sends; a lost datagram is simply gone.</figcaption>
+</figure>
+
+<h3>What TCP does for you after the handshake</h3>
+<ul>
+  <li><strong>Reliability</strong>: unacknowledged segments are re-sent after a timeout, or sooner after duplicate ACKs (fast retransmit).</li>
+  <li><strong>Ordering</strong>: sequence numbers let the receiver put segments back in order and drop duplicates before your app sees them.</li>
+  <li><strong>Flow control</strong>: the receiver advertises a <em>window</em> (how much it can buffer), so a fast sender can't overwhelm a slow reader.</li>
+  <li><strong>Congestion control</strong>: the sender starts slow (<em>slow start</em>) and backs off when packets are lost or delayed, so it doesn't overload the network. Linux defaults to the CUBIC algorithm; Google's BBR is a common alternative.</li>
+</ul>
+
+<h2>TCP vs UDP at a glance</h2>
+<table>
+  <tr><th></th><th>TCP</th><th>UDP</th></tr>
+  <tr><td>Connection</td><td>yes: handshake before data, explicit close</td><td>none: each datagram is independent</td></tr>
+  <tr><td>Delivery</td><td>guaranteed, or the connection reports an error</td><td>best effort: may be lost, duplicated, reordered</td></tr>
+  <tr><td>Ordering</td><td>in order</td><td>no guarantee</td></tr>
+  <tr><td>Data shape</td><td><strong>byte stream</strong>: no message boundaries</td><td><strong>messages</strong>: one send = one datagram</td></tr>
+  <tr><td>Flow / congestion control</td><td>built in</td><td>none (the app must behave)</td></tr>
+  <tr><td>Header size</td><td>20–60 bytes</td><td>8 bytes</td></tr>
+  <tr><td>Broadcast / multicast</td><td>no (one-to-one only)</td><td>yes</td></tr>
+  <tr><td>Typical uses</td><td>HTTP/1.1 and HTTP/2, databases, SSH, SMTP, gRPC</td><td>DNS queries, voice/video (WebRTC), games, metrics (StatsD), QUIC / HTTP/3</td></tr>
+</table>
+
+<h3>Which one should I use?</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Decision tree: if every byte must arrive in order, use TCP. Otherwise, if late data is worse than lost data, use plain UDP; if you need reliability without head-of-line blocking, use QUIC over UDP">
+  <path class="line" d="M330 61 L180 120 M450 61 L600 120 M560 166 L505 230 M640 166 L685 230"/>
+  <rect class="box accent" x="230" y="15" width="320" height="46" rx="10"/>
+  <text x="390" y="43" text-anchor="middle" class="title">Must every byte arrive, in order?</text>
+  <text x="246" y="84" text-anchor="end" class="small">yes</text>
+  <text x="545" y="84" class="small">no</text>
+  <rect class="box ok" x="30" y="120" width="300" height="64" rx="10"/>
+  <text x="180" y="146" text-anchor="middle" class="title">TCP</text>
+  <text x="180" y="166" text-anchor="middle" class="small">web/API traffic, databases, SSH, file transfer</text>
+  <rect class="box" x="450" y="120" width="300" height="46" rx="10"/>
+  <text x="600" y="148" text-anchor="middle" class="title">Is late data worse than lost data?</text>
+  <text x="512" y="204" text-anchor="end" class="small">yes</text>
+  <text x="678" y="200" class="small">no</text>
+  <rect class="box ok" x="420" y="230" width="170" height="60" rx="10"/>
+  <text x="505" y="255" text-anchor="middle" class="title">Plain UDP</text>
+  <text x="505" y="274" text-anchor="middle" class="small">voice, video, games</text>
+  <rect class="box ok" x="600" y="230" width="170" height="60" rx="10"/>
+  <text x="685" y="255" text-anchor="middle" class="title">QUIC (on UDP)</text>
+  <text x="685" y="274" text-anchor="middle" class="small">HTTP/3: reliable streams</text>
+</svg>
+<figcaption>In a video call, a 300 ms-old audio packet is useless, so re-sending it only causes stutter. QUIC rebuilds reliability on top of UDP to avoid TCP's head-of-line blocking (see <a href="#http-2-http-3">HTTP/2 &amp; HTTP/3</a>).</figcaption>
+</figure>
+
+<h2>Example</h2>
+<p><strong>TCP is a stream, so you must frame messages.</strong> One <code>write()</code> on the sender does <em>not</em> equal one <code>read()</code> on the receiver: TCP may split or merge your bytes. A common fix is a length prefix (gRPC and many database protocols do a version of this):</p>
+<pre><code>// TCP: send one message as [4-byte length][payload]
+Socket("orders.internal", 9000).use { socket -&gt;
+  val out = DataOutputStream(socket.getOutputStream())
+  val payload = """{"orderId":42}""".toByteArray()
+  out.writeInt(payload.size)
+  out.write(payload)
+  out.flush()
+
+  val input = DataInputStream(socket.getInputStream())
+  val reply = ByteArray(input.readInt())
+  input.readFully(reply)  // keeps reading until all bytes arrive; a single read() might not
+}</code></pre>
+
+<p><strong>UDP is fire-and-forget.</strong> StatsD metrics are a classic use: losing one CPU sample is fine, and the app never blocks on a slow metrics server.</p>
+<pre><code>// UDP: one send = one datagram, no connection, no confirmation
+DatagramSocket().use { socket -&gt;
+  val payload = "api.requests:1|c".toByteArray()
+  socket.send(DatagramPacket(payload, payload.size, InetAddress.getByName("statsd.internal"), 8125))
+}</code></pre>
+
+<p>Try both from a terminal (macOS/BSD <code>nc</code> syntax):</p>
+<pre><code>$ nc -l 9000              # TCP server
+$ nc localhost 9000       # TCP client: handshake happens, then type to send
+
+$ nc -u -l 9000           # UDP server
+$ nc -u localhost 9000    # UDP client: no connection, each line is a datagram
+
+$ ss -tan state time-wait | wc -l   # Linux: count sockets stuck in TIME_WAIT</code></pre>
+
+<p><strong>Real-world scenario: DNS uses both.</strong> A normal lookup is one small question and one small answer, so it goes over UDP port 53: no handshake, one round trip. If the answer is too big for a UDP response, the server sets the "truncated" flag and the resolver retries over TCP. Zone transfers between DNS servers always use TCP. Same service, two transports, each where it fits.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Forgetting TCP has no message boundaries.</strong> Code that assumes "one read = one message" works on localhost and breaks under real network conditions. Always frame (length prefix, delimiter) or use a protocol that does (HTTP, gRPC).</li>
+  <li><strong>Head-of-line blocking.</strong> One lost TCP segment stalls everything behind it until it's re-sent, even data for unrelated requests sharing the connection. This is the main reason HTTP/3 moved to QUIC over UDP.</li>
+  <li><strong>Connection setup is expensive.</strong> 1 round trip for TCP, plus 1 for TLS 1.3, before the first request. Reuse connections (HTTP keep-alive, <a href="#connection-pooling">connection pools</a>) instead of opening one per request.</li>
+  <li><strong>TIME_WAIT and port exhaustion.</strong> Opening and closing many short connections to the same destination can run out of local ports. Pooling fixes it.</li>
+  <li><strong>Idle connections get cut silently.</strong> NATs, firewalls and load balancers drop idle TCP connections (AWS ALB's default idle timeout is 60 seconds). The next write then fails. Use keepalives or heartbeats, and handle connection resets with retries.</li>
+  <li><strong>Small-message latency (Nagle's algorithm).</strong> TCP may hold tiny writes to batch them. For interactive protocols, set <code>TCP_NODELAY</code>; most HTTP clients and database drivers already do.</li>
+  <li><strong>UDP has no brakes.</strong> No congestion control means a careless sender can flood the network and lose most of its own packets. Keep datagrams below the path MTU (about 1500 bytes on Ethernet, minus headers) to avoid fragmentation.</li>
+  <li><strong>UDP source addresses are easy to spoof.</strong> That's what makes DNS/NTP reflection and amplification attacks possible (see <a href="#ddos-protection">DDoS Protection</a>).</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>TCP = connection + reliable, ordered byte stream + flow and congestion control. UDP = ports + checksum, nothing more.</li>
+  <li>Use TCP when every byte matters; UDP when late data is useless or when you build your own reliability (QUIC).</li>
+  <li>TCP is a stream, not messages: always frame your data.</li>
+  <li>TCP connections are costly to open: reuse them, and expect idle ones to be cut.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#dns">DNS</a> · <a href="#http-2-http-3">HTTP/2 &amp; HTTP/3</a> · <a href="#grpc">gRPC</a> · <a href="#websockets">WebSockets</a> · <a href="#connection-pooling">Connection Pooling</a> · <a href="#ddos-protection">DDoS Protection</a></p>
+`;
