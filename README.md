@@ -2,6 +2,8 @@
 
 **Software Engineer Concept** is a single-page tracker for 111 software engineering concepts, grouped into 17 topics. The list comes from [@nataindata](https://www.instagram.com/nataindata/)'s "Who's gonna tell vibe coders about…".
 
+**Live:** https://sorenhoang.github.io/swe-concepts/
+
 ## Usage
 
 Open `index.html` in a browser. It has no build step and no dependencies.
