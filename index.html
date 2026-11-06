@@ -106,54 +106,62 @@
 
 <!--
   LEARNED CONCEPTS
-  Add <template id="concept-N">…HTML…</template> below, where N is the concept number.
+  Add <template id="concept-SLUG">…HTML…</template> below, e.g. concept-rate-limiting, concept-http-2-http-3.
   A concept with a template is "Learned"; every other concept shows "Coming soon".
 -->
 
 <script>
   const GROUPS = [
     { name: "Networking & Protocols", desc: "How bytes move between machines: name resolution, transport, and modern wire protocols.",
-      items: [[97, "DNS"], [98, "TCP vs UDP"], [99, "HTTP/2 & HTTP/3"], [100, "gRPC"]] },
+      items: ["DNS", "TCP vs UDP", "HTTP/2 & HTTP/3", "gRPC"] },
     { name: "Real-time & Integration", desc: "Pushing data to clients and to other systems without them asking over and over.",
-      items: [[22, "WebSockets"], [23, "Long Polling"], [24, "Server-Sent Events"], [101, "Webhooks"]] },
+      items: ["WebSockets", "Long Polling", "Server-Sent Events", "Webhooks"] },
     { name: "Traffic & API Management", desc: "What sits in front of your services: routing, shaping and protecting incoming requests.",
-      items: [[1, "Rate Limiting"], [3, "Load Balancing"], [4, "Reverse Proxies"], [5, "API Gateways"], [9, "Service Discovery"], [102, "API Versioning"]] },
+      items: ["Rate Limiting", "Load Balancing", "Reverse Proxies", "API Gateways", "Service Discovery", "API Versioning"] },
     { name: "Caching & Content Delivery", desc: "Serving data faster by keeping copies closer to the reader, and knowing when they go stale.",
-      items: [[2, "Caching"], [48, "CDN"], [49, "Edge Caching"], [50, "Cache Invalidation"]] },
+      items: ["Caching", "CDN", "Edge Caching", "Cache Invalidation"] },
     { name: "Resilience & Fault Tolerance", desc: "Patterns that keep one failing dependency from taking the whole system down.",
-      items: [[10, "Circuit Breakers"], [11, "Timeouts"], [12, "Retries"], [13, "Exponential Backoff"], [14, "Idempotency"], [44, "Backpressure"]] },
+      items: ["Circuit Breakers", "Timeouts", "Retries", "Exponential Backoff", "Idempotency", "Backpressure"] },
     { name: "Messaging & Async Processing", desc: "Decoupling producers from consumers and running work in the background.",
-      items: [[15, "Message Queues"], [16, "Pub/Sub"], [17, "Event-Driven Architecture"], [20, "Dead Letter Queues"], [21, "Cron Jobs"]] },
+      items: ["Message Queues", "Pub/Sub", "Event-Driven Architecture", "Dead Letter Queues", "Cron Jobs"] },
     { name: "Distributed Systems", desc: "The hard truths of many machines: consistency, coordination, partitions and time.",
-      items: [[18, "Distributed Transactions"], [19, "Saga Pattern"], [32, "Replication"], [33, "Leader Election"], [34, "CAP Theorem"], [35, "Eventual Consistency"], [38, "Distributed Locks"], [95, "Network Partitions"], [96, "Clock Skew"]] },
+      items: ["Distributed Transactions", "Saga Pattern", "Replication", "Leader Election", "CAP Theorem", "Eventual Consistency", "Distributed Locks", "Network Partitions", "Clock Skew"] },
     { name: "Databases & Data Modeling", desc: "Making queries fast, scaling storage, and evolving schemas safely.",
-      items: [[25, "Database Indexing"], [26, "Query Optimization"], [27, "N+1 Queries"], [28, "Connection Pooling"], [29, "Read Replicas"], [30, "Sharding"], [31, "Partitioning"], [81, "Database Migrations"], [82, "Schema Versioning"]] },
+      items: ["Database Indexing", "Query Optimization", "N+1 Queries", "Connection Pooling", "Read Replicas", "Sharding", "Partitioning", "Database Migrations", "Schema Versioning"] },
     { name: "Concurrency & Memory", desc: "Correctness when many things happen at once, and how runtimes manage memory.",
-      items: [[36, "Optimistic Locking"], [37, "Pessimistic Locking"], [39, "Race Conditions"], [40, "Deadlocks"], [43, "Thread Safety"], [41, "Memory Leaks"], [42, "Garbage Collection"]] },
+      items: ["Optimistic Locking", "Pessimistic Locking", "Race Conditions", "Deadlocks", "Thread Safety", "Memory Leaks", "Garbage Collection"] },
     { name: "Scalability & Performance", desc: "Growing capacity, measuring speed, and paying only for what you need.",
-      items: [[46, "Horizontal Scaling"], [47, "Vertical Scaling"], [45, "Autoscaling"], [91, "Latency"], [92, "Throughput"], [93, "P99 Latency"], [94, "Tail Latency"], [89, "Cold Starts"], [90, "Serverless Limits"], [88, "Cost Optimization"]] },
+      items: ["Horizontal Scaling", "Vertical Scaling", "Autoscaling", "Latency", "Throughput", "P99 Latency", "Tail Latency", "Cold Starts", "Serverless Limits", "Cost Optimization"] },
     { name: "Containers & Infrastructure as Code", desc: "Packaging apps and describing infrastructure in versioned code.",
-      items: [[7, "Docker"], [8, "Kubernetes"], [106, "Helm Charts"], [104, "Infrastructure as Code"], [105, "Terraform"]] },
+      items: ["Docker", "Kubernetes", "Helm Charts", "Infrastructure as Code", "Terraform"] },
     { name: "CI/CD & Release Engineering", desc: "Building, versioning and shipping code to production without drama.",
-      items: [[6, "CI/CD"], [107, "Build Caching"], [108, "Dependency Hell"], [103, "Semantic Versioning"], [51, "Feature Flags"], [52, "Blue-Green Deployment"], [53, "Canary Releases"], [54, "Rolling Deployments"], [55, "Rollbacks"]] },
+      items: ["CI/CD", "Build Caching", "Dependency Hell", "Semantic Versioning", "Feature Flags", "Blue-Green Deployment", "Canary Releases", "Rolling Deployments", "Rollbacks"] },
     { name: "Observability & Reliability Targets", desc: "Knowing what production is doing, and defining how reliable is reliable enough.",
-      items: [[56, "Health Checks"], [57, "Liveness & Readiness Probes"], [58, "Monitoring"], [59, "Logging"], [61, "Metrics"], [60, "Distributed Tracing"], [66, "Observability"], [62, "Alerts"], [64, "SLIs"], [63, "SLOs"], [65, "Error Budgets"]] },
+      items: ["Health Checks", "Liveness & Readiness Probes", "Monitoring", "Logging", "Metrics", "Distributed Tracing", "Observability", "Alerts", "SLIs", "SLOs", "Error Budgets"] },
     { name: "Security: Identity & Encryption", desc: "Who can access what, and keeping data and secrets protected.",
-      items: [[67, "Secrets Management"], [68, "IAM"], [69, "OAuth"], [70, "JWT Rotation"], [71, "TLS"], [72, "Encryption at Rest"], [73, "Encryption in Transit"]] },
+      items: ["Secrets Management", "IAM", "OAuth", "JWT Rotation", "TLS", "Encryption at Rest", "Encryption in Transit"] },
     { name: "Security: Web Threats & Defense", desc: "Common attacks against web apps and the controls that stop them.",
-      items: [[74, "WAF"], [75, "DDoS Protection"], [76, "CORS"], [77, "CSRF"], [78, "SQL Injection"], [79, "XSS"], [80, "SSRF"]] },
+      items: ["WAF", "DDoS Protection", "CORS", "CSRF", "SQL Injection", "XSS", "SSRF"] },
     { name: "Disaster Recovery & High Availability", desc: "Surviving the loss of a server, a database, or a whole region.",
-      items: [[84, "Backups"], [85, "Failover"], [83, "Disaster Recovery"], [86, "Multi-Region Deployment"], [87, "Chaos Engineering"]] },
+      items: ["Backups", "Failover", "Disaster Recovery", "Multi-Region Deployment", "Chaos Engineering"] },
     { name: "Incident Management", desc: "What happens when production breaks, and how teams learn from it.",
-      items: [[109, "Production Incidents"], [110, "On-Call"], [111, "Postmortems"]] },
+      items: ["Production Incidents", "On-Call", "Postmortems"] },
   ];
 
-  const ALL = GROUPS.flatMap((g, gi) => g.items.map(([id, name]) => ({ id, name, gi })));
-  const isDone = (id) => !!document.getElementById(`concept-${id}`);
-  const badge = (id) => isDone(id) ? `<span class="badge done">Learned</span>` : `<span class="badge">Coming soon</span>`;
-  const doneIn = (items) => items.filter(([id]) => isDone(id)).length;
+  // Numbers follow display order; templates are keyed by slug so reordering never detaches content.
+  let seq = 0;
+  GROUPS.forEach((g, gi) => {
+    g.items = g.items.map((name) => ({
+      id: ++seq, name, gi, slug: name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""),
+    }));
+  });
+  const ALL = GROUPS.flatMap((g) => g.items);
+  const template = (c) => document.getElementById(`concept-${c.slug}`);
+  const isDone = (c) => !!template(c);
+  const badge = (c) => isDone(c) ? `<span class="badge done">Learned</span>` : `<span class="badge">Coming soon</span>`;
+  const doneIn = (items) => items.filter(isDone).length;
 
-  const learned = ALL.filter((c) => isDone(c.id)).length;
+  const learned = doneIn(ALL);
   document.getElementById("progress-text").textContent = `${learned} / ${ALL.length} learned`;
   document.getElementById("progress-bar").style.width = `${(learned / ALL.length) * 100}%`;
 
@@ -161,9 +169,9 @@
   nav.innerHTML = GROUPS.map((g, gi) => `
     <details id="nav-g${gi}">
       <summary><span class="label">${g.name}</span><span class="count">${doneIn(g.items)}/${g.items.length}</span></summary>
-      ${g.items.map(([id, name]) => `
-        <a href="#c-${id}" data-id="${id}" class="${isDone(id) ? "learned" : ""}">
-          <span class="num">${id}</span><span class="name">${name}</span>${isDone(id) ? "" : `<span class="badge">Soon</span>`}
+      ${g.items.map((c) => `
+        <a href="#c-${c.id}" data-id="${c.id}" class="${isDone(c) ? "learned" : ""}">
+          <span class="num">${c.id}</span><span class="name">${c.name}</span>${isDone(c) ? "" : `<span class="badge">Soon</span>`}
         </a>`).join("")}
     </details>`).join("");
 
@@ -172,7 +180,7 @@
       <h2><a href="#g-${gi}">${g.name}</a> <span class="count">${doneIn(g.items)}/${g.items.length}</span></h2>
       <p>${g.desc}</p>
       <div class="grid">
-        ${g.items.map(([id, name]) => `<a class="card" href="#c-${id}"><span class="num">#${id}</span><b>${name}</b>${badge(id)}</a>`).join("")}
+        ${g.items.map((c) => `<a class="card" href="#c-${c.id}"><span class="num">#${c.id}</span><b>${c.name}</b>${badge(c)}</a>`).join("")}
       </div>
     </section>`;
 
@@ -190,9 +198,9 @@
       main.innerHTML = `
         <a class="crumb" href="#g-${concept.gi}">← ${GROUPS[concept.gi].name}</a>
         <h1>#${concept.id} ${concept.name}</h1>
-        ${badge(concept.id)}
+        ${badge(concept)}
         <div class="content"></div>`;
-      const tpl = document.getElementById(`concept-${concept.id}`);
+      const tpl = template(concept);
       main.querySelector(".content").append(
         tpl ? tpl.content.cloneNode(true) : Object.assign(document.createElement("div"), {
           className: "soon",

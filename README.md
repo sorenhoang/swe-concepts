@@ -7,15 +7,16 @@
 Open `index.html` in a browser. It has no build step and no dependencies.
 
 - The left sidebar lists the groups. Expand one to see its concepts.
+- Concepts are numbered 1–111 top-down in sidebar order.
 - Click a group or a concept to open it. Links like `#c-1` and `#g-0` can be bookmarked.
 - Concepts you haven't learned yet show **Coming soon**. The progress bar counts the learned ones.
 
 ## Adding content for a learned concept
 
-Add a `<template>` with the concept's number to `index.html`, below the `LEARNED CONCEPTS` comment:
+Add a `<template>` keyed by the concept's slug (lowercase name, non-alphanumerics → `-`) to `index.html`, below the `LEARNED CONCEPTS` comment:
 
 ```html
-<template id="concept-1">
+<template id="concept-rate-limiting">
   <h2>What it is</h2>
   <p>…</p>
 </template>
