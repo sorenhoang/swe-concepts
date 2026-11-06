@@ -130,30 +130,14 @@
 </aside>
 <main id="main"></main>
 
-<!-- Concept content: each file registers CONTENT["<concept-slug>"] = `…HTML…`. -->
+<!--
+  Learned concepts: content/<group>.js registers CONTENT["<concept-slug>"] = `…HTML…`;
+  add a <script src="content/<group>.js"></script> tag below for each group file.
+  A concept with content is "Learned"; every other concept shows "Coming soon".
+-->
 <script>const CONTENT = {};</script>
-<script src="content/networking-protocols.js"></script>
-<script src="content/real-time-integration.js"></script>
-<script src="content/traffic-api-management.js"></script>
-<script src="content/caching-content-delivery.js"></script>
-<script src="content/resilience-fault-tolerance.js"></script>
-<script src="content/messaging-async-processing.js"></script>
-<script src="content/distributed-systems.js"></script>
-<script src="content/databases-data-modeling.js"></script>
-<script src="content/concurrency-memory.js"></script>
-<script src="content/scalability-performance.js"></script>
-<script src="content/containers-infrastructure-as-code.js"></script>
-<script src="content/ci-cd-release-engineering.js"></script>
-<script src="content/observability-reliability-targets.js"></script>
-<script src="content/security-identity-encryption.js"></script>
-<script src="content/security-web-threats-defense.js"></script>
-<script src="content/disaster-recovery-high-availability.js"></script>
-<script src="content/incident-management.js"></script>
 
 <script>
-  // Slugs of concepts you've finished learning. Content shows regardless; this only drives progress.
-  const LEARNED = [];
-
   const GROUPS = [
     { name: "Networking & Protocols", desc: "How bytes move between machines: name resolution, transport, and modern wire protocols.",
       items: ["DNS", "TCP vs UDP", "HTTP/2 & HTTP/3", "gRPC"] },
@@ -199,8 +183,8 @@
     }));
   });
   const ALL = GROUPS.flatMap((g) => g.items);
-  const isDone = (c) => LEARNED.includes(c.slug);
-  const badge = (c) => isDone(c) ? `<span class="badge done">Learned</span>` : "";
+  const isDone = (c) => c.slug in CONTENT;
+  const badge = (c) => isDone(c) ? `<span class="badge done">Learned</span>` : `<span class="badge">Coming soon</span>`;
   const doneIn = (items) => items.filter(isDone).length;
 
   const learned = doneIn(ALL);
@@ -213,7 +197,7 @@
       <summary><span class="label">${g.name}</span><span class="count">${doneIn(g.items)}/${g.items.length}</span></summary>
       ${g.items.map((c) => `
         <a href="#${c.slug}" data-slug="${c.slug}" class="${isDone(c) ? "learned" : ""}">
-          <span class="num">${c.id}</span><span class="name">${c.name}</span>${isDone(c) ? `<span class="badge done">✓</span>` : CONTENT[c.slug] ? "" : `<span class="badge">Soon</span>`}
+          <span class="num">${c.id}</span><span class="name">${c.name}</span>${isDone(c) ? `<span class="badge done">✓</span>` : `<span class="badge">Soon</span>`}
         </a>`).join("")}
     </details>`).join("");
 
@@ -244,7 +228,7 @@
         ${badge(concept)}
         <div class="content"></div>`;
       main.querySelector(".content").innerHTML = CONTENT[concept.slug]
-        ?? `<div class="soon"><strong>Coming soon</strong>Content for this concept hasn't been written yet.</div>`;
+        ?? `<div class="soon"><strong>Coming soon</strong>This concept hasn't been learned yet.</div>`;
     } else if (group) {
       document.getElementById(`nav-g${n}`).open = true;
       main.innerHTML = `<a class="crumb" href="#">← All groups</a>${section(group, +n)}`;

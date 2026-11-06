@@ -13,16 +13,17 @@ Open `index.html` in a browser. It has no build step and no dependencies.
 
 ## Adding content for a learned concept
 
-Add a `<template>` keyed by the concept's slug (lowercase name, non-alphanumerics → `-`) to `index.html`, below the `LEARNED CONCEPTS` comment:
+Content lives in one file per group, `content/<group-slug>.js`, and each concept is registered by its slug:
 
-```html
-<template id="concept-rate-limiting">
-  <h2>What it is</h2>
-  <p>…</p>
-</template>
+```js
+CONTENT["rate-limiting"] = `
+  <p class="tldr">…</p>
+  <h2>How it works</h2>
+  <figure class="diagram"><svg viewBox="0 0 780 300">…</svg></figure>
+`;
 ```
 
-Once the template is there, the concept loses its "Coming soon" tag and the progress counts update.
+Load the file in `index.html` with `<script src="content/<group-slug>.js"></script>`, next to the comment that explains it. Once a concept has content, it switches from "Coming soon" to "Learned" and the progress counts update. Inline SVG diagrams use the `.diagram` classes in `index.html`, so they work in both light and dark mode.
 
 ## Groups
 
