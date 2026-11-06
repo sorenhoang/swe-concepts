@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Software Engineer Concept</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --surface: #ffffff; --ink: #1c1c1a; --muted: #6b6b66;
+    --line: #e4e4df; --accent: #c2410c; --accent-soft: #fff1e8; --done: #15803d; --done-soft: #e8f6ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --surface: #1c1c1a; --ink: #ecece8; --muted: #9a9a93;
+      --line: #2e2e2b; --accent: #fb923c; --accent-soft: #2d1d12; --done: #4ade80; --done-soft: #12261a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: grid; grid-template-columns: 310px 1fr;
+    font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink);
+  }
+  a { color: inherit; text-decoration: none; }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  aside { background: var(--surface); border-right: 1px solid var(--line); overflow-y: auto; padding: 24px 14px; }
+  .brand { display: block; font-weight: 800; font-size: 19px; letter-spacing: -.01em; padding: 0 8px; }
+  .progress { padding: 6px 8px 18px; color: var(--muted); font-size: 13px; }
+  .bar { height: 6px; background: var(--line); border-radius: 99px; margin-top: 6px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--done); }
+
+  details { border-top: 1px solid var(--line); }
+  summary {
+    list-style: none; cursor: pointer; display: flex; justify-content: space-between; gap: 8px;
+    padding: 10px 8px; font-weight: 650; font-size: 14px;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "▸"; color: var(--muted); transition: transform .15s; }
+  details[open] summary::before { transform: rotate(90deg); }
+  summary .label { flex: 1; }
+  .count { color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+  nav a {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 26px; border-radius: 6px;
+    font-size: 14px; color: var(--muted);
+  }
+  nav a:hover { background: var(--bg); color: var(--ink); }
+  nav a.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  nav a.learned { color: var(--ink); }
+  nav .name { flex: 1; }
+  .num { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--muted); min-width: 22px; }
+
+  .badge {
+    font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 99px; white-space: nowrap;
+    background: var(--bg); color: var(--muted); border: 1px solid var(--line);
+  }
+  .badge.done { background: var(--done-soft); color: var(--done); border-color: transparent; }
+
+  main { overflow-y: auto; padding: 48px 56px 80px; }
+  main > * { max-width: 920px; }
+  h1 { font-size: 34px; line-height: 1.2; letter-spacing: -.02em; margin: 0 0 8px; }
+  .lead { color: var(--muted); margin: 0 0 40px; }
+  section { margin-bottom: 44px; }
+  section h2 { font-size: 20px; margin: 0; }
+  section h2 a:hover { color: var(--accent); }
+  section > p { color: var(--muted); margin: 4px 0 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px;
+    display: flex; flex-direction: column; gap: 6px; align-items: flex-start;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card b { font-size: 15px; }
+
+  .crumb { color: var(--muted); font-size: 14px; margin-bottom: 10px; display: inline-block; }
+  .crumb:hover { color: var(--accent); }
+  .soon {
+    margin-top: 28px; padding: 40px; text-align: center; border: 1px dashed var(--line);
+    border-radius: 12px; color: var(--muted); background: var(--surface);
+  }
+  .soon strong { display: block; font-size: 22px; color: var(--ink); margin-bottom: 4px; }
+
+  .content { margin-top: 24px; }
+  .content h2 { font-size: 22px; margin: 32px 0 8px; }
+  .content h3 { font-size: 17px; margin: 24px 0 6px; }
+  .content code { background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: 13px; }
+  .content pre { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px; overflow-x: auto; }
+  .content pre code { border: 0; padding: 0; }
+  .content table { border-collapse: collapse; width: 100%; }
+  .content th, .content td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; }
+  .content blockquote { margin: 16px 0; padding: 8px 16px; border-left: 3px solid var(--accent); background: var(--surface); }
+
+  @media (max-width: 760px) {
+    body { grid-template-columns: 1fr; height: auto; }
+    aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 50vh; }
+    main { padding: 28px 20px 60px; }
+  }
+</style>
+</head>
+<body>
+<aside>
+  <a class="brand" href="#">Software Engineer Concept</a>
+  <div class="progress"><span id="progress-text"></span><div class="bar"><i id="progress-bar"></i></div></div>
+  <nav id="nav"></nav>
+</aside>
+<main id="main"></main>
+
+<!--
+  LEARNED CONCEPTS
+  Add <template id="concept-N">…HTML…</template> below, where N is the concept number.
+  A concept with a template is "Learned"; every other concept shows "Coming soon".
+-->
+
+<script>
+  const GROUPS = [
+    { name: "Networking & Protocols", desc: "How bytes move between machines: name resolution, transport, and modern wire protocols.",
+      items: [[97, "DNS"], [98, "TCP vs UDP"], [99, "HTTP/2 & HTTP/3"], [100, "gRPC"]] },
+    { name: "Real-time & Integration", desc: "Pushing data to clients and to other systems without them asking over and over.",
+      items: [[22, "WebSockets"], [23, "Long Polling"], [24, "Server-Sent Events"], [101, "Webhooks"]] },
+    { name: "Traffic & API Management", desc: "What sits in front of your services: routing, shaping and protecting incoming requests.",
+      items: [[1, "Rate Limiting"], [3, "Load Balancing"], [4, "Reverse Proxies"], [5, "API Gateways"], [9, "Service Discovery"], [102, "API Versioning"]] },
+    { name: "Caching & Content Delivery", desc: "Serving data faster by keeping copies closer to the reader, and knowing when they go stale.",
+      items: [[2, "Caching"], [48, "CDN"], [49, "Edge Caching"], [50, "Cache Invalidation"]] },
+    { name: "Resilience & Fault Tolerance", desc: "Patterns that keep one failing dependency from taking the whole system down.",
+      items: [[10, "Circuit Breakers"], [11, "Timeouts"], [12, "Retries"], [13, "Exponential Backoff"], [14, "Idempotency"], [44, "Backpressure"]] },
+    { name: "Messaging & Async Processing", desc: "Decoupling producers from consumers and running work in the background.",
+      items: [[15, "Message Queues"], [16, "Pub/Sub"], [17, "Event-Driven Architecture"], [20, "Dead Letter Queues"], [21, "Cron Jobs"]] },
+    { name: "Distributed Systems", desc: "The hard truths of many machines: consistency, coordination, partitions and time.",
+      items: [[18, "Distributed Transactions"], [19, "Saga Pattern"], [32, "Replication"], [33, "Leader Election"], [34, "CAP Theorem"], [35, "Eventual Consistency"], [38, "Distributed Locks"], [95, "Network Partitions"], [96, "Clock Skew"]] },
+    { name: "Databases & Data Modeling", desc: "Making queries fast, scaling storage, and evolving schemas safely.",
+      items: [[25, "Database Indexing"], [26, "Query Optimization"], [27, "N+1 Queries"], [28, "Connection Pooling"], [29, "Read Replicas"], [30, "Sharding"], [31, "Partitioning"], [81, "Database Migrations"], [82, "Schema Versioning"]] },
+    { name: "Concurrency & Memory", desc: "Correctness when many things happen at once, and how runtimes manage memory.",
+      items: [[36, "Optimistic Locking"], [37, "Pessimistic Locking"], [39, "Race Conditions"], [40, "Deadlocks"], [43, "Thread Safety"], [41, "Memory Leaks"], [42, "Garbage Collection"]] },
+    { name: "Scalability & Performance", desc: "Growing capacity, measuring speed, and paying only for what you need.",
+      items: [[46, "Horizontal Scaling"], [47, "Vertical Scaling"], [45, "Autoscaling"], [91, "Latency"], [92, "Throughput"], [93, "P99 Latency"], [94, "Tail Latency"], [89, "Cold Starts"], [90, "Serverless Limits"], [88, "Cost Optimization"]] },
+    { name: "Containers & Infrastructure as Code", desc: "Packaging apps and describing infrastructure in versioned code.",
+      items: [[7, "Docker"], [8, "Kubernetes"], [106, "Helm Charts"], [104, "Infrastructure as Code"], [105, "Terraform"]] },
+    { name: "CI/CD & Release Engineering", desc: "Building, versioning and shipping code to production without drama.",
+      items: [[6, "CI/CD"], [107, "Build Caching"], [108, "Dependency Hell"], [103, "Semantic Versioning"], [51, "Feature Flags"], [52, "Blue-Green Deployment"], [53, "Canary Releases"], [54, "Rolling Deployments"], [55, "Rollbacks"]] },
+    { name: "Observability & Reliability Targets", desc: "Knowing what production is doing, and defining how reliable is reliable enough.",
+      items: [[56, "Health Checks"], [57, "Liveness & Readiness Probes"], [58, "Monitoring"], [59, "Logging"], [61, "Metrics"], [60, "Distributed Tracing"], [66, "Observability"], [62, "Alerts"], [64, "SLIs"], [63, "SLOs"], [65, "Error Budgets"]] },
+    { name: "Security: Identity & Encryption", desc: "Who can access what, and keeping data and secrets protected.",
+      items: [[67, "Secrets Management"], [68, "IAM"], [69, "OAuth"], [70, "JWT Rotation"], [71, "TLS"], [72, "Encryption at Rest"], [73, "Encryption in Transit"]] },
+    { name: "Security: Web Threats & Defense", desc: "Common attacks against web apps and the controls that stop them.",
+      items: [[74, "WAF"], [75, "DDoS Protection"], [76, "CORS"], [77, "CSRF"], [78, "SQL Injection"], [79, "XSS"], [80, "SSRF"]] },
+    { name: "Disaster Recovery & High Availability", desc: "Surviving the loss of a server, a database, or a whole region.",
+      items: [[84, "Backups"], [85, "Failover"], [83, "Disaster Recovery"], [86, "Multi-Region Deployment"], [87, "Chaos Engineering"]] },
+    { name: "Incident Management", desc: "What happens when production breaks, and how teams learn from it.",
+      items: [[109, "Production Incidents"], [110, "On-Call"], [111, "Postmortems"]] },
+  ];
+
+  const ALL = GROUPS.flatMap((g, gi) => g.items.map(([id, name]) => ({ id, name, gi })));
+  const isDone = (id) => !!document.getElementById(`concept-${id}`);
+  const badge = (id) => isDone(id) ? `<span class="badge done">Learned</span>` : `<span class="badge">Coming soon</span>`;
+  const doneIn = (items) => items.filter(([id]) => isDone(id)).length;
+
+  const learned = ALL.filter((c) => isDone(c.id)).length;
+  document.getElementById("progress-text").textContent = `${learned} / ${ALL.length} learned`;
+  document.getElementById("progress-bar").style.width = `${(learned / ALL.length) * 100}%`;
+
+  const nav = document.getElementById("nav");
+  nav.innerHTML = GROUPS.map((g, gi) => `
+    <details id="nav-g${gi}">
+      <summary><span class="label">${g.name}</span><span class="count">${doneIn(g.items)}/${g.items.length}</span></summary>
+      ${g.items.map(([id, name]) => `
+        <a href="#c-${id}" data-id="${id}" class="${isDone(id) ? "learned" : ""}">
+          <span class="num">${id}</span><span class="name">${name}</span>${isDone(id) ? "" : `<span class="badge">Soon</span>`}
+        </a>`).join("")}
+    </details>`).join("");
+
+  const section = (g, gi) => `
+    <section>
+      <h2><a href="#g-${gi}">${g.name}</a> <span class="count">${doneIn(g.items)}/${g.items.length}</span></h2>
+      <p>${g.desc}</p>
+      <div class="grid">
+        ${g.items.map(([id, name]) => `<a class="card" href="#c-${id}"><span class="num">#${id}</span><b>${name}</b>${badge(id)}</a>`).join("")}
+      </div>
+    </section>`;
+
+  function render() {
+    const main = document.getElementById("main");
+    const [, kind, n] = location.hash.match(/^#([cg])-(\d+)$/) || [];
+    const concept = kind === "c" && ALL.find((c) => c.id === +n);
+    const group = kind === "g" && GROUPS[+n];
+
+    nav.querySelectorAll("a").forEach((a) => a.classList.toggle("active", !!concept && a.dataset.id === n));
+    main.scrollTop = 0;
+
+    if (concept) {
+      document.getElementById(`nav-g${concept.gi}`).open = true;
+      main.innerHTML = `
+        <a class="crumb" href="#g-${concept.gi}">← ${GROUPS[concept.gi].name}</a>
+        <h1>#${concept.id} ${concept.name}</h1>
+        ${badge(concept.id)}
+        <div class="content"></div>`;
+      const tpl = document.getElementById(`concept-${concept.id}`);
+      main.querySelector(".content").append(
+        tpl ? tpl.content.cloneNode(true) : Object.assign(document.createElement("div"), {
+          className: "soon",
+          innerHTML: "<strong>Coming soon</strong>This concept hasn't been learned yet.",
+        })
+      );
+    } else if (group) {
+      document.getElementById(`nav-g${n}`).open = true;
+      main.innerHTML = `<a class="crumb" href="#">← All groups</a>${section(group, +n)}`;
+    } else {
+      main.innerHTML = `
+        <h1>Software Engineer Concept</h1>
+        <p class="lead">${ALL.length} concepts in ${GROUPS.length} groups · ${learned} learned</p>
+        ${GROUPS.map(section).join("")}`;
+    }
+  }
+
+  addEventListener("hashchange", render);
+  render();
+</script>
+</body>
+</html>
