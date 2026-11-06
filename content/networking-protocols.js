@@ -870,3 +870,235 @@ $ grpcurl -plaintext -d '{"id": "42"}' localhost:50051 orders.v1.OrderService/Ge
 
 <p><strong>Related:</strong> <a href="#http-2-http-3">HTTP/2 &amp; HTTP/3</a> · <a href="#load-balancing">Load Balancing</a> · <a href="#service-discovery">Service Discovery</a> · <a href="#timeouts">Timeouts</a> · <a href="#retries">Retries</a> · <a href="#api-gateways">API Gateways</a> · <a href="#schema-versioning">Schema Versioning</a></p>
 `;
+
+CONTENT["what-happens-when-you-type-google-com"] = `
+<p class="tldr"><strong>TL;DR</strong>: Between pressing Enter and seeing the page, about ten systems work together in a few hundred milliseconds: the browser works out the URL and checks its caches, <a href="#dns">DNS</a> turns the name into an IP, <a href="#tcp-vs-udp">TCP</a> (or QUIC) connects, <a href="#tls">TLS</a> secures the line, an <a href="#http-2-http-3">HTTP</a> request travels to a nearby edge server and on to the backend, and the browser turns the HTML that comes back into pixels.</p>
+
+<h2>Why this question matters</h2>
+<p>It's the classic interview question because the answer touches every concept in this group, and it's the mental model you need when someone says "the site is slow". Slow <em>where</em>? Each step below has its own failure modes, its own tools, and shows up as its own bar in the browser's timing view. If you can name the step, you can fix it.</p>
+
+<h2>How it works</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 268" role="img" aria-label="Ten steps: 1 parse the URL, 2 check caches, 3 DNS lookup, 4 connect with TCP or QUIC, 5 TLS handshake, 6 send the HTTP request, 7 Google's edge, 8 backend, 9 response, 10 render.">
+  <defs><marker id="arr-gc-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="10" y="30" width="136" height="72" rx="10"/>
+  <text x="78" y="56" text-anchor="middle" class="title">1 Parse URL</text>
+  <text x="78" y="76" text-anchor="middle" class="small">add https://</text>
+  <text x="78" y="91" text-anchor="middle" class="small">check HSTS list</text>
+  <rect class="box accent" x="166" y="30" width="136" height="72" rx="10"/>
+  <text x="234" y="56" text-anchor="middle" class="title">2 Caches</text>
+  <text x="234" y="76" text-anchor="middle" class="small">service worker,</text>
+  <text x="234" y="91" text-anchor="middle" class="small">HTTP cache</text>
+  <rect class="box" x="322" y="30" width="136" height="72" rx="10"/>
+  <text x="390" y="56" text-anchor="middle" class="title">3 DNS</text>
+  <text x="390" y="76" text-anchor="middle" class="small">google.com → IP</text>
+  <text x="390" y="91" text-anchor="middle" class="small">(usually cached)</text>
+  <rect class="box" x="478" y="30" width="136" height="72" rx="10"/>
+  <text x="546" y="56" text-anchor="middle" class="title">4 Connect</text>
+  <text x="546" y="76" text-anchor="middle" class="small">TCP to port 443,</text>
+  <text x="546" y="91" text-anchor="middle" class="small">or QUIC over UDP</text>
+  <rect class="box" x="634" y="30" width="136" height="72" rx="10"/>
+  <text x="702" y="56" text-anchor="middle" class="title">5 TLS 1.3</text>
+  <text x="702" y="76" text-anchor="middle" class="small">verify certificate,</text>
+  <text x="702" y="91" text-anchor="middle" class="small">agree on h2 / h3</text>
+  <path class="line" d="M146 66 H164" marker-end="url(#arr-gc-1)"/>
+  <path class="line" d="M302 66 H320" marker-end="url(#arr-gc-1)"/>
+  <path class="line" d="M458 66 H476" marker-end="url(#arr-gc-1)"/>
+  <path class="line" d="M614 66 H632" marker-end="url(#arr-gc-1)"/>
+  <path class="line" d="M702 102 V148" marker-end="url(#arr-gc-1)"/>
+
+  <rect class="box" x="634" y="150" width="136" height="72" rx="10"/>
+  <text x="702" y="176" text-anchor="middle" class="title">6 HTTP request</text>
+  <text x="702" y="196" text-anchor="middle" class="small">GET / → 301 to</text>
+  <text x="702" y="211" text-anchor="middle" class="small">www.google.com</text>
+  <rect class="box ok" x="478" y="150" width="136" height="72" rx="10"/>
+  <text x="546" y="176" text-anchor="middle" class="title">7 Edge</text>
+  <text x="546" y="196" text-anchor="middle" class="small">nearby server,</text>
+  <text x="546" y="211" text-anchor="middle" class="small">TLS ends here</text>
+  <rect class="box ok" x="322" y="150" width="136" height="72" rx="10"/>
+  <text x="390" y="176" text-anchor="middle" class="title">8 Backend</text>
+  <text x="390" y="196" text-anchor="middle" class="small">load balancer → app</text>
+  <text x="390" y="211" text-anchor="middle" class="small">→ caches, services</text>
+  <rect class="box ok" x="166" y="150" width="136" height="72" rx="10"/>
+  <text x="234" y="176" text-anchor="middle" class="title">9 Response</text>
+  <text x="234" y="196" text-anchor="middle" class="small">200 + compressed</text>
+  <text x="234" y="211" text-anchor="middle" class="small">HTML, cookies</text>
+  <rect class="box accent" x="10" y="150" width="136" height="72" rx="10"/>
+  <text x="78" y="176" text-anchor="middle" class="title">10 Render</text>
+  <text x="78" y="196" text-anchor="middle" class="small">DOM + CSSOM →</text>
+  <text x="78" y="211" text-anchor="middle" class="small">layout → paint</text>
+  <path class="line" d="M634 186 H616" marker-end="url(#arr-gc-1)"/>
+  <path class="line" d="M478 186 H460" marker-end="url(#arr-gc-1)"/>
+  <path class="line" d="M322 186 H304" marker-end="url(#arr-gc-1)"/>
+  <path class="line" d="M166 186 H148" marker-end="url(#arr-gc-1)"/>
+
+  <rect class="box accent" x="190" y="244" width="14" height="14" rx="3"/><text x="210" y="256" class="small">in the browser</text>
+  <rect class="box" x="330" y="244" width="14" height="14" rx="3"/><text x="350" y="256" class="small">on the network</text>
+  <rect class="box ok" x="470" y="244" width="14" height="14" rx="3"/><text x="490" y="256" class="small">Google's side</text>
+</svg>
+<figcaption>The whole journey. Steps 3–5 are paid once per new connection; steps 6–9 repeat for every request; step 10 triggers dozens more requests for CSS, JS and images.</figcaption>
+</figure>
+
+<h3>1. The browser works out what you meant</h3>
+<p>"google.com" has no scheme, and it doesn't look like a search query, so the browser treats it as a site address. Modern browsers try <code>https://</code> first. If the site is on the browser's <strong>HSTS</strong> list (sites that said "only ever talk to me over HTTPS", or that are built into the browser's preload list), plain <code>http://</code> is never even attempted.</p>
+
+<h3>2. Caches, before any network</h3>
+<p>A service worker registered by the site can answer the request itself. Otherwise the browser checks its HTTP cache. A search homepage is usually marked as not cacheable, so the request goes out, but images, scripts and fonts often come straight from disk.</p>
+
+<h3>3. DNS: name to IP address</h3>
+<p>The browser asks its own DNS cache, then the operating system, then the configured recursive resolver (your ISP's, or 1.1.1.1 / 8.8.8.8). Only on a full miss does the resolver walk root → <code>.com</code> → Google's name servers. Most lookups are answered from a cache in a few milliseconds (see <a href="#dns">DNS</a> and its cache layers). The answer depends on where you are: Google hands out addresses of servers close to you.</p>
+
+<h3>4–5. Connect and secure the line</h3>
+<p>With an IP address, the browser opens a <strong>TCP</strong> connection to port 443 (3-way handshake, 1 round trip), then runs the <strong>TLS 1.3</strong> handshake (1 more round trip). During TLS:</p>
+<ul>
+  <li>The browser sends the hostname (<strong>SNI</strong>) so the server knows which certificate to present.</li>
+  <li>It checks the certificate: signed by a trusted authority, not expired, and valid for <code>google.com</code>. If any check fails, you get the full-page warning.</li>
+  <li>Both sides agree on the HTTP version (<strong>ALPN</strong>): usually <code>h2</code>.</li>
+</ul>
+<p>If the browser already knows the site speaks HTTP/3 (from an earlier <code>alt-svc</code> header or a DNS <code>HTTPS</code> record), it uses <strong>QUIC</strong> over UDP instead, combining both handshakes into one round trip (see <a href="#http-2-http-3">HTTP/2 &amp; HTTP/3</a>).</p>
+
+<h3>6. The HTTP request, and a redirect</h3>
+<p>The browser sends <code>GET /</code> with headers: <code>host</code>, <code>user-agent</code>, <code>accept-language</code>, cookies, and so on. For <code>google.com</code>, the answer is a <strong>301 redirect</strong> to <code>https://www.google.com/</code>, so the browser does it all again for <code>www</code>: another DNS lookup, and possibly another connection. One redirect easily costs a full round trip or more.</p>
+
+<h3>7–8. Google's side</h3>
+<p>The IP you connected to belongs to an <strong>edge</strong> server near you, not to the machine that builds the page. Google's edge (its "Google Front End") ends TLS close to you, absorbs attacks, and forwards the request over Google's private network to a <a href="#load-balancing">load balancer</a>, which picks a healthy web server. That server calls many internal services (search suggestions, your account, today's doodle) and assembles the HTML. Your own systems usually look the same, just smaller: <a href="#cdn">CDN</a> → load balancer → <a href="#reverse-proxies">reverse proxy</a> → app → cache and database.</p>
+
+<h3>9–10. Response and rendering</h3>
+<p>The response comes back <code>200 OK</code> with compressed HTML (<code>content-encoding: br</code> or <code>gzip</code>), cookies, and caching headers. The browser then:</p>
+<ol>
+  <li>Parses HTML into the <strong>DOM</strong>. A preload scanner spots CSS, JS and images early and requests them over the same connection.</li>
+  <li>Parses CSS into the <strong>CSSOM</strong>. CSS blocks rendering, and a plain <code>&lt;script&gt;</code> blocks parsing until it has downloaded and run.</li>
+  <li>Combines them, works out every element's size and position (<strong>layout</strong>), draws pixels (<strong>paint</strong>), and composites the layers on screen.</li>
+</ol>
+
+<h2>Where the time goes</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 262" role="img" aria-label="Example timing waterfall: DNS 20 ms, TCP 15 ms, TLS 15 ms, waiting for the first byte 60 ms, download 15 ms, then parse and render about 110 ms.">
+  <text x="20" y="35" class="title">DNS lookup</text>
+  <rect class="box" x="180" y="18" width="40" height="24" rx="4"/><text x="228" y="35" class="small">20 ms</text>
+  <text x="20" y="70" class="title">TCP connect</text>
+  <rect class="box" x="220" y="53" width="30" height="24" rx="4"/><text x="258" y="70" class="small">15 ms (1 round trip)</text>
+  <text x="20" y="105" class="title">TLS handshake</text>
+  <rect class="box" x="250" y="88" width="30" height="24" rx="4"/><text x="288" y="105" class="small">15 ms (1 round trip)</text>
+  <text x="20" y="140" class="title">Waiting (TTFB)</text>
+  <rect class="box accent" x="280" y="123" width="120" height="24" rx="4"/><text x="408" y="140" class="small">60 ms: network + server work</text>
+  <text x="20" y="175" class="title">Download</text>
+  <rect class="box" x="400" y="158" width="30" height="24" rx="4"/><text x="438" y="175" class="small">15 ms</text>
+  <text x="20" y="210" class="title">Parse + render</text>
+  <rect class="box ok" x="430" y="193" width="220" height="24" rx="4"/><text x="658" y="210" class="small">~110 ms</text>
+  <path class="line" d="M180 230 H760" style="stroke: var(--line)"/>
+  <text x="180" y="248" text-anchor="middle" class="small">0</text>
+  <text x="280" y="248" text-anchor="middle" class="small">50 ms</text>
+  <text x="380" y="248" text-anchor="middle" class="small">100 ms</text>
+  <text x="480" y="248" text-anchor="middle" class="small">150 ms</text>
+  <text x="580" y="248" text-anchor="middle" class="small">200 ms</text>
+  <text x="680" y="248" text-anchor="middle" class="small">250 ms</text>
+</svg>
+<figcaption>Illustrative numbers for one request on a good connection (about 15 ms round trip). Chrome DevTools shows the real ones: Network tab → click a request → <em>Timing</em> (DNS Lookup, Initial connection, SSL, Waiting for server response, Content Download).</figcaption>
+</figure>
+
+<h2>Debugging map: which step is slow?</h2>
+<table>
+  <tr><th>Step</th><th>Typical problem</th><th>How to see it</th><th>Concept</th></tr>
+  <tr><td>DNS</td><td>slow or stale resolver, cached old IP after a move</td><td><code>dig</code>, DevTools "DNS Lookup"</td><td><a href="#dns">DNS</a></td></tr>
+  <tr><td>Connect</td><td>packet loss (dropped SYNs are retried after ~1 s), far-away server, firewall</td><td>DevTools "Initial connection", <code>curl -w</code></td><td><a href="#tcp-vs-udp">TCP vs UDP</a></td></tr>
+  <tr><td>TLS</td><td>expired or wrong certificate, missing intermediate, old TLS version</td><td><code>openssl s_client -connect host:443</code></td><td><a href="#tls">TLS</a></td></tr>
+  <tr><td>Redirects</td><td>http → https → www chains, each costing a round trip</td><td><code>curl -sIL</code>, DevTools 3xx rows</td><td><a href="#http-2-http-3">HTTP/2 &amp; HTTP/3</a></td></tr>
+  <tr><td>Waiting (TTFB)</td><td>slow backend, cache misses, queueing at the load balancer</td><td>DevTools "Waiting", server traces</td><td><a href="#latency">Latency</a>, <a href="#caching">Caching</a></td></tr>
+  <tr><td>Download</td><td>large uncompressed payloads, no CDN</td><td>DevTools size column, <code>content-encoding</code></td><td><a href="#cdn">CDN</a></td></tr>
+  <tr><td>Render</td><td>render-blocking CSS and JS, huge DOM</td><td>DevTools Performance tab, Lighthouse</td><td>–</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>Watch the steps happen with Go.</strong> <code>net/http/httptrace</code> lets you hook into each phase of a request. This program fetches <code>https://google.com</code> without following the redirect and prints where the time went:</p>
+<pre><code>package main
+
+import (
+	"crypto/tls"
+	"fmt"
+	"log"
+	"net/http"
+	"net/http/httptrace"
+	"time"
+)
+
+func main() {
+	var start, dnsStart, connStart, tlsStart time.Time
+	trace := &amp;httptrace.ClientTrace{
+		DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			fmt.Printf("DNS         %v  %d addresses&#92;n", time.Since(dnsStart), len(info.Addrs))
+		},
+		ConnectStart: func(network, addr string) { connStart = time.Now() },
+		ConnectDone: func(network, addr string, err error) {
+			fmt.Printf("TCP         %v  %s&#92;n", time.Since(connStart), addr)
+		},
+		TLSHandshakeStart: func() { tlsStart = time.Now() },
+		TLSHandshakeDone: func(cs tls.ConnectionState, err error) {
+			fmt.Printf("TLS         %v  %s, ALPN=%s&#92;n", time.Since(tlsStart), tls.VersionName(cs.Version), cs.NegotiatedProtocol)
+		},
+		GotFirstResponseByte: func() {
+			fmt.Printf("first byte  %v  since start&#92;n", time.Since(start))
+		},
+	}
+
+	client := &amp;http.Client{
+		// stop at the first response so we can see the redirect
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://google.com", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
+	start = time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resp.Body.Close()
+	fmt.Println(resp.Proto, resp.Status, "→", resp.Header.Get("Location"))
+}</code></pre>
+<p>A real run (your numbers will differ; here the server was far away, so each round trip cost about 57 ms):</p>
+<pre><code>DNS         14.0825ms  5 addresses
+TCP         57.071292ms  142.250.197.142:443
+TLS         81.888417ms  TLS 1.3, ALPN=h2
+first byte  232.027958ms  since start
+HTTP/2.0 301 Moved Permanently → https://www.google.com/</code></pre>
+<p>Go's standard client speaks HTTP/1.1 and HTTP/2 over TCP, so you'll always see the TCP path here. Chrome may use QUIC for the same site.</p>
+
+<p><strong>The same from the terminal:</strong></p>
+<pre><code>$ dig +short google.com                 # step 3: the IPs you're given (they vary by location)
+$ curl -sI https://google.com | head -3  # step 6: the redirect
+HTTP/2 301
+location: https://www.google.com/
+content-type: text/html; charset=UTF-8
+
+$ curl -so /dev/null -w 'dns %{time_namelookup}  tcp %{time_connect}  tls %{time_appconnect}  ttfb %{time_starttransfer}  total %{time_total}&#92;n' https://www.google.com
+dns 0.021  tcp 0.036  tls 0.052  ttfb 0.151  total 0.197</code></pre>
+<p>curl's times are cumulative seconds since the start: TCP took 0.036 − 0.021 = 15 ms.</p>
+
+<p><strong>Real-world scenario: "the site is slow, but only for some users".</strong> The backend dashboards look healthy. A user's DevTools timing shows about 1 s in "Initial connection" and normal times everywhere else. A delay of roughly one second in connect is the signature of a lost SYN being retried after TCP's initial retransmission timeout. Which leads to the real cause: a packet-dropping link or an overloaded load balancer in one region, not the application. Knowing the steps turned "it's slow" into "step 4 is slow in region X" in minutes.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>"DNS goes to the root every time."</strong> It almost never does: answers are cached at several layers. The flip side is that changes take up to the TTL to reach everyone.</li>
+  <li><strong>Redirects aren't free.</strong> <code>http://example.com</code> → <code>https://example.com</code> → <code>https://www.example.com</code> can add hundreds of milliseconds on mobile. Link to the final URL and use HSTS so the http hop disappears.</li>
+  <li><strong>Every new origin pays steps 3–5 again.</strong> Fonts from one domain, analytics from another, images from a third: each needs its own DNS, TCP and TLS. Use fewer origins, or <code>&lt;link rel="preconnect"&gt;</code> for the ones you must call.</li>
+  <li><strong>TTFB is not "backend time".</strong> It includes a network round trip, load-balancer queueing, and the server's work. Compare it with server-side traces before blaming the code.</li>
+  <li><strong>"It works for me."</strong> DNS and anycast send users in different places to different servers, so one region can be broken while yours is fine. Test from several locations.</li>
+  <li><strong>Render-blocking resources.</strong> A fast server doesn't help if the page waits on a big CSS file or a synchronous script in <code>&lt;head&gt;</code>. Use <code>defer</code> or <code>async</code> on scripts and keep critical CSS small.</li>
+  <li><strong>Connections are the expensive part, so reuse them.</strong> HTTP keep-alive and HTTP/2 let later requests skip steps 3–5 entirely. The same lesson applies between your own services: <a href="#connection-pooling">connection pooling</a>.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>URL → caches → DNS → TCP/QUIC → TLS → HTTP → edge → backend → response → render.</li>
+  <li>Steps 3–5 are per connection and dominated by round trips: reuse connections, avoid extra origins and redirects.</li>
+  <li>Use the DevTools timing bars or <code>curl -w</code> to find which step is slow before guessing.</li>
+  <li>Every concept in this group (DNS, TCP/UDP, HTTP/2 and 3, gRPC) is one of these steps seen up close.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#dns">DNS</a> · <a href="#tcp-vs-udp">TCP vs UDP</a> · <a href="#tls">TLS</a> · <a href="#http-2-http-3">HTTP/2 &amp; HTTP/3</a> · <a href="#cdn">CDN</a> · <a href="#load-balancing">Load Balancing</a> · <a href="#latency">Latency</a></p>
+`;
