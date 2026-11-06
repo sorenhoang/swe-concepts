@@ -1,6 +1,6 @@
 # swe-concepts
 
-**Software Engineer Concept** is a single-page tracker for 111 software engineering concepts, grouped into 17 topics. The list comes from [@nataindata](https://www.instagram.com/nataindata/)'s "Who's gonna tell vibe coders about…".
+**Software Engineer Concept** is a single-page tracker for 112 software engineering concepts, grouped into 17 topics. The original 111 come from [@nataindata](https://www.instagram.com/nataindata/)'s "Who's gonna tell vibe coders about…".
 
 **Live:** https://sorenhoang.github.io/swe-concepts/
 
@@ -9,7 +9,7 @@
 Open `index.html` in a browser. It has no build step and no dependencies.
 
 - The left sidebar lists the groups. Expand one to see its concepts.
-- Concepts are numbered 1–111 top-down in sidebar order.
+- Concepts are numbered top-down in sidebar order.
 - Click a group or a concept to open it. Links like `#c-1` and `#g-0` can be bookmarked.
 - Concepts you haven't learned yet show **Coming soon**. The progress bar counts the learned ones.
 
@@ -31,7 +31,7 @@ Load the file in `index.html` with `<script src="content/<group-slug>.js"></scri
 
 | Group | # |
 |---|---|
-| Networking & Protocols | 4 |
+| Networking & Protocols | 5 |
 | Real-time & Integration | 4 |
 | Traffic & API Management | 6 |
 | Caching & Content Delivery | 4 |
