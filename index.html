@@ -8,11 +8,13 @@
   :root {
     --bg: #f7f7f5; --surface: #ffffff; --ink: #1c1c1a; --muted: #6b6b66;
     --line: #e4e4df; --accent: #c2410c; --accent-soft: #fff1e8; --done: #15803d; --done-soft: #e8f6ec;
+    --danger: #b91c1c; --danger-soft: #fdecec;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #141413; --surface: #1c1c1a; --ink: #ecece8; --muted: #9a9a93;
       --line: #2e2e2b; --accent: #fb923c; --accent-soft: #2d1d12; --done: #4ade80; --done-soft: #12261a;
+      --danger: #f87171; --danger-soft: #2a1414;
     }
   }
   * { box-sizing: border-box; }
@@ -88,6 +90,30 @@
   .content table { border-collapse: collapse; width: 100%; }
   .content th, .content td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; }
   .content blockquote { margin: 16px 0; padding: 8px 16px; border-left: 3px solid var(--accent); background: var(--surface); }
+  .content a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+  .content .tldr { font-size: 17px; padding: 14px 18px; border-radius: 10px; background: var(--accent-soft); margin: 0 0 8px; }
+  .content .callout { padding: 12px 16px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); }
+  .content .callout.warn { border-left: 4px solid var(--danger); }
+  .content .callout.tip { border-left: 4px solid var(--done); }
+
+  /* Diagrams: inline SVGs use these classes so they follow light/dark theme. */
+  .diagram { margin: 20px 0; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+  .diagram svg { display: block; width: 100%; height: auto; max-height: 520px; }
+  .diagram figcaption { color: var(--muted); font-size: 13px; text-align: center; margin-top: 8px; }
+  .diagram text { fill: var(--ink); font: 13px system-ui, sans-serif; }
+  .diagram text.small { font-size: 11px; fill: var(--muted); }
+  .diagram text.title { font-weight: 700; }
+  .diagram .box { fill: var(--bg); stroke: var(--ink); stroke-width: 1.4; }
+  .diagram .box.accent { fill: var(--accent-soft); stroke: var(--accent); }
+  .diagram .box.ok { fill: var(--done-soft); stroke: var(--done); }
+  .diagram .box.bad { fill: var(--danger-soft); stroke: var(--danger); }
+  .diagram .box.muted { stroke: var(--line); }
+  .diagram .line { fill: none; stroke: var(--ink); stroke-width: 1.4; }
+  .diagram .line.accent { stroke: var(--accent); }
+  .diagram .line.ok { stroke: var(--done); }
+  .diagram .line.bad { stroke: var(--danger); }
+  .diagram .line.dashed { stroke-dasharray: 5 4; }
+  .diagram .arrowhead { fill: var(--ink); }
 
   @media (max-width: 760px) {
     body { grid-template-columns: 1fr; height: auto; }
@@ -104,13 +130,30 @@
 </aside>
 <main id="main"></main>
 
-<!--
-  LEARNED CONCEPTS
-  Add <template id="concept-SLUG">…HTML…</template> below, e.g. concept-rate-limiting, concept-http-2-http-3.
-  A concept with a template is "Learned"; every other concept shows "Coming soon".
--->
+<!-- Concept content: each file registers CONTENT["<concept-slug>"] = `…HTML…`. -->
+<script>const CONTENT = {};</script>
+<script src="content/networking-protocols.js"></script>
+<script src="content/real-time-integration.js"></script>
+<script src="content/traffic-api-management.js"></script>
+<script src="content/caching-content-delivery.js"></script>
+<script src="content/resilience-fault-tolerance.js"></script>
+<script src="content/messaging-async-processing.js"></script>
+<script src="content/distributed-systems.js"></script>
+<script src="content/databases-data-modeling.js"></script>
+<script src="content/concurrency-memory.js"></script>
+<script src="content/scalability-performance.js"></script>
+<script src="content/containers-infrastructure-as-code.js"></script>
+<script src="content/ci-cd-release-engineering.js"></script>
+<script src="content/observability-reliability-targets.js"></script>
+<script src="content/security-identity-encryption.js"></script>
+<script src="content/security-web-threats-defense.js"></script>
+<script src="content/disaster-recovery-high-availability.js"></script>
+<script src="content/incident-management.js"></script>
 
 <script>
+  // Slugs of concepts you've finished learning. Content shows regardless; this only drives progress.
+  const LEARNED = [];
+
   const GROUPS = [
     { name: "Networking & Protocols", desc: "How bytes move between machines: name resolution, transport, and modern wire protocols.",
       items: ["DNS", "TCP vs UDP", "HTTP/2 & HTTP/3", "gRPC"] },
@@ -156,9 +199,8 @@
     }));
   });
   const ALL = GROUPS.flatMap((g) => g.items);
-  const template = (c) => document.getElementById(`concept-${c.slug}`);
-  const isDone = (c) => !!template(c);
-  const badge = (c) => isDone(c) ? `<span class="badge done">Learned</span>` : `<span class="badge">Coming soon</span>`;
+  const isDone = (c) => LEARNED.includes(c.slug);
+  const badge = (c) => isDone(c) ? `<span class="badge done">Learned</span>` : "";
   const doneIn = (items) => items.filter(isDone).length;
 
   const learned = doneIn(ALL);
@@ -170,8 +212,8 @@
     <details id="nav-g${gi}">
       <summary><span class="label">${g.name}</span><span class="count">${doneIn(g.items)}/${g.items.length}</span></summary>
       ${g.items.map((c) => `
-        <a href="#c-${c.id}" data-id="${c.id}" class="${isDone(c) ? "learned" : ""}">
-          <span class="num">${c.id}</span><span class="name">${c.name}</span>${isDone(c) ? "" : `<span class="badge">Soon</span>`}
+        <a href="#${c.slug}" data-slug="${c.slug}" class="${isDone(c) ? "learned" : ""}">
+          <span class="num">${c.id}</span><span class="name">${c.name}</span>${isDone(c) ? `<span class="badge done">✓</span>` : CONTENT[c.slug] ? "" : `<span class="badge">Soon</span>`}
         </a>`).join("")}
     </details>`).join("");
 
@@ -180,17 +222,18 @@
       <h2><a href="#g-${gi}">${g.name}</a> <span class="count">${doneIn(g.items)}/${g.items.length}</span></h2>
       <p>${g.desc}</p>
       <div class="grid">
-        ${g.items.map((c) => `<a class="card" href="#c-${c.id}"><span class="num">#${c.id}</span><b>${c.name}</b>${badge(c)}</a>`).join("")}
+        ${g.items.map((c) => `<a class="card" href="#${c.slug}"><span class="num">#${c.id}</span><b>${c.name}</b>${badge(c)}</a>`).join("")}
       </div>
     </section>`;
 
   function render() {
     const main = document.getElementById("main");
-    const [, kind, n] = location.hash.match(/^#([cg])-(\d+)$/) || [];
-    const concept = kind === "c" && ALL.find((c) => c.id === +n);
-    const group = kind === "g" && GROUPS[+n];
+    const hash = location.hash.slice(1);
+    const n = (hash.match(/^g-(\d+)$/) || [])[1];
+    const concept = ALL.find((c) => c.slug === hash);
+    const group = n !== undefined && GROUPS[+n];
 
-    nav.querySelectorAll("a").forEach((a) => a.classList.toggle("active", !!concept && a.dataset.id === n));
+    nav.querySelectorAll("a").forEach((a) => a.classList.toggle("active", !!concept && a.dataset.slug === concept.slug));
     main.scrollTop = 0;
 
     if (concept) {
@@ -200,13 +243,8 @@
         <h1>#${concept.id} ${concept.name}</h1>
         ${badge(concept)}
         <div class="content"></div>`;
-      const tpl = template(concept);
-      main.querySelector(".content").append(
-        tpl ? tpl.content.cloneNode(true) : Object.assign(document.createElement("div"), {
-          className: "soon",
-          innerHTML: "<strong>Coming soon</strong>This concept hasn't been learned yet.",
-        })
-      );
+      main.querySelector(".content").innerHTML = CONTENT[concept.slug]
+        ?? `<div class="soon"><strong>Coming soon</strong>Content for this concept hasn't been written yet.</div>`;
     } else if (group) {
       document.getElementById(`nav-g${n}`).open = true;
       main.innerHTML = `<a class="crumb" href="#">← All groups</a>${section(group, +n)}`;
