@@ -276,24 +276,36 @@ CONTENT["tcp-vs-udp"] = `
 <h2>Example</h2>
 <p><strong>TCP is a stream, so you must frame messages.</strong> One <code>write()</code> on the sender does <em>not</em> equal one <code>read()</code> on the receiver: TCP may split or merge your bytes. A common fix is a length prefix (gRPC and many database protocols do a version of this):</p>
 <pre><code>// TCP: send one message as [4-byte length][payload]
-Socket("orders.internal", 9000).use { socket -&gt;
-  val out = DataOutputStream(socket.getOutputStream())
-  val payload = """{"orderId":42}""".toByteArray()
-  out.writeInt(payload.size)
-  out.write(payload)
-  out.flush()
+conn, err := net.Dial("tcp", "orders.internal:9000")
+if err != nil {
+	return err
+}
+defer conn.Close()
 
-  val input = DataInputStream(socket.getInputStream())
-  val reply = ByteArray(input.readInt())
-  input.readFully(reply)  // keeps reading until all bytes arrive; a single read() might not
+payload := []byte(&#96;{"orderId":42}&#96;)
+frame := binary.BigEndian.AppendUint32(nil, uint32(len(payload)))
+frame = append(frame, payload...)
+if _, err := conn.Write(frame); err != nil {
+	return err
+}
+
+var header [4]byte
+if _, err := io.ReadFull(conn, header[:]); err != nil {
+	return err
+}
+reply := make([]byte, binary.BigEndian.Uint32(header[:]))
+if _, err := io.ReadFull(conn, reply); err != nil { // a single conn.Read might return only part
+	return err
 }</code></pre>
 
 <p><strong>UDP is fire-and-forget.</strong> StatsD metrics are a classic use: losing one CPU sample is fine, and the app never blocks on a slow metrics server.</p>
 <pre><code>// UDP: one send = one datagram, no connection, no confirmation
-DatagramSocket().use { socket -&gt;
-  val payload = "api.requests:1|c".toByteArray()
-  socket.send(DatagramPacket(payload, payload.size, InetAddress.getByName("statsd.internal"), 8125))
-}</code></pre>
+conn, err := net.Dial("udp", "statsd.internal:8125") // sends nothing yet: just remembers the address
+if err != nil {
+	return err
+}
+defer conn.Close()
+conn.Write([]byte("api.requests:1|c")) // error ignored on purpose: losing one metric is fine</code></pre>
 
 <p>Try both from a terminal (macOS/BSD <code>nc</code> syntax):</p>
 <pre><code>$ nc -l 9000              # TCP server
@@ -493,20 +505,25 @@ alt-svc: h3=":443"; ma=86400          # "I also speak HTTP/3 on UDP 443"
 $ curl --http3 -sI -o /dev/null -w '%{http_version}\\n' https://www.cloudflare.com
 3                                     # needs a curl built with HTTP/3 support</code></pre>
 
-<p><strong>Calling an API over HTTP/2 from Kotlin.</strong> The JDK's built-in client (Java 11+) negotiates HTTP/2 and falls back to HTTP/1.1 if the server doesn't support it:</p>
-<pre><code>val client = HttpClient.newBuilder()
-  .version(HttpClient.Version.HTTP_2)
-  .build()
+<p><strong>Calling an API over HTTP/2 from Go.</strong> <code>net/http</code> negotiates HTTP/2 automatically for <code>https://</code> URLs (and falls back to HTTP/1.1 if the server doesn't support it). Concurrent requests to the same host become streams on a shared connection:</p>
+<pre><code>client := &amp;http.Client{Timeout: 5 * time.Second}
 
-// These 3 requests share ONE connection as 3 streams, instead of opening 3 connections
-val responses = listOf("/users", "/orders", "/invoices").map { path -&gt;
-  client.sendAsync(
-    HttpRequest.newBuilder(URI("https://api.example.com&#36;path")).build(),
-    HttpResponse.BodyHandlers.ofString(),
-  )
-}.map { it.join() }
-
-println(responses.first().version())  // HTTP_2</code></pre>
+var wg sync.WaitGroup
+for _, path := range []string{"/users", "/orders", "/invoices"} {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp, err := client.Get("https://api.example.com" + path)
+		if err != nil {
+			log.Println(path, err)
+			return
+		}
+		defer resp.Body.Close()
+		log.Println(path, resp.Proto) // "HTTP/2.0"
+	}()
+}
+wg.Wait()</code></pre>
+<p>The server side is just as automatic: <code>http.ListenAndServeTLS</code> serves HTTP/2 with no extra code. HTTP/3 isn't in the standard library yet; the <code>quic-go</code> package is the usual choice.</p>
 
 <p><strong>Turning on HTTP/2 and HTTP/3 in nginx</strong> (1.25.1+):</p>
 <pre><code>server {
@@ -546,4 +563,310 @@ println(responses.first().version())  // HTTP_2</code></pre>
 </ul></div>
 
 <p><strong>Related:</strong> <a href="#tcp-vs-udp">TCP vs UDP</a> · <a href="#tls">TLS</a> · <a href="#grpc">gRPC</a> · <a href="#cdn">CDN</a> · <a href="#load-balancing">Load Balancing</a> · <a href="#websockets">WebSockets</a></p>
+`;
+
+CONTENT["grpc"] = `
+<p class="tldr"><strong>TL;DR</strong>: gRPC lets one service call a function on another service as if it were a local function. You describe the API once in a <code>.proto</code> file, generate typed client and server code in any language, and calls travel as compact <strong>Protocol Buffers</strong> over <strong>HTTP/2</strong>, with streaming, deadlines and standard error codes built in.</p>
+
+<h2>The problem it solves</h2>
+<p>Inside a backend with dozens of services, plain REST + JSON between them gets painful:</p>
+<ul>
+  <li><strong>No enforced contract.</strong> The API lives in docs (or nowhere). A renamed field or a typo in <code>"totalCents"</code> vs <code>"total_cents"</code> only shows up at runtime.</li>
+  <li><strong>Hand-written clients</strong> in every calling service and every language, each with its own bugs.</li>
+  <li><strong>JSON is text</strong>: bigger on the wire and slower to parse than a binary format, which adds up at thousands of calls per second.</li>
+  <li><strong>No standard for streaming, timeouts or errors</strong>: every team invents its own.</li>
+</ul>
+<p>gRPC (open-sourced by Google in 2015, based on its internal RPC system) makes the contract the source of truth and generates everything else from it.</p>
+
+<h2>How it works</h2>
+<ol>
+  <li><strong>Define the contract</strong> in a <code>.proto</code> file: services, methods, and message types.</li>
+  <li><strong>Generate code</strong> with <code>protoc</code> (or <code>buf</code>): a client <em>stub</em> for callers, a base class for the server. Go, Java, Python, TypeScript and more, all from the same file.</li>
+  <li><strong>Call the stub</strong> like a normal function. It serializes the request to protobuf and sends it as one <strong>HTTP/2 stream</strong>, so many calls share one connection.</li>
+  <li><strong>The server</strong> decodes the request, runs your handler, and replies with the response plus a <code>grpc-status</code> in the HTTP/2 trailers.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="A .proto file generates a client stub and a server base class. The stub calls the server over one HTTP/2 stream per call. On the stream: request headers with the method path and timeout, data frames with length-prefixed protobuf, and response trailers with grpc-status.">
+  <defs><marker id="arr-grpc-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="290" y="12" width="200" height="50" rx="10"/>
+  <text x="390" y="34" text-anchor="middle" class="title">order.proto</text>
+  <text x="390" y="52" text-anchor="middle" class="small">the contract</text>
+  <path class="line dashed" d="M310 62 L160 108" marker-end="url(#arr-grpc-1)"/>
+  <path class="line dashed" d="M470 62 L620 108" marker-end="url(#arr-grpc-1)"/>
+  <text x="390" y="92" text-anchor="middle" class="small">protoc generates code</text>
+
+  <rect class="box" x="30" y="110" width="220" height="54" rx="10"/>
+  <text x="140" y="133" text-anchor="middle" class="title">Client stub</text>
+  <text x="140" y="152" text-anchor="middle" class="small">you call client.GetOrder(ctx, req)</text>
+  <rect class="box" x="530" y="110" width="220" height="54" rx="10"/>
+  <text x="640" y="133" text-anchor="middle" class="title">Server base class</text>
+  <text x="640" y="152" text-anchor="middle" class="small">you implement GetOrder()</text>
+  <text x="390" y="128" text-anchor="middle">HTTP/2</text>
+  <path class="line accent" d="M252 137 H526" marker-end="url(#arr-grpc-1)" marker-start="url(#arr-grpc-1)"/>
+  <text x="390" y="156" text-anchor="middle" class="small">one stream per call</text>
+
+  <text x="390" y="196" text-anchor="middle" class="small">what travels on that stream</text>
+  <rect class="box" x="30" y="206" width="300" height="80" rx="8"/>
+  <text x="180" y="226" text-anchor="middle" class="title">request HEADERS</text>
+  <text x="180" y="244" text-anchor="middle" class="small">:path /orders.v1.OrderService/GetOrder</text>
+  <text x="180" y="260" text-anchor="middle" class="small">content-type: application/grpc</text>
+  <text x="180" y="276" text-anchor="middle" class="small">grpc-timeout: 300m</text>
+  <rect class="box" x="345" y="206" width="200" height="80" rx="8"/>
+  <text x="445" y="226" text-anchor="middle" class="title">DATA (both ways)</text>
+  <text x="445" y="244" text-anchor="middle" class="small">[1-byte flag][4-byte length]</text>
+  <text x="445" y="260" text-anchor="middle" class="small">[protobuf bytes]</text>
+  <rect class="box" x="560" y="206" width="190" height="80" rx="8"/>
+  <text x="655" y="226" text-anchor="middle" class="title">response trailers</text>
+  <text x="655" y="244" text-anchor="middle" class="small">grpc-status: 0 (OK)</text>
+  <text x="655" y="260" text-anchor="middle" class="small">grpc-message: …</text>
+</svg>
+<figcaption>One contract, generated code on both sides. A call is an HTTP/2 stream: a path naming the method, length-prefixed protobuf messages, and a status in the trailers.</figcaption>
+</figure>
+
+<h3>Protocol Buffers: why it's small and evolvable</h3>
+<p>Protobuf identifies fields by <strong>number</strong>, not by name. A message with <code>id = 42</code> in field 1 encodes to 2 bytes (<code>08 2A</code>: "field 1, varint" then 42); the JSON <code>{"id":42}</code> is 9 bytes. Because readers skip field numbers they don't know, old and new versions can talk to each other: add a field, and old clients just ignore it. The flip side: <strong>field numbers are forever</strong>. Reusing or retyping one silently corrupts data between versions.</p>
+
+<h3>Four kinds of calls</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Four call types. Unary: one request, one response. Server streaming: one request, many responses. Client streaming: many requests, one response. Bidirectional: both sides send messages independently.">
+  <defs><marker id="arr-grpc-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <path class="line" d="M200 10 V240 M395 10 V240 M590 10 V240" style="stroke: var(--line)"/>
+
+  <text x="102" y="22" text-anchor="middle" class="title">Unary</text>
+  <text x="50" y="44" text-anchor="middle" class="small">client</text><text x="155" y="44" text-anchor="middle" class="small">server</text>
+  <path class="line dashed" d="M50 52 V190 M155 52 V190" style="stroke: var(--line)"/>
+  <path class="line accent" d="M50 80 H153" marker-end="url(#arr-grpc-2)"/>
+  <path class="line ok dashed" d="M155 120 H52" marker-end="url(#arr-grpc-2)"/>
+  <text x="102" y="214" text-anchor="middle" class="small">GetOrder</text>
+  <text x="102" y="230" text-anchor="middle" class="small">like a REST call</text>
+
+  <text x="297" y="22" text-anchor="middle" class="title">Server streaming</text>
+  <text x="245" y="44" text-anchor="middle" class="small">client</text><text x="350" y="44" text-anchor="middle" class="small">server</text>
+  <path class="line dashed" d="M245 52 V190 M350 52 V190" style="stroke: var(--line)"/>
+  <path class="line accent" d="M245 75 H348" marker-end="url(#arr-grpc-2)"/>
+  <path class="line ok dashed" d="M350 105 H247" marker-end="url(#arr-grpc-2)"/>
+  <path class="line ok dashed" d="M350 130 H247" marker-end="url(#arr-grpc-2)"/>
+  <path class="line ok dashed" d="M350 155 H247" marker-end="url(#arr-grpc-2)"/>
+  <text x="297" y="214" text-anchor="middle" class="small">WatchOrder</text>
+  <text x="297" y="230" text-anchor="middle" class="small">status updates, price feed</text>
+
+  <text x="492" y="22" text-anchor="middle" class="title">Client streaming</text>
+  <text x="440" y="44" text-anchor="middle" class="small">client</text><text x="545" y="44" text-anchor="middle" class="small">server</text>
+  <path class="line dashed" d="M440 52 V190 M545 52 V190" style="stroke: var(--line)"/>
+  <path class="line accent" d="M440 75 H543" marker-end="url(#arr-grpc-2)"/>
+  <path class="line accent" d="M440 100 H543" marker-end="url(#arr-grpc-2)"/>
+  <path class="line accent" d="M440 125 H543" marker-end="url(#arr-grpc-2)"/>
+  <path class="line ok dashed" d="M545 160 H442" marker-end="url(#arr-grpc-2)"/>
+  <text x="492" y="214" text-anchor="middle" class="small">UploadEvents</text>
+  <text x="492" y="230" text-anchor="middle" class="small">batch upload, one summary</text>
+
+  <text x="685" y="22" text-anchor="middle" class="title">Bidirectional</text>
+  <text x="635" y="44" text-anchor="middle" class="small">client</text><text x="740" y="44" text-anchor="middle" class="small">server</text>
+  <path class="line dashed" d="M635 52 V190 M740 52 V190" style="stroke: var(--line)"/>
+  <path class="line accent" d="M635 72 H738" marker-end="url(#arr-grpc-2)"/>
+  <path class="line ok dashed" d="M740 94 H637" marker-end="url(#arr-grpc-2)"/>
+  <path class="line accent" d="M635 116 H738" marker-end="url(#arr-grpc-2)"/>
+  <path class="line accent" d="M635 138 H738" marker-end="url(#arr-grpc-2)"/>
+  <path class="line ok dashed" d="M740 160 H637" marker-end="url(#arr-grpc-2)"/>
+  <text x="687" y="214" text-anchor="middle" class="small">Chat, live sync</text>
+  <text x="687" y="230" text-anchor="middle" class="small">both sides talk freely</text>
+</svg>
+<figcaption>Streaming comes for free from HTTP/2 streams. Solid arrows are client messages, dashed arrows are server messages.</figcaption>
+</figure>
+
+<p>In Go (<code>grpc-go</code>), each call type becomes a method that takes either a <code>context</code> or a stream object:</p>
+<table>
+  <tr><th>Call type</th><th>In the .proto</th><th>Generated Go server method</th></tr>
+  <tr><td>Unary</td><td><code>rpc GetOrder(Req) returns (Order)</code></td><td><code>GetOrder(ctx context.Context, req *Req) (*Order, error)</code></td></tr>
+  <tr><td>Server streaming</td><td><code>returns (stream Event)</code></td><td><code>WatchOrder(req *Req, stream grpc.ServerStreamingServer[Event]) error</code></td></tr>
+  <tr><td>Client streaming</td><td><code>(stream Event) returns (Summary)</code></td><td><code>Upload(stream grpc.ClientStreamingServer[Event, Summary]) error</code></td></tr>
+  <tr><td>Bidirectional</td><td><code>(stream Msg) returns (stream Msg)</code></td><td><code>Chat(stream grpc.BidiStreamingServer[Msg, Msg]) error</code></td></tr>
+</table>
+
+<h3>Deadlines and status codes</h3>
+<p>Every call can carry a <strong>deadline</strong> ("give up 300 ms from now"), sent as the <code>grpc-timeout</code> header. The server can see how much time is left and pass the remaining budget on to the services it calls (in Go, just pass the incoming <code>ctx</code> to outgoing calls), so a whole chain gives up together instead of doing work nobody is waiting for. <strong>By default there is no deadline</strong>: a call can wait forever.</p>
+<p>Errors use a fixed set of 17 status codes instead of HTTP statuses. The HTTP response itself is <code>200</code> even when the call failed; the real result is <code>grpc-status</code> in the trailers.</p>
+<table>
+  <tr><th>Code</th><th>Meaning</th><th>Closest HTTP</th><th>Retry?</th></tr>
+  <tr><td><code>OK</code> (0)</td><td>success</td><td>200</td><td>–</td></tr>
+  <tr><td><code>INVALID_ARGUMENT</code> (3)</td><td>bad input, whatever the system state</td><td>400</td><td>no</td></tr>
+  <tr><td><code>DEADLINE_EXCEEDED</code> (4)</td><td>ran out of time (the work may still have happened)</td><td>504</td><td>only if idempotent</td></tr>
+  <tr><td><code>NOT_FOUND</code> (5)</td><td>entity doesn't exist</td><td>404</td><td>no</td></tr>
+  <tr><td><code>PERMISSION_DENIED</code> (7)</td><td>authenticated, but not allowed</td><td>403</td><td>no</td></tr>
+  <tr><td><code>RESOURCE_EXHAUSTED</code> (8)</td><td>quota or rate limit hit</td><td>429</td><td>later, with backoff</td></tr>
+  <tr><td><code>INTERNAL</code> (13)</td><td>bug or broken invariant on the server</td><td>500</td><td>usually no</td></tr>
+  <tr><td><code>UNAVAILABLE</code> (14)</td><td>server down or overloaded, temporary</td><td>503</td><td><strong>yes</strong>, with backoff</td></tr>
+  <tr><td><code>UNAUTHENTICATED</code> (16)</td><td>missing or invalid credentials</td><td>401</td><td>after re-auth</td></tr>
+</table>
+
+<h2>gRPC vs REST + JSON</h2>
+<table>
+  <tr><th></th><th>REST + JSON</th><th>gRPC</th></tr>
+  <tr><td>Contract</td><td>optional (OpenAPI), often drifts from the code</td><td>required <code>.proto</code>; code is generated from it</td></tr>
+  <tr><td>Payload</td><td>JSON text, human-readable</td><td>protobuf binary: smaller, faster to parse, not readable by eye</td></tr>
+  <tr><td>Transport</td><td>HTTP/1.1 or HTTP/2</td><td>HTTP/2 only</td></tr>
+  <tr><td>Streaming</td><td>bolt-ons (SSE, WebSockets)</td><td>built in, both directions</td></tr>
+  <tr><td>Browser support</td><td>native</td><td>needs gRPC-Web or Connect plus a proxy</td></tr>
+  <tr><td>Debugging</td><td>curl, browser DevTools</td><td>grpcurl, Postman, server reflection</td></tr>
+  <tr><td>Caching</td><td>HTTP caches and CDNs work out of the box</td><td>everything is POST: no HTTP caching</td></tr>
+  <tr><td>Best fit</td><td>public APIs, browsers, third parties</td><td>internal service-to-service, mobile apps, streaming</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>The contract</strong> (<code>orders/v1/order.proto</code>):</p>
+<pre><code>syntax = "proto3";
+package orders.v1;
+
+service OrderService {
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  rpc WatchOrder(GetOrderRequest) returns (stream OrderEvent);
+}
+
+message GetOrderRequest {
+  string id = 1;
+}
+
+message Order {
+  enum Status { STATUS_UNSPECIFIED = 0; PAID = 1; SHIPPED = 2; }
+
+  string id = 1;
+  int64 total_cents = 2;
+  Status status = 3;
+  reserved 4;  // old "coupon" field: removed, and its number is never reused
+}
+
+message OrderEvent {
+  Order.Status status = 1;
+}</code></pre>
+
+<p><strong>Server</strong> (Go, <code>grpc-go</code>): implement the generated interface.</p>
+<pre><code>type orderServer struct {
+	pb.UnimplementedOrderServiceServer // methods you don't write return UNIMPLEMENTED
+	store *OrderStore
+}
+
+func (s *orderServer) GetOrder(ctx context.Context, req *pb.GetOrderRequest) (*pb.Order, error) {
+	o, ok := s.store.Find(ctx, req.GetId())
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "order %s not found", req.GetId())
+	}
+	return &amp;pb.Order{Id: o.ID, TotalCents: o.TotalCents, Status: pb.Order_PAID}, nil
+}
+
+func (s *orderServer) WatchOrder(req *pb.GetOrderRequest, stream grpc.ServerStreamingServer[pb.OrderEvent]) error {
+	for st := range s.store.StatusUpdates(stream.Context(), req.GetId()) {
+		if err := stream.Send(&amp;pb.OrderEvent{Status: st}); err != nil {
+			return err // client went away
+		}
+	}
+	return nil
+}
+
+func main() {
+	lis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterOrderServiceServer(srv, &amp;orderServer{store: NewOrderStore()})
+	reflection.Register(srv) // lets grpcurl discover the API
+	log.Fatal(srv.Serve(lis))
+}</code></pre>
+
+<p><strong>Client</strong>: always set a deadline, and spread calls across every server.</p>
+<pre><code>conn, err := grpc.NewClient("dns:///orders.internal:50051",
+	grpc.WithTransportCredentials(insecure.NewCredentials()), // inside a mesh that adds TLS; use TLS otherwise
+	grpc.WithDefaultServiceConfig(&#96;{"loadBalancingConfig": [{"round_robin": {}}]}&#96;), // one connection per resolved IP, calls rotated
+)
+if err != nil {
+	log.Fatal(err)
+}
+defer conn.Close()
+client := pb.NewOrderServiceClient(conn)
+
+ctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond) // the deadline travels with the call
+defer cancel()
+
+order, err := client.GetOrder(ctx, &amp;pb.GetOrderRequest{Id: "42"})
+switch status.Code(err) {
+case codes.OK:
+	fmt.Println(order.GetTotalCents())
+case codes.NotFound:
+	// show "order not found"
+case codes.DeadlineExceeded, codes.Unavailable:
+	// retry with backoff, or degrade
+default:
+	return err
+}</code></pre>
+
+<p><strong>Poking a server from the terminal</strong> with <code>grpcurl</code> (needs server reflection enabled, or the .proto files):</p>
+<pre><code>$ grpcurl -plaintext localhost:50051 list
+orders.v1.OrderService
+
+$ grpcurl -plaintext -d '{"id": "42"}' localhost:50051 orders.v1.OrderService/GetOrder
+{
+  "id": "42",
+  "totalCents": "1999",
+  "status": "PAID"
+}</code></pre>
+<p>Note <code>"1999"</code> is a string: protobuf's JSON form writes 64-bit integers as strings, because JavaScript numbers can't hold all of them exactly.</p>
+
+<p><strong>Real-world scenario.</strong> A checkout service calls inventory, pricing and payments on every order. Moving those internal calls to gRPC gives each team a shared, versioned <code>.proto</code>, generated clients for every language in use, and a deadline that flows through the whole chain: if checkout has 800 ms left, pricing knows it and doesn't start work it can't finish. The public API for the web and partners stays REST + JSON, translated at the edge by an API gateway (Envoy's gRPC-JSON transcoder or <code>grpc-gateway</code>).</p>
+
+<h2>Load balancing: the classic gRPC surprise</h2>
+<p>gRPC keeps one long-lived HTTP/2 connection and sends every call over it. A <strong>layer-4</strong> load balancer (one that balances <em>connections</em>, like a plain Kubernetes <code>ClusterIP</code> Service or an AWS NLB) picks a backend once, when the connection opens. After that, every call goes to that one pod, and newly added pods get nothing.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Left: an L4 load balancer pins the client's single HTTP/2 connection to pod 1, while pods 2 and 3 sit idle. Right: client-side or L7 load balancing spreads calls across all three pods.">
+  <defs><marker id="arr-grpc-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="195" y="22" text-anchor="middle" class="title">L4 balancing: one connection, one pod</text>
+  <text x="590" y="22" text-anchor="middle" class="title">Client-side or L7 balancing</text>
+  <path class="line" d="M395 10 V240" style="stroke: var(--line)"/>
+
+  <rect class="box" x="20" y="100" width="90" height="40" rx="8"/><text x="65" y="125" text-anchor="middle">client</text>
+  <rect class="box" x="145" y="100" width="100" height="40" rx="8"/><text x="195" y="125" text-anchor="middle">L4 LB</text>
+  <path class="line bad" d="M110 120 H143" marker-end="url(#arr-grpc-3)"/>
+  <path class="line bad" d="M245 112 L278 62" marker-end="url(#arr-grpc-3)"/>
+  <rect class="box bad" x="280" y="40" width="100" height="40" rx="8"/><text x="330" y="65" text-anchor="middle">pod 1: all</text>
+  <rect class="box muted" x="280" y="100" width="100" height="40" rx="8"/><text x="330" y="125" text-anchor="middle">pod 2: idle</text>
+  <rect class="box muted" x="280" y="160" width="100" height="40" rx="8"/><text x="330" y="185" text-anchor="middle">pod 3: idle</text>
+  <text x="195" y="230" text-anchor="middle" class="small">the LB balanced the connection, not the calls</text>
+
+  <rect class="box" x="420" y="95" width="120" height="50" rx="8"/>
+  <text x="480" y="116" text-anchor="middle">client</text>
+  <text x="480" y="134" text-anchor="middle" class="small">round_robin</text>
+  <path class="line ok" d="M540 110 L638 62" marker-end="url(#arr-grpc-3)"/>
+  <path class="line ok" d="M540 120 H638" marker-end="url(#arr-grpc-3)"/>
+  <path class="line ok" d="M540 130 L638 178" marker-end="url(#arr-grpc-3)"/>
+  <rect class="box ok" x="640" y="40" width="120" height="40" rx="8"/><text x="700" y="65" text-anchor="middle">pod 1: 1/3</text>
+  <rect class="box ok" x="640" y="100" width="120" height="40" rx="8"/><text x="700" y="125" text-anchor="middle">pod 2: 1/3</text>
+  <rect class="box ok" x="640" y="160" width="120" height="40" rx="8"/><text x="700" y="185" text-anchor="middle">pod 3: 1/3</text>
+  <text x="590" y="230" text-anchor="middle" class="small">client knows every pod IP, or an L7 proxy balances each call</text>
+</svg>
+<figcaption>Fixes: client-side balancing (a Kubernetes <em>headless</em> Service so DNS returns every pod IP, plus <code>round_robin</code>), or an L7 proxy that understands HTTP/2 (Envoy, a service mesh like Istio or Linkerd, AWS ALB with a gRPC target group).</figcaption>
+</figure>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>No deadline = waits forever.</strong> gRPC calls have no timeout by default. One slow dependency then piles up stuck calls until threads or memory run out. Set a deadline on every call (see <a href="#timeouts">Timeouts</a>).</li>
+  <li><strong>Connection-level load balancing.</strong> Covered above: the most common production surprise. Watch for one hot pod after scaling up.</li>
+  <li><strong>Breaking the contract.</strong> Never reuse or retype a field number; mark removed ones <code>reserved</code>. Renaming a field is safe on the wire but breaks the JSON form. Run <code>buf breaking</code> in CI to catch it.</li>
+  <li><strong>proto3 can't tell "0" from "not set".</strong> Unset scalars read as their default (<code>0</code>, <code>""</code>, first enum value). Use <code>optional</code> when "missing" matters, and make enum value 0 an <code>UNSPECIFIED</code> placeholder.</li>
+  <li><strong>Browsers can't call gRPC directly.</strong> They can't control HTTP/2 frames or read trailers. Use gRPC-Web or Connect with a proxy, or keep REST at the edge.</li>
+  <li><strong>Monitoring that only reads HTTP status sees all green.</strong> Failed calls still return HTTP 200. Alert on <code>grpc-status</code> instead.</li>
+  <li><strong>Message size limit.</strong> Most implementations reject incoming messages over 4 MB by default. For big payloads, stream chunks or upload to object storage and pass a link.</li>
+  <li><strong>Long-lived streams vs idle timeouts.</strong> Proxies and load balancers cut quiet connections. Configure keepalive pings, and make stream consumers reconnect and resume.</li>
+  <li><strong>Retry only what's safe.</strong> <code>UNAVAILABLE</code> is the one code that's generally safe to retry. Retrying after <code>DEADLINE_EXCEEDED</code> can run a non-idempotent action twice (see <a href="#idempotency">Idempotency</a>).</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>gRPC = a <code>.proto</code> contract + generated clients and servers + protobuf over HTTP/2.</li>
+  <li>Four call types: unary, server streaming, client streaming, bidirectional.</li>
+  <li>Always set deadlines, handle status codes, and use L7 or client-side load balancing.</li>
+  <li>Best for internal service-to-service traffic; keep REST/JSON for browsers and public APIs.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#http-2-http-3">HTTP/2 &amp; HTTP/3</a> · <a href="#load-balancing">Load Balancing</a> · <a href="#service-discovery">Service Discovery</a> · <a href="#timeouts">Timeouts</a> · <a href="#retries">Retries</a> · <a href="#api-gateways">API Gateways</a> · <a href="#schema-versioning">Schema Versioning</a></p>
 `;
