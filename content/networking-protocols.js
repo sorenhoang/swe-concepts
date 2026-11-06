@@ -328,3 +328,222 @@ $ ss -tan state time-wait | wc -l   # Linux: count sockets stuck in TIME_WAIT</c
 
 <p><strong>Related:</strong> <a href="#dns">DNS</a> · <a href="#http-2-http-3">HTTP/2 &amp; HTTP/3</a> · <a href="#grpc">gRPC</a> · <a href="#websockets">WebSockets</a> · <a href="#connection-pooling">Connection Pooling</a> · <a href="#ddos-protection">DDoS Protection</a></p>
 `;
+
+CONTENT["http-2-http-3"] = `
+<p class="tldr"><strong>TL;DR</strong>: HTTP/2 and HTTP/3 keep the same HTTP you know (methods, headers, status codes) but change how it travels on the wire. <strong>HTTP/2</strong> sends many requests at once over <em>one</em> TCP connection using binary frames. <strong>HTTP/3</strong> moves to <strong>QUIC over UDP</strong>, so one lost packet no longer stalls every request, and connections start faster.</p>
+
+<h2>The problem it solves</h2>
+<p><strong>HTTP/1.1</strong> can only carry one request at a time per connection: send a request, wait for the whole response, then send the next. A modern page needs 50–100+ files, so:</p>
+<ul>
+  <li>Browsers open about <strong>6 parallel TCP connections per host</strong>, each paying its own TCP + TLS setup.</li>
+  <li>Developers invented workarounds: <em>domain sharding</em> (static1/static2.example.com for more connections), image sprites, and concatenating all JS/CSS into one file.</li>
+  <li>Headers are plain text and repeated on every request. Cookies and user agents alone can be hundreds of bytes, sent again and again.</li>
+  <li>HTTP/1.1 <em>pipelining</em> (sending several requests without waiting) existed, but responses still had to come back in order, and buggy proxies broke it, so browsers never turned it on.</li>
+</ul>
+<p>HTTP/2 (2015) fixed the "one at a time" problem. HTTP/3 (2022) fixed the problem HTTP/2 inherited from TCP.</p>
+
+<h2>How it works</h2>
+<h3>HTTP/2: many streams, one connection</h3>
+<ul>
+  <li><strong>Binary framing</strong>: each request and response is split into small frames (HEADERS, DATA, …), each tagged with a <strong>stream ID</strong>.</li>
+  <li><strong>Multiplexing</strong>: frames from many streams are interleaved on one TCP connection, so a slow response no longer blocks the others at the HTTP level.</li>
+  <li><strong>HPACK header compression</strong>: both sides keep a table of headers already sent, so a repeated <code>cookie</code> or <code>user-agent</code> costs a few bytes instead of hundreds.</li>
+  <li><strong>Per-stream flow control and priorities</strong>, so a big download doesn't starve the CSS the page needs first.</li>
+  <li><strong>Negotiation</strong>: the client and server agree on HTTP/2 during the TLS handshake (ALPN, protocol id <code>h2</code>). Browsers only use HTTP/2 over TLS.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 325" role="img" aria-label="Protocol stacks. HTTP/1.1: text messages over optional TLS over TCP. HTTP/2: binary frames and streams over TLS over TCP. HTTP/3: HTTP/3 frames over QUIC with built-in TLS 1.3 over UDP. All run over IP.">
+  <text x="140" y="24" text-anchor="middle" class="title">HTTP/1.1</text>
+  <text x="390" y="24" text-anchor="middle" class="title">HTTP/2</text>
+  <text x="640" y="24" text-anchor="middle" class="title">HTTP/3</text>
+  <rect class="box muted" x="30" y="40" width="720" height="36" rx="8"/>
+  <text x="390" y="63" text-anchor="middle">HTTP semantics: GET/POST, headers, status codes (same in all three)</text>
+
+  <rect class="box" x="30" y="90" width="220" height="50" rx="8"/>
+  <text x="140" y="111" text-anchor="middle">text messages</text>
+  <text x="140" y="129" text-anchor="middle" class="small">one request at a time</text>
+  <rect class="box" x="280" y="90" width="220" height="50" rx="8"/>
+  <text x="390" y="111" text-anchor="middle">binary frames + streams</text>
+  <text x="390" y="129" text-anchor="middle" class="small">HPACK header compression</text>
+  <rect class="box" x="530" y="90" width="220" height="50" rx="8"/>
+  <text x="640" y="111" text-anchor="middle">HTTP/3 frames</text>
+  <text x="640" y="129" text-anchor="middle" class="small">QPACK header compression</text>
+
+  <rect class="box muted" x="30" y="150" width="220" height="40" rx="8"/>
+  <text x="140" y="175" text-anchor="middle">TLS (optional)</text>
+  <rect class="box" x="280" y="150" width="220" height="40" rx="8"/>
+  <text x="390" y="175" text-anchor="middle">TLS (required by browsers)</text>
+  <rect class="box accent" x="530" y="150" width="220" height="40" rx="8"/>
+  <text x="640" y="175" text-anchor="middle">QUIC, with TLS 1.3 built in</text>
+
+  <rect class="box" x="30" y="200" width="220" height="40" rx="8"/>
+  <text x="140" y="225" text-anchor="middle">TCP</text>
+  <rect class="box" x="280" y="200" width="220" height="40" rx="8"/>
+  <text x="390" y="225" text-anchor="middle">TCP</text>
+  <rect class="box accent" x="530" y="200" width="220" height="40" rx="8"/>
+  <text x="640" y="225" text-anchor="middle">UDP</text>
+
+  <rect class="box muted" x="30" y="250" width="720" height="34" rx="8"/>
+  <text x="390" y="272" text-anchor="middle">IP</text>
+  <text x="140" y="310" text-anchor="middle" class="small">~6 connections per host</text>
+  <text x="390" y="310" text-anchor="middle" class="small">1 connection, many streams</text>
+  <text x="640" y="310" text-anchor="middle" class="small">1 connection, independent streams</text>
+</svg>
+<figcaption>Your application code sees the same HTTP in every version. What changes is the framing and the transport underneath.</figcaption>
+</figure>
+
+<h3>The catch: TCP head-of-line blocking</h3>
+<p>HTTP/2 multiplexes streams, but TCP only knows one ordered byte stream. If a single packet is lost, TCP holds back <em>everything</em> after it until the lost packet is re-sent, even frames from other streams that arrived fine. On a clean network this barely matters. On a lossy mobile network, one HTTP/2 connection can actually do worse than six HTTP/1.1 connections, because one loss now stalls every request instead of one.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 205" role="img" aria-label="Head-of-line blocking. Streams A, B and C share one connection and packet A2 is lost. Over TCP, B2 and C2 wait until A2 is re-sent. Over QUIC, B2 and C2 are delivered immediately and only stream A waits.">
+  <defs><marker id="arr-h23-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="390" y="20" text-anchor="middle" class="small">A, B, C = three requests (streams) on one connection. Packet A2 is lost on the way.</text>
+
+  <text x="20" y="62" class="title">HTTP/2 over TCP</text>
+  <rect class="box" x="150" y="40" width="56" height="34" rx="6"/><text x="178" y="62" text-anchor="middle">A1</text>
+  <rect class="box" x="220" y="40" width="56" height="34" rx="6"/><text x="248" y="62" text-anchor="middle">B1</text>
+  <rect class="box" x="290" y="40" width="56" height="34" rx="6"/><text x="318" y="62" text-anchor="middle">C1</text>
+  <rect class="box bad" x="360" y="40" width="56" height="34" rx="6"/><text x="388" y="62" text-anchor="middle">A2 ✗</text>
+  <rect class="box muted" x="430" y="40" width="56" height="34" rx="6"/><text x="458" y="62" text-anchor="middle">B2</text>
+  <rect class="box muted" x="500" y="40" width="56" height="34" rx="6"/><text x="528" y="62" text-anchor="middle">C2</text>
+  <path class="line" d="M562 57 H618" marker-end="url(#arr-h23-2)"/>
+  <rect class="box" x="620" y="40" width="140" height="34" rx="6"/><text x="690" y="62" text-anchor="middle">browser</text>
+  <text x="150" y="96" class="small">TCP delivers bytes in order: B2 and C2 arrived, but sit in a buffer until A2 is re-sent.</text>
+
+  <text x="20" y="152" class="title">HTTP/3 over QUIC</text>
+  <rect class="box" x="150" y="130" width="56" height="34" rx="6"/><text x="178" y="152" text-anchor="middle">A1</text>
+  <rect class="box" x="220" y="130" width="56" height="34" rx="6"/><text x="248" y="152" text-anchor="middle">B1</text>
+  <rect class="box" x="290" y="130" width="56" height="34" rx="6"/><text x="318" y="152" text-anchor="middle">C1</text>
+  <rect class="box bad" x="360" y="130" width="56" height="34" rx="6"/><text x="388" y="152" text-anchor="middle">A2 ✗</text>
+  <rect class="box ok" x="430" y="130" width="56" height="34" rx="6"/><text x="458" y="152" text-anchor="middle">B2</text>
+  <rect class="box ok" x="500" y="130" width="56" height="34" rx="6"/><text x="528" y="152" text-anchor="middle">C2</text>
+  <path class="line" d="M562 147 H618" marker-end="url(#arr-h23-2)"/>
+  <rect class="box" x="620" y="130" width="140" height="34" rx="6"/><text x="690" y="152" text-anchor="middle">browser</text>
+  <text x="150" y="186" class="small">QUIC tracks loss per stream: B and C are delivered now, only stream A waits for A2.</text>
+</svg>
+<figcaption>HTTP/2 removed blocking between requests at the HTTP level, but TCP still blocks at the packet level. QUIC removes that too.</figcaption>
+</figure>
+
+<h3>HTTP/3: HTTP over QUIC</h3>
+<p>Changing TCP itself is nearly impossible: it lives in every OS kernel and in millions of middleboxes. So QUIC rebuilds what HTTP needs on top of UDP, in user space:</p>
+<ul>
+  <li><strong>Independent streams</strong>: loss recovery is per stream, so no transport-level head-of-line blocking.</li>
+  <li><strong>TLS 1.3 built in</strong>: the transport and crypto handshakes are combined, so a new connection is ready in <strong>1 round trip</strong> instead of 2 (TCP + TLS 1.3).</li>
+  <li><strong>0-RTT resumption</strong>: when reconnecting to a server it has talked to before, the client can send the request in its very first packet.</li>
+  <li><strong>Connection migration</strong>: a connection is identified by a <em>connection ID</em>, not by IP and port, so switching from Wi-Fi to 4G doesn't kill an in-progress download.</li>
+  <li><strong>Always encrypted</strong>: even most of QUIC's own transport headers are encrypted, so middleboxes can't meddle with them.</li>
+  <li><strong>QPACK</strong> replaces HPACK, because HPACK assumed in-order delivery.</li>
+</ul>
+<p><strong>How does a browser know to use HTTP/3?</strong> It usually first connects over TCP (HTTP/2), and the server answers with <code>alt-svc: h3=":443"; ma=86400</code> ("I also speak HTTP/3 on UDP 443, remember it for a day"). Later requests try QUIC. An <code>HTTPS</code> DNS record can advertise it before the first connection. If UDP is blocked, the browser silently falls back to TCP.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 222" role="img" aria-label="Round trips before the first request can be sent. TCP plus TLS 1.2: 3 round trips. TCP plus TLS 1.3: 2. QUIC: 1. QUIC 0-RTT resumption: 0.">
+  <text x="20" y="51" class="title">TCP + TLS 1.2</text>
+  <rect class="box muted" x="230" y="30" width="150" height="32" rx="6"/><text x="305" y="51" text-anchor="middle">TCP handshake</text>
+  <rect class="box bad" x="380" y="30" width="300" height="32" rx="6"/><text x="530" y="51" text-anchor="middle">TLS 1.2 (2 round trips)</text>
+  <rect class="box ok" x="680" y="30" width="80" height="32" rx="6"/><text x="720" y="51" text-anchor="middle">GET</text>
+
+  <text x="20" y="96" class="title">TCP + TLS 1.3</text>
+  <rect class="box muted" x="230" y="75" width="150" height="32" rx="6"/><text x="305" y="96" text-anchor="middle">TCP handshake</text>
+  <rect class="box" x="380" y="75" width="150" height="32" rx="6"/><text x="455" y="96" text-anchor="middle">TLS 1.3</text>
+  <rect class="box ok" x="530" y="75" width="80" height="32" rx="6"/><text x="570" y="96" text-anchor="middle">GET</text>
+
+  <text x="20" y="141" class="title">QUIC (HTTP/3)</text>
+  <rect class="box accent" x="230" y="120" width="150" height="32" rx="6"/><text x="305" y="141" text-anchor="middle">QUIC + TLS 1.3</text>
+  <rect class="box ok" x="380" y="120" width="80" height="32" rx="6"/><text x="420" y="141" text-anchor="middle">GET</text>
+
+  <text x="20" y="179" class="title">QUIC 0-RTT</text>
+  <text x="20" y="195" class="small">(reconnecting)</text>
+  <rect class="box ok" x="230" y="165" width="80" height="32" rx="6"/><text x="270" y="186" text-anchor="middle">GET</text>
+  <text x="322" y="186" class="small">request rides in the very first packet</text>
+
+  <path class="line" d="M230 206 H760" style="stroke: var(--line)"/>
+  <text x="230" y="218" text-anchor="middle" class="small">0</text>
+  <text x="380" y="218" text-anchor="middle" class="small">1 RTT</text>
+  <text x="530" y="218" text-anchor="middle" class="small">2 RTT</text>
+  <text x="680" y="218" text-anchor="middle" class="small">3 RTT</text>
+</svg>
+<figcaption>Round trips spent before the first request byte is sent. At 100 ms per round trip (a phone far from the server), going from TLS 1.2 over TCP to QUIC saves 200 ms on every new connection.</figcaption>
+</figure>
+
+<h2>HTTP/1.1 vs HTTP/2 vs HTTP/3</h2>
+<table>
+  <tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr>
+  <tr><td>Transport</td><td>TCP</td><td>TCP</td><td>QUIC over UDP</td></tr>
+  <tr><td>Format</td><td>text</td><td>binary frames</td><td>binary frames</td></tr>
+  <tr><td>Parallel requests</td><td>one per connection (so ~6 connections)</td><td>many streams on 1 connection</td><td>many independent streams on 1 connection</td></tr>
+  <tr><td>Header compression</td><td>none</td><td>HPACK</td><td>QPACK</td></tr>
+  <tr><td>Head-of-line blocking</td><td>per connection</td><td>at TCP level (one loss stalls all streams)</td><td>only the stream that lost data</td></tr>
+  <tr><td>Encryption</td><td>optional</td><td>TLS in practice (browsers require it)</td><td>always, TLS 1.3 built in</td></tr>
+  <tr><td>Round trips to first request</td><td>2 with TLS 1.3</td><td>2 with TLS 1.3</td><td>1, or 0 when resuming</td></tr>
+  <tr><td>Survives network change</td><td>no</td><td>no</td><td>yes (connection IDs)</td></tr>
+  <tr><td>Current spec</td><td>RFC 9112</td><td>RFC 9113</td><td>RFC 9114 (QUIC: RFC 9000)</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>See which version you're getting.</strong> In Chrome DevTools, open the Network tab and right-click the column header to enable <em>Protocol</em>: you'll see <code>http/1.1</code>, <code>h2</code> or <code>h3</code>. From a terminal:</p>
+<pre><code>$ curl -sI -o /dev/null -w '%{http_version}\\n' https://www.google.com
+2
+
+$ curl -sI https://www.cloudflare.com | grep -i alt-svc
+alt-svc: h3=":443"; ma=86400          # "I also speak HTTP/3 on UDP 443"
+
+$ curl --http3 -sI -o /dev/null -w '%{http_version}\\n' https://www.cloudflare.com
+3                                     # needs a curl built with HTTP/3 support</code></pre>
+
+<p><strong>Calling an API over HTTP/2 from Kotlin.</strong> The JDK's built-in client (Java 11+) negotiates HTTP/2 and falls back to HTTP/1.1 if the server doesn't support it:</p>
+<pre><code>val client = HttpClient.newBuilder()
+  .version(HttpClient.Version.HTTP_2)
+  .build()
+
+// These 3 requests share ONE connection as 3 streams, instead of opening 3 connections
+val responses = listOf("/users", "/orders", "/invoices").map { path -&gt;
+  client.sendAsync(
+    HttpRequest.newBuilder(URI("https://api.example.com&#36;path")).build(),
+    HttpResponse.BodyHandlers.ofString(),
+  )
+}.map { it.join() }
+
+println(responses.first().version())  // HTTP_2</code></pre>
+
+<p><strong>Turning on HTTP/2 and HTTP/3 in nginx</strong> (1.25.1+):</p>
+<pre><code>server {
+  listen 443 ssl;               # TCP: HTTP/1.1 and HTTP/2
+  listen 443 quic reuseport;    # UDP: HTTP/3
+  http2 on;
+
+  ssl_certificate     /etc/ssl/example.crt;
+  ssl_certificate_key /etc/ssl/example.key;
+
+  # Tell browsers HTTP/3 is available; they switch on later requests
+  add_header Alt-Svc 'h3=":443"; ma=86400';
+}</code></pre>
+<p>Remember to open <strong>UDP</strong> 443 in the firewall or security group. Without it, nothing breaks: browsers just keep using HTTP/2.</p>
+
+<p><strong>Real-world scenario.</strong> A shopping app's users on mobile networks report slow product pages. The CDN already serves HTTP/2, but those networks lose 1–2% of packets, and each loss stalls all ~40 requests sharing the connection. Enabling HTTP/3 at the CDN (CloudFront, Cloudflare and Fastly all support it) means a loss only delays the image it belongs to, and users walking from Wi-Fi to 4G keep their connection. Nothing in the backend changes: the CDN terminates HTTP/3 and talks to the origin over HTTP/1.1 or HTTP/2 as before.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>HTTP/1.1 hacks hurt under HTTP/2.</strong> Domain sharding forces extra connections and defeats multiplexing and header compression. Drop it when you move to HTTP/2. Bundling is still useful, but you no longer need one giant file.</li>
+  <li><strong>HTTP/2 is not always faster.</strong> On lossy networks, TCP head-of-line blocking can make one HTTP/2 connection slower than six HTTP/1.1 connections. That's the problem HTTP/3 exists to fix.</li>
+  <li><strong>Server push is dead.</strong> HTTP/2 push was hard to use well and often sent things the browser already had cached. Chrome removed it in 2022. Use <code>&lt;link rel="preload"&gt;</code> or the <code>103 Early Hints</code> response instead.</li>
+  <li><strong>UDP is often blocked.</strong> Some corporate networks and firewalls block or throttle UDP 443. HTTP/3 is an upgrade on top of HTTP/2, never a replacement: always keep TCP working.</li>
+  <li><strong>0-RTT can be replayed.</strong> An attacker can capture and resend a 0-RTT request. Only allow it for safe, idempotent requests (GET), never for "pay now". Servers can answer <code>425 Too Early</code> to force a full handshake.</li>
+  <li><strong>QUIC costs more CPU.</strong> It runs in user space and gets less help from kernel and network-card offloads than TCP, so it uses more CPU per byte. That's one reason HTTP/3 mostly shows up at CDNs and big edges, not between internal services.</li>
+  <li><strong>The edge protocol isn't end to end.</strong> A load balancer or CDN terminates the client's HTTP/2 or HTTP/3 and opens its own connection to your servers. AWS ALB, for example, talks HTTP/1.1 to targets unless you set the target group protocol version to HTTP/2 or gRPC. gRPC needs HTTP/2 all the way through.</li>
+  <li><strong>Multiplexing has its own attacks.</strong> The HTTP/2 "Rapid Reset" attack (CVE-2023-44487, 2023) opened and cancelled streams in a tight loop to overload servers. Keep servers patched and cap concurrent streams per connection.</li>
+  <li><strong>Harder to debug by eye.</strong> Binary frames and mandatory encryption mean no more reading raw traffic. Use browser DevTools, <code>curl -v</code>, or Wireshark with a TLS key log (<code>SSLKEYLOGFILE</code>).</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Same HTTP semantics in every version: only framing and transport change, so app code rarely needs to.</li>
+  <li>HTTP/2 = many streams over one TCP connection, plus header compression. Remaining weakness: TCP head-of-line blocking.</li>
+  <li>HTTP/3 = HTTP over QUIC (UDP): per-stream loss recovery, 1-RTT setup (0-RTT on resume), survives network changes.</li>
+  <li>Deploy HTTP/3 as an upgrade with HTTP/2 fallback, usually at the CDN or edge first.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#tcp-vs-udp">TCP vs UDP</a> · <a href="#tls">TLS</a> · <a href="#grpc">gRPC</a> · <a href="#cdn">CDN</a> · <a href="#load-balancing">Load Balancing</a> · <a href="#websockets">WebSockets</a></p>
+`;
