@@ -1073,3 +1073,198 @@ $ curl -s localhost:8080/v2/orders/42
 `;
 
 
+CONTENT["real-world-traffic-stack"] = `
+<p class="tldr"><strong>TL;DR</strong>: In production, the concepts in this group are stacked in front of your code, each doing one job: the edge filters and rate-limits floods, load balancers spread traffic and skip dead servers, an API gateway authenticates, enforces quotas and routes by version, service discovery finds healthy instances, and reverse proxies handle TLS and buffering along the way. This page shows how they fit together in real systems, and how to keep them from fighting each other.</p>
+
+<h2>Why combine them at all?</h2>
+<p>No single component does everything well, and doing everything in your app means every service re-implements TLS, auth, limits and routing. Layering lets each concern live where it's cheapest and most effective: drop a flood at the edge before it costs anything, check a customer's quota where you know who they are, find instances where you know what's running. The risk is the opposite problem: the same job done in three places, inconsistently. The rest of this page is about getting that balance right.</p>
+
+<h2>How it works: one request through the stack</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 286" role="img" aria-label="Request path: client, DNS and CDN with WAF at the edge, regional layer 7 load balancer, API gateway, service discovery, service pods with sidecar proxies. Each box lists which concepts act there: rate limiting per IP at the edge, load balancing and health checks at the load balancer, auth, quotas and versioning at the gateway, discovery and mTLS inside.">
+  <defs><marker id="arr-ts-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="10" y="30" width="136" height="88" rx="10"/>
+  <text x="78" y="54" text-anchor="middle" class="title">1 Client</text>
+  <text x="78" y="74" text-anchor="middle" class="small">GET /v2/orders/42</text>
+  <text x="78" y="90" text-anchor="middle" class="small">Bearer token</text>
+  <rect class="box accent" x="166" y="30" width="136" height="88" rx="10"/>
+  <text x="234" y="54" text-anchor="middle" class="title">2 Edge</text>
+  <text x="234" y="74" text-anchor="middle" class="small">DNS, CDN, WAF</text>
+  <text x="234" y="90" text-anchor="middle" class="small">per-IP rate limit</text>
+  <text x="234" y="106" text-anchor="middle" class="small">TLS terminates</text>
+  <rect class="box accent" x="322" y="30" width="136" height="88" rx="10"/>
+  <text x="390" y="54" text-anchor="middle" class="title">3 Load balancer</text>
+  <text x="390" y="74" text-anchor="middle" class="small">L7, per region</text>
+  <text x="390" y="90" text-anchor="middle" class="small">health checks</text>
+  <text x="390" y="106" text-anchor="middle" class="small">spreads requests</text>
+  <rect class="box accent" x="478" y="30" width="136" height="88" rx="10"/>
+  <text x="546" y="54" text-anchor="middle" class="title">4 API gateway</text>
+  <text x="546" y="74" text-anchor="middle" class="small">auth (JWT / key)</text>
+  <text x="546" y="90" text-anchor="middle" class="small">quota per plan</text>
+  <text x="546" y="106" text-anchor="middle" class="small">route /v2 → orders</text>
+  <rect class="box" x="634" y="30" width="136" height="88" rx="10"/>
+  <text x="702" y="54" text-anchor="middle" class="title">5 Discovery</text>
+  <text x="702" y="74" text-anchor="middle" class="small">"orders" → healthy</text>
+  <text x="702" y="90" text-anchor="middle" class="small">pod IPs (k8s,</text>
+  <text x="702" y="106" text-anchor="middle" class="small">Consul, mesh)</text>
+  <path class="line" d="M146 74 H164" marker-end="url(#arr-ts-1)"/>
+  <path class="line" d="M302 74 H320" marker-end="url(#arr-ts-1)"/>
+  <path class="line" d="M458 74 H476" marker-end="url(#arr-ts-1)"/>
+  <path class="line" d="M614 74 H632" marker-end="url(#arr-ts-1)"/>
+  <path class="line" d="M702 118 V156" marker-end="url(#arr-ts-1)"/>
+
+  <rect class="box ok" x="478" y="158" width="292" height="92" rx="10"/>
+  <text x="624" y="182" text-anchor="middle" class="title">6 Service pods</text>
+  <rect class="box" x="494" y="194" width="124" height="44" rx="6"/><text x="556" y="213" text-anchor="middle" class="small">sidecar proxy</text><text x="556" y="228" text-anchor="middle" class="small">mTLS, retries</text>
+  <rect class="box" x="630" y="194" width="124" height="44" rx="6"/><text x="692" y="213" text-anchor="middle" class="small">orders app</text><text x="692" y="228" text-anchor="middle" class="small">business logic</text>
+  <rect class="box muted" x="10" y="158" width="440" height="92" rx="10"/>
+  <text x="30" y="182" class="title">What each layer adds to the request</text>
+  <text x="30" y="204" class="small">edge: X-Forwarded-For (client IP) · LB: trace ID · gateway: X-User-ID,</text>
+  <text x="30" y="221" class="small">X-Request-ID, version routing · sidecar: verified service identity</text>
+  <text x="30" y="238" class="small">the app sees an authenticated, rate-limited, traceable request</text>
+  <text x="390" y="276" text-anchor="middle" class="small">Small systems collapse layers: one managed load balancer + the app can be the whole stack.</text>
+</svg>
+<figcaption>Outside in: cheap, coarse filtering first (edge), then distribution (load balancer), then API policy (gateway), then location (discovery), then the code that does the work.</figcaption>
+</figure>
+
+<h3>Who does what</h3>
+<table>
+  <tr><th>Job</th><th>Edge (CDN / WAF)</th><th>Load balancer</th><th>Reverse proxy</th><th>API gateway</th><th>Mesh / discovery</th><th>App</th></tr>
+  <tr><td><a href="#rate-limiting">Rate limiting</a></td><td>per IP, floods</td><td>rarely</td><td>sometimes</td><td>per key / plan</td><td>sometimes</td><td>per expensive operation</td></tr>
+  <tr><td>TLS termination</td><td>yes (public certs)</td><td>often</td><td>often</td><td>sometimes</td><td>mTLS inside</td><td>rarely</td></tr>
+  <tr><td>Routing</td><td>by host / path to origins</td><td>by host / path to pools</td><td>by host / path</td><td>by API route and version</td><td>by service name</td><td>internal handlers</td></tr>
+  <tr><td>Health checks</td><td>origin health</td><td><strong>yes</strong></td><td>passive</td><td>sometimes</td><td><strong>yes</strong></td><td>exposes <code>/healthz</code>, <code>/readyz</code></td></tr>
+  <tr><td>Authentication</td><td>bot checks</td><td>rarely</td><td>rarely</td><td><strong>yes</strong></td><td>service identity</td><td>authorization decisions</td></tr>
+  <tr><td><a href="#api-versioning">Versioning</a></td><td>–</td><td>–</td><td>path rules</td><td>routes versions</td><td>–</td><td>adapters per version</td></tr>
+  <tr><td>Retries and timeouts</td><td>origin timeout</td><td>timeout, maybe retry</td><td>timeout</td><td>timeout, maybe retry</td><td>retry budget</td><td>deadlines</td></tr>
+</table>
+<p>Bold marks where a job <em>must</em> live. Everything else is optional, and every "sometimes" you turn on needs a reason.</p>
+
+<h3>Timeouts shrink as you go inward</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 238" role="img" aria-label="Nested timeouts: edge 60 seconds contains load balancer 30 seconds, which contains gateway 15 seconds, which contains the service 10 seconds, which contains its database call 2 seconds. Retries happen at one layer only.">
+  <rect class="box muted" x="20" y="14" width="740" height="210" rx="12"/>
+  <text x="36" y="36" class="title">Edge / CDN: 60 s</text>
+  <rect class="box" x="60" y="48" width="680" height="166" rx="10"/>
+  <text x="76" y="70" class="title">Load balancer: 30 s</text>
+  <rect class="box accent" x="100" y="82" width="620" height="122" rx="10"/>
+  <text x="116" y="104" class="title">API gateway: 15 s (the only layer that retries, once, idempotent requests only)</text>
+  <rect class="box ok" x="140" y="116" width="560" height="78" rx="10"/>
+  <text x="156" y="138" class="title">orders service: 10 s deadline</text>
+  <rect class="box" x="180" y="150" width="240" height="34" rx="8"/><text x="300" y="172" text-anchor="middle" class="small">database query: 2 s</text>
+  <rect class="box" x="440" y="150" width="240" height="34" rx="8"/><text x="560" y="172" text-anchor="middle" class="small">payments call: 3 s</text>
+</svg>
+<figcaption>Each outer layer waits a bit longer than the one inside it, so the innermost layer gives up first and returns a real error instead of an orphaned request.</figcaption>
+</figure>
+<p>If an outer layer times out first, it returns 504 while inner layers keep working on a request nobody is waiting for. And if three layers each make up to 3 attempts, one failing call becomes 3 × 3 × 3 = 27 attempts at the bottom, exactly when the system is weakest. Retry in one place, with a budget (see <a href="#retries">Retries</a>).</p>
+
+<h2>Real use cases</h2>
+<table>
+  <tr><th>System</th><th>Stack</th><th>Why this shape</th></tr>
+  <tr><td>Early-stage startup, one app</td><td>managed load balancer → 2–3 app instances; rate limiting in the app</td><td>everything else is overhead until you have several services or external API customers</td></tr>
+  <tr><td>Public API for partners</td><td>CDN/WAF → load balancer → <strong>API gateway</strong> (keys, usage plans, <code>/v1</code> + <code>/v2</code>) → services</td><td>quotas, billing per key, stable versions while internals change</td></tr>
+  <tr><td>Mobile app backend</td><td>CDN → load balancer → <strong>BFF gateway</strong> per client type → services; WebSockets on a separate L7 listener</td><td>one tailored call per screen over slow networks; old app versions pinned to old API versions</td></tr>
+  <tr><td>Microservices on Kubernetes</td><td>cloud load balancer → ingress / gateway → <strong>Services + mesh</strong> (discovery, mTLS, retries) → pods</td><td>hundreds of instances changing constantly; east-west traffic needs identity and discovery</td></tr>
+  <tr><td>Global SaaS</td><td>DNS latency routing / anycast → regional load balancers → regional gateways → regional services</td><td>users hit the nearest region; a whole region can fail over</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>How a request looks at each hop</strong> (headers trimmed):</p>
+<pre><code>client → edge          GET /v2/orders/42
+                       Authorization: Bearer eyJhbGciOi…
+
+edge → load balancer   + X-Forwarded-For: 203.0.113.7       (WAF passed; per-IP limit 31/300 used)
+                       + X-Forwarded-Proto: https
+
+LB → gateway           + X-Amzn-Trace-Id: Root=1-6730f2a1-…  (target chosen by health + algorithm)
+
+gateway → orders pod   + X-Request-ID: 9f2c41d7e0a3          (JWT verified; plan "pro": 412/1000 left)
+                       + X-User-ID: u_123                    (set by the gateway, never by the client)
+                       routed: /v2/* → orders-v2, discovered via orders.shop.svc.cluster.local
+
+sidecar → orders app   plain HTTP on 127.0.0.1, caller identity verified with mTLS</code></pre>
+
+<p><strong>Your service's side of the deal, in Go.</strong> Most of the stack's guarantees depend on the app cooperating: separate liveness and readiness, a graceful shutdown that lets load balancers and discovery notice before the process exits, server timeouts below the gateway's, and trusting identity headers only from the gateway.</p>
+<pre><code>var ready atomic.Bool
+
+func main() {
+	mux := http.NewServeMux()
+	// Liveness: the process is alive. Readiness: send me traffic.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.Handle("/", fromGatewayOnly(api()))
+
+	srv := &amp;http.Server{
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      12 * time.Second, // below the gateway's 15 s
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	ready.Store(true)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	&lt;-ctx.Done()
+
+	ready.Store(false)           // 1. fail readiness: LB and discovery stop sending new requests
+	time.Sleep(15 * time.Second) // 2. give them time to notice (check interval × threshold)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	srv.Shutdown(shutdownCtx)    // 3. finish in-flight requests, then exit
+}
+
+// Identity headers are only meaningful if they came through the gateway.
+func fromGatewayOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !fromTrustedProxy(r.RemoteAddr) { // e.g. the mesh sidecar on 127.0.0.1
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}</code></pre>
+
+<p><strong>Real-world scenario: a Black Friday, layer by layer.</strong> Traffic jumps to 8× normal at 9:00.</p>
+<ul>
+  <li><strong>Edge</strong>: the CDN serves product images and cached catalogue pages, so most requests never reach the origin. The WAF and per-IP limits absorb a scraping bot that started at the same time.</li>
+  <li><strong>Load balancer</strong>: autoscaling adds 40 instances; slow-start ramps them up gradually; a few that fail readiness never receive traffic.</li>
+  <li><strong>API gateway</strong>: a partner's runaway sync job hits its quota and gets 429s with <code>Retry-After</code> instead of starving checkout. A new <code>/v2/checkout</code> rolled out last week; v1 clients are unaffected.</li>
+  <li><strong>Discovery</strong>: new pods show up in the registry within seconds; a node that dies takes its pods out of rotation after two failed checks, and callers retry those requests on other instances.</li>
+  <li><strong>What went wrong anyway</strong>: the search service had retries configured at the gateway, the mesh <em>and</em> its client library. When its database slowed down, retries multiplied the load until it fell over. The postmortem's fix: retry only at the mesh, with a 10% retry budget.</li>
+</ul>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Over-building early.</strong> A gateway, a mesh and three proxies for one service is cost and latency with no benefit. Add a layer when you can name the problem it solves.</li>
+  <li><strong>The same job in several layers, configured differently.</strong> Rate limits of 100/min at the gateway and 50/min in the app produce confusing 429s. Give each job one owner, and document it.</li>
+  <li><strong>Retry amplification.</strong> Retries at every layer multiply. Retry in one layer, only idempotent requests, with backoff and a budget.</li>
+  <li><strong>Timeouts in the wrong order.</strong> Outer layers must wait longer than inner ones, or you get 504s for work that's still running.</li>
+  <li><strong>Header trust chains.</strong> Every layer appends or sets headers (<code>X-Forwarded-For</code>, <code>X-User-ID</code>). Each one must trust only the layer directly in front of it, and overwrite anything the client could have forged.</li>
+  <li><strong>Latency per hop.</strong> Each proxy adds a little; with TLS between every hop and no connection reuse, it adds a lot. Reuse connections and measure the overhead.</li>
+  <li><strong>Config spread across five systems.</strong> Routes, limits and timeouts drift apart when they're edited by hand in consoles. Keep them in code (see <a href="#infrastructure-as-code">Infrastructure as Code</a>) and review them together.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Outside in: edge (filter, cache) → load balancer (spread, health) → gateway (auth, quota, version) → discovery (find) → app.</li>
+  <li>Give every job exactly one owner layer; "sometimes" features need a reason.</li>
+  <li>Timeouts shrink inward; retries happen in one layer only.</li>
+  <li>Start with the smallest stack that works and add layers as real problems appear.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#rate-limiting">Rate Limiting</a> · <a href="#load-balancing">Load Balancing</a> · <a href="#reverse-proxies">Reverse Proxies</a> · <a href="#api-gateways">API Gateways</a> · <a href="#service-discovery">Service Discovery</a> · <a href="#api-versioning">API Versioning</a> · <a href="#timeouts">Timeouts</a> · <a href="#retries">Retries</a></p>
+`;
+
