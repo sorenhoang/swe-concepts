@@ -202,3 +202,194 @@ Retry-After: 1</code></pre>
 `;
 
 
+CONTENT["load-balancing"] = `
+<p class="tldr"><strong>TL;DR</strong>: A load balancer sits in front of several copies of a service and spreads incoming traffic across them, skipping any copy that's unhealthy. Clients see one address; behind it you can add, remove, and restart servers freely. It's the host at a busy restaurant, seating each new guest at a table that's free.</p>
+
+<h2>The problem it solves</h2>
+<ul>
+  <li><strong>One server isn't enough</strong>: to handle more traffic you run many copies (<a href="#horizontal-scaling">horizontal scaling</a>), and something has to split the work.</li>
+  <li><strong>Servers fail</strong>: a crashed or overloaded instance must stop receiving traffic automatically, without clients noticing.</li>
+  <li><strong>Deploys and scaling</strong>: instances come and go all day; clients shouldn't need to know their addresses.</li>
+</ul>
+<p>A load balancer gives clients one stable endpoint and turns a fleet of interchangeable servers into one reliable service.</p>
+
+<h2>How it works</h2>
+<ol>
+  <li>Clients connect to the load balancer's address (often found through <a href="#dns">DNS</a>).</li>
+  <li>For each new connection (layer 4) or request (layer 7), it <strong>picks a backend</strong> with an algorithm: round robin, least connections, and so on.</li>
+  <li>It <strong>health-checks</strong> every backend (e.g. <code>GET /healthz</code> every few seconds) and only sends traffic to healthy ones. It can also notice failures passively, from errors in real traffic.</li>
+  <li>When a backend is being removed, it <strong>drains</strong> it: no new requests, but in-flight ones may finish.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 262" role="img" aria-label="Clients send requests to one load balancer address. The load balancer spreads them across server 1 and server 2 using round robin; server 3 fails its health check and receives no traffic.">
+  <defs><marker id="arr-lb-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="60" width="110" height="34" rx="8"/><text x="75" y="82" text-anchor="middle">client</text>
+  <rect class="box" x="20" y="114" width="110" height="34" rx="8"/><text x="75" y="136" text-anchor="middle">client</text>
+  <rect class="box" x="20" y="168" width="110" height="34" rx="8"/><text x="75" y="190" text-anchor="middle">client</text>
+  <path class="line" d="M130 77 L228 120 M130 131 H228 M130 185 L228 142"/>
+  <rect class="box accent" x="230" y="96" width="170" height="70" rx="10"/>
+  <text x="315" y="122" text-anchor="middle" class="title">Load balancer</text>
+  <text x="315" y="140" text-anchor="middle" class="small">api.example.com</text>
+  <text x="315" y="156" text-anchor="middle" class="small">round robin</text>
+
+  <rect class="box ok" x="560" y="30" width="200" height="50" rx="10"/>
+  <text x="660" y="52" text-anchor="middle" class="title">server 1</text><text x="660" y="70" text-anchor="middle" class="small">healthy: requests 1, 3, 5…</text>
+  <rect class="box ok" x="560" y="106" width="200" height="50" rx="10"/>
+  <text x="660" y="128" text-anchor="middle" class="title">server 2</text><text x="660" y="146" text-anchor="middle" class="small">healthy: requests 2, 4, 6…</text>
+  <rect class="box bad" x="560" y="182" width="200" height="50" rx="10"/>
+  <text x="660" y="204" text-anchor="middle" class="title">server 3</text><text x="660" y="222" text-anchor="middle" class="small">failed /healthz: no traffic</text>
+  <path class="line ok" d="M400 115 L558 58" marker-end="url(#arr-lb-1)"/>
+  <path class="line ok" d="M400 131 H558" marker-end="url(#arr-lb-1)"/>
+  <path class="line bad dashed" d="M400 150 L558 205"/>
+  <text x="478" y="198" text-anchor="middle" class="small">✗ skipped</text>
+  <text x="315" y="250" text-anchor="middle" class="small">health check every few seconds: GET /healthz on each server</text>
+</svg>
+<figcaption>Clients only know the load balancer. Failed servers drop out automatically and rejoin when their health checks pass again.</figcaption>
+</figure>
+
+<h3>Layer 4 vs layer 7</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 238" role="img" aria-label="Layer 4 load balancers see only IP addresses and ports and pick a backend per TCP connection. Layer 7 load balancers see HTTP: path, headers and cookies, and can route each request, for example /api to the API pool and /images to the static pool.">
+  <defs><marker id="arr-lb-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="195" y="22" text-anchor="middle" class="title">Layer 4 (TCP/UDP)</text>
+  <text x="590" y="22" text-anchor="middle" class="title">Layer 7 (HTTP)</text>
+  <path class="line" d="M390 10 V230" style="stroke: var(--line)"/>
+  <rect class="box muted" x="20" y="40" width="350" height="46" rx="8"/>
+  <text x="195" y="60" text-anchor="middle" class="small">sees: 203.0.113.7:51234 → 10.0.0.5:443</text>
+  <text x="195" y="77" text-anchor="middle" class="small">(encrypted bytes; no idea what's inside)</text>
+  <rect class="box accent" x="120" y="104" width="150" height="40" rx="8"/><text x="195" y="129" text-anchor="middle">L4 LB</text>
+  <path class="line" d="M170 144 L80 186 M195 144 V186 M220 144 L310 186" />
+  <rect class="box" x="30" y="188" width="100" height="32" rx="6"/><text x="80" y="209" text-anchor="middle" class="small">server</text>
+  <rect class="box" x="145" y="188" width="100" height="32" rx="6"/><text x="195" y="209" text-anchor="middle" class="small">server</text>
+  <rect class="box" x="260" y="188" width="100" height="32" rx="6"/><text x="310" y="209" text-anchor="middle" class="small">server</text>
+
+  <rect class="box muted" x="410" y="40" width="360" height="46" rx="8"/>
+  <text x="590" y="60" text-anchor="middle" class="small">sees: GET /api/orders, Host, cookies, headers</text>
+  <text x="590" y="77" text-anchor="middle" class="small">(terminates TLS to read the request)</text>
+  <rect class="box accent" x="515" y="104" width="150" height="40" rx="8"/><text x="590" y="129" text-anchor="middle">L7 LB</text>
+  <path class="line" d="M560 144 L490 186" marker-end="url(#arr-lb-2)"/>
+  <path class="line" d="M620 144 L690 186" marker-end="url(#arr-lb-2)"/>
+  <text x="500" y="168" text-anchor="end" class="small">/api/*</text>
+  <text x="680" y="168" class="small">/images/*</text>
+  <rect class="box" x="420" y="188" width="140" height="32" rx="6"/><text x="490" y="209" text-anchor="middle" class="small">API servers</text>
+  <rect class="box" x="620" y="188" width="140" height="32" rx="6"/><text x="690" y="209" text-anchor="middle" class="small">static servers</text>
+</svg>
+<figcaption>L4 is fast and protocol-agnostic but balances whole connections. L7 understands HTTP, so it can route by path or header, retry, and balance per request.</figcaption>
+</figure>
+<p>On AWS, the Network Load Balancer is layer 4 and the Application Load Balancer is layer 7; nginx, HAProxy and Envoy can do both.</p>
+
+<h2>Balancing algorithms</h2>
+<table>
+  <tr><th>Algorithm</th><th>How it picks</th><th>Good for</th><th>Watch out</th></tr>
+  <tr><td>Round robin</td><td>next server in turn</td><td>identical servers, similar requests</td><td>ignores load: a slow server still gets its turn</td></tr>
+  <tr><td>Weighted round robin</td><td>bigger servers get proportionally more</td><td>mixed instance sizes, canary at 5%</td><td>weights need maintaining</td></tr>
+  <tr><td>Least connections / requests</td><td>server with the fewest in flight</td><td>uneven request durations</td><td>needs live counts; a fast-failing server looks "free"</td></tr>
+  <tr><td>Power of two choices</td><td>pick 2 at random, send to the less busy one</td><td>large fleets, many load balancers</td><td>slightly random, but avoids herding</td></tr>
+  <tr><td>Hash (IP, user, key)</td><td>same key → same server</td><td>caches, session affinity</td><td>hot keys; reshuffles when servers change (use consistent hashing)</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>A tiny round-robin load balancer in Go</strong> with active health checks, built on the standard library's reverse proxy:</p>
+<pre><code>type Backend struct {
+	URL     *url.URL
+	proxy   *httputil.ReverseProxy
+	healthy atomic.Bool
+}
+
+type LoadBalancer struct {
+	backends []*Backend
+	next     atomic.Uint64
+}
+
+func NewLoadBalancer(urls ...string) *LoadBalancer {
+	lb := &amp;LoadBalancer{}
+	for _, raw := range urls {
+		u, err := url.Parse(raw)
+		if err != nil {
+			log.Fatal(err)
+		}
+		b := &amp;Backend{URL: u, proxy: httputil.NewSingleHostReverseProxy(u)}
+		b.healthy.Store(true)
+		lb.backends = append(lb.backends, b)
+	}
+	return lb
+}
+
+// Round robin, skipping unhealthy backends.
+func (lb *LoadBalancer) pick() *Backend {
+	n := uint64(len(lb.backends))
+	for range n {
+		b := lb.backends[lb.next.Add(1)%n]
+		if b.healthy.Load() {
+			return b
+		}
+	}
+	return nil
+}
+
+func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	b := lb.pick()
+	if b == nil {
+		http.Error(w, "no healthy backend", http.StatusServiceUnavailable)
+		return
+	}
+	b.proxy.ServeHTTP(w, r)
+}
+
+// Active health checks. Real load balancers also require N failures in a row.
+func (lb *LoadBalancer) HealthCheck(ctx context.Context, every time.Duration) {
+	client := &amp;http.Client{Timeout: 2 * time.Second}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		for _, b := range lb.backends {
+			resp, err := client.Get(b.URL.String() + "/healthz")
+			ok := err == nil &amp;&amp; resp.StatusCode == http.StatusOK
+			if resp != nil {
+				resp.Body.Close()
+			}
+			if ok != b.healthy.Load() {
+				log.Printf("%s healthy=%v", b.URL, ok)
+			}
+			b.healthy.Store(ok)
+		}
+		select {
+		case &lt;-ticker.C:
+		case &lt;-ctx.Done():
+			return
+		}
+	}
+}
+
+func main() {
+	lb := NewLoadBalancer("http://10.0.1.10:8080", "http://10.0.1.11:8080", "http://10.0.1.12:8080")
+	go lb.HealthCheck(context.Background(), 5*time.Second)
+	log.Fatal(http.ListenAndServe(":80", lb))
+}</code></pre>
+<p>Kill one backend and watch requests keep succeeding once the next health check marks it down. Real load balancers add thresholds (e.g. AWS ALB checks every 30 seconds by default and needs 2 consecutive failures to mark a target unhealthy), passive failure detection, retries and connection draining.</p>
+
+<p><strong>Real-world scenario: the deploy that dropped requests.</strong> A team's rolling deploy caused a burst of 502s every time. The new pods were fine; the problem was the old ones. Kubernetes sent SIGTERM and the app exited immediately, while the load balancer was still routing requests to it for a few more seconds. The fix: on SIGTERM, first fail the readiness check and keep serving for a short grace period so the load balancer stops sending new requests, then finish in-flight ones and exit. Load balancers call this <strong>connection draining</strong> or a <em>deregistration delay</em> (300 seconds by default on AWS target groups).</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Sticky sessions fight balancing.</strong> Pinning users to a server (for in-memory sessions) breaks even distribution and loses sessions when that server dies. Keep servers stateless and put sessions in a shared store.</li>
+  <li><strong>Long-lived connections stay put.</strong> WebSockets, gRPC and HTTP/2 hold one connection for a long time, so an L4 balancer can't rebalance them, and new servers sit idle (see <a href="#grpc">gRPC</a>).</li>
+  <li><strong>Health checks that check too little or too much.</strong> "Process is up" misses a broken database connection; a check that calls every dependency can mark <em>all</em> servers unhealthy when one shared dependency blips. Check what this instance needs to serve traffic.</li>
+  <li><strong>New servers get flattened.</strong> A cold instance (empty caches, JIT warming up) receiving a full share immediately can fall over. Use slow-start or ramp-up weights.</li>
+  <li><strong>Retries at the load balancer amplify load.</strong> Retrying failed requests on another server helps for one bad instance, but during overload it multiplies traffic. Retry only idempotent requests, with a budget (see <a href="#retries">Retries</a>).</li>
+  <li><strong>The load balancer itself is a single point of failure.</strong> Managed cloud load balancers are redundant across zones; self-hosted ones need a pair with failover.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>A load balancer = one address in front of many servers + an algorithm + health checks + draining.</li>
+  <li>L4 balances connections and is protocol-agnostic; L7 understands HTTP and balances requests.</li>
+  <li>Keep backends stateless, health checks meaningful, and drain servers before stopping them.</li>
+  <li>Beware long-lived connections, retry storms, and cold servers.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#reverse-proxies">Reverse Proxies</a> · <a href="#health-checks">Health Checks</a> · <a href="#horizontal-scaling">Horizontal Scaling</a> · <a href="#service-discovery">Service Discovery</a> · <a href="#grpc">gRPC</a> · <a href="#real-world-traffic-stack">Real-World Traffic Stack</a></p>
+`;
+
+
