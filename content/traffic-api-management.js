@@ -904,3 +904,172 @@ func HealthyInstances(ctx context.Context, service string) ([]string, error) {
 `;
 
 
+CONTENT["api-versioning"] = `
+<p class="tldr"><strong>TL;DR</strong>: API versioning lets you change an API without breaking the clients already using it. Non-breaking changes (adding a field) ship freely; breaking changes (renaming or removing one) go into a new <strong>version</strong> that clients move to on their own schedule, while the old one keeps working until a published <strong>sunset</strong> date.</p>
+
+<h2>The problem it solves</h2>
+<p>Once an API is public, or even just used by a mobile app, you don't control when clients update. Mobile users run app versions from two years ago; partners integrated once and moved on. If you rename <code>total</code> to <code>total_cents</code>, every one of them breaks the moment you deploy. Versioning separates "we improved the API" from "everyone must change their code today".</p>
+
+<h3>Breaking or not?</h3>
+<table>
+  <tr><th>Usually safe (no new version needed)</th><th>Breaking (needs a new version)</th></tr>
+  <tr><td>adding a new endpoint</td><td>removing or renaming an endpoint or field</td></tr>
+  <tr><td>adding an optional request field</td><td>making an optional field required</td></tr>
+  <tr><td>adding a response field</td><td>changing a field's type or format (<code>"12.50"</code> → <code>1250</code>)</td></tr>
+  <tr><td>adding a new enum value <em>if</em> clients were told to expect unknown values</td><td>changing meaning or defaults (amounts now in cents, not dollars)</td></tr>
+  <tr><td>relaxing validation</td><td>tightening validation, changing error codes or auth rules</td></tr>
+</table>
+<p>"Safe" assumes <strong>tolerant readers</strong>: clients that ignore fields they don't know. Say so in your docs.</p>
+
+<h2>How it works</h2>
+<h3>Where to put the version</h3>
+<table>
+  <tr><th>Strategy</th><th>Looks like</th><th>Pros</th><th>Cons</th><th>Used by</th></tr>
+  <tr><td>URL path</td><td><code>/v2/orders/42</code></td><td>obvious, easy to route, cache and test in a browser</td><td>versions the whole API at once</td><td>most public APIs, Google APIs</td></tr>
+  <tr><td>Query parameter</td><td><code>/orders/42?api-version=2</code></td><td>easy to add</td><td>easy to forget; caching gets messy</td><td>Azure services</td></tr>
+  <tr><td>Custom header</td><td><code>X-GitHub-Api-Version: 2022-11-28</code></td><td>clean URLs</td><td>invisible in links; caches need <code>Vary</code></td><td>GitHub REST API</td></tr>
+  <tr><td>Media type</td><td><code>Accept: application/vnd.example.v2+json</code></td><td>"pure" HTTP content negotiation</td><td>awkward for clients and tools</td><td>some hypermedia APIs</td></tr>
+  <tr><td>Date-based, pinned per account</td><td><code>Stripe-Version: 2024-06-20</code></td><td>small, frequent changes; each account keeps its version</td><td>you maintain many small transformations</td><td>Stripe</td></tr>
+</table>
+<p>For most teams, <strong>URL path versions with long-lived majors</strong> (<code>/v1</code>, <code>/v2</code>) are the pragmatic default. gRPC uses the same idea in the package name (<code>orders.v1</code>), and GraphQL APIs usually avoid versions entirely by only adding fields and deprecating old ones.</p>
+
+<h3>One codebase, many versions</h3>
+<p>Don't fork the code per version. Keep one core model and thin <strong>adapters</strong> that translate it to each version's shape:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 220" role="img" aria-label="Requests to /v1/orders and /v2/orders hit separate thin handlers that translate to and from one shared core order service and database. v1 returns total as a decimal string; v2 returns total_cents and currency.">
+  <defs><marker id="arr-ver-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box muted" x="20" y="40" width="150" height="40" rx="8"/><text x="95" y="65" text-anchor="middle" class="small">GET /v1/orders/42</text>
+  <rect class="box" x="20" y="140" width="150" height="40" rx="8"/><text x="95" y="165" text-anchor="middle" class="small">GET /v2/orders/42</text>
+  <rect class="box muted" x="230" y="32" width="200" height="56" rx="8"/>
+  <text x="330" y="55" text-anchor="middle" class="title">v1 adapter</text>
+  <text x="330" y="74" text-anchor="middle" class="small">"total": "12.50" + Deprecation</text>
+  <rect class="box" x="230" y="132" width="200" height="56" rx="8"/>
+  <text x="330" y="155" text-anchor="middle" class="title">v2 adapter</text>
+  <text x="330" y="174" text-anchor="middle" class="small">"total_cents": 1250, "currency"</text>
+  <rect class="box accent" x="510" y="72" width="250" height="76" rx="10"/>
+  <text x="635" y="100" text-anchor="middle" class="title">Core order service</text>
+  <text x="635" y="120" text-anchor="middle" class="small">one model, one database,</text>
+  <text x="635" y="136" text-anchor="middle" class="small">one set of business rules</text>
+  <path class="line" d="M170 60 H228" marker-end="url(#arr-ver-1)"/>
+  <path class="line" d="M170 160 H228" marker-end="url(#arr-ver-1)"/>
+  <path class="line" d="M430 60 L508 95" marker-end="url(#arr-ver-1)"/>
+  <path class="line" d="M430 160 L508 125" marker-end="url(#arr-ver-1)"/>
+</svg>
+<figcaption>Versions differ only at the edge. Bug fixes and new rules land once and every version gets them.</figcaption>
+</figure>
+
+<h3>The lifecycle: announce, deprecate, sunset</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 196" role="img" aria-label="Version lifecycle timeline: v1 is current; v2 is released and v1 is marked deprecated with Deprecation and Sunset headers; during the migration window traffic to v1 is monitored and heavy users are contacted; after the sunset date v1 returns 410 Gone and is removed.">
+  <path class="line" d="M40 90 H750" style="stroke: var(--line)"/>
+  <rect class="box ok" x="40" y="70" width="170" height="40" rx="6"/><text x="125" y="95" text-anchor="middle" class="small">v1 current</text>
+  <rect class="box accent" x="210" y="70" width="340" height="40" rx="6"/><text x="380" y="95" text-anchor="middle" class="small">v1 deprecated: migration window (months)</text>
+  <rect class="box bad" x="550" y="70" width="200" height="40" rx="6"/><text x="650" y="95" text-anchor="middle" class="small">v1 sunset: 410 Gone</text>
+  <text x="210" y="50" text-anchor="middle" class="title">v2 released</text>
+  <text x="210" y="140" text-anchor="middle" class="small">Deprecation + Sunset</text>
+  <text x="210" y="155" text-anchor="middle" class="small">headers, emails</text>
+  <text x="380" y="140" text-anchor="middle" class="small">watch v1 traffic per client,</text>
+  <text x="380" y="155" text-anchor="middle" class="small">contact the biggest users</text>
+  <text x="550" y="50" text-anchor="middle" class="title">sunset date</text>
+  <text x="650" y="140" text-anchor="middle" class="small">delete the v1 adapter</text>
+  <text x="650" y="155" text-anchor="middle" class="small">(the core stays)</text>
+</svg>
+<figcaption>Deprecation is a process, not a deploy. Measure who still calls the old version and tell them, in the response itself and out of band.</figcaption>
+</figure>
+<p>Two standard headers announce it machine-readably: <code>Deprecation</code> (RFC 9745, a timestamp like <code>@1767225600</code>) and <code>Sunset</code> (RFC 8594, an HTTP date after which the endpoint may stop working), plus a <code>Link</code> with <code>rel="deprecation"</code> pointing to the migration guide.</p>
+
+<h2>Example</h2>
+<p><strong>v1 and v2 side by side in Go</strong>, sharing one core <code>Order</code>. v1 formatted money as a decimal string (a classic mistake); v2 uses integer cents plus a currency:</p>
+<pre><code>// The core model: one shape, used by every version.
+type Order struct {
+	ID         string
+	TotalCents int64
+	Currency   string
+	Status     string
+}
+
+// v1: money as a decimal string. Kept only for old clients.
+type orderV1 struct {
+	ID     string &#96;json:"id"&#96;
+	Total  string &#96;json:"total"&#96;
+	Status string &#96;json:"status"&#96;
+}
+
+// v2: integer cents + currency.
+type orderV2 struct {
+	ID         string &#96;json:"id"&#96;
+	TotalCents int64  &#96;json:"total_cents"&#96;
+	Currency   string &#96;json:"currency"&#96;
+	Status     string &#96;json:"status"&#96;
+}
+
+func routes(mux *http.ServeMux, orders OrderStore) {
+	mux.HandleFunc("GET /v1/orders/{id}", func(w http.ResponseWriter, r *http.Request) {
+		o, err := orders.Get(r.Context(), r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		h := w.Header()
+		h.Set("Deprecation", "@1767225600")             // deprecated since 2026-01-01 (RFC 9745)
+		h.Set("Sunset", "Wed, 30 Jun 2027 23:59:59 GMT") // may stop working after this (RFC 8594)
+		h.Set("Link", &#96;&lt;https://docs.example.com/migrate-to-v2&gt;; rel="deprecation"&#96;)
+		writeJSON(w, orderV1{
+			ID:     o.ID,
+			Total:  fmt.Sprintf("%d.%02d", o.TotalCents/100, o.TotalCents%100),
+			Status: o.Status,
+		})
+	})
+
+	mux.HandleFunc("GET /v2/orders/{id}", func(w http.ResponseWriter, r *http.Request) {
+		o, err := orders.Get(r.Context(), r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, orderV2{ID: o.ID, TotalCents: o.TotalCents, Currency: o.Currency, Status: o.Status})
+	})
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}</code></pre>
+<p>Calling both:</p>
+<pre><code>$ curl -si localhost:8080/v1/orders/42
+HTTP/1.1 200 OK
+Content-Type: application/json
+Deprecation: @1767225600
+Link: &lt;https://docs.example.com/migrate-to-v2&gt;; rel="deprecation"
+Sunset: Wed, 30 Jun 2027 23:59:59 GMT
+
+{"id":"42","total":"12.50","status":"paid"}
+
+$ curl -s localhost:8080/v2/orders/42
+{"id":"42","total_cents":1250,"currency":"USD","status":"paid"}</code></pre>
+
+<p><strong>Real-world scenario: the mobile app you can't update.</strong> A food-delivery company shipped v2 of its API and turned off v1 after three months. Support tickets exploded: about 8% of users ran app versions that only knew v1, because many phones don't auto-update. The lesson the team took: log the API version and app version on every request, sunset only when old-version traffic is near zero (or force an app update screen first), and keep the v1 adapter around, which was cheap because it was only an adapter over the shared core.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Breaking without bumping.</strong> "Small" renames in place break someone. If you're unsure whether a change is breaking, assume it is, or add the new field alongside the old one (expand, then contract later).</li>
+  <li><strong>Versioning too often.</strong> Every live version is code to test, document and secure. Batch breaking changes into rare major versions; ship additive changes continuously.</li>
+  <li><strong>Forking the codebase per version.</strong> Copy-pasted handlers drift and bugs get fixed in one version only. Use adapters over one core.</li>
+  <li><strong>Never sunsetting.</strong> Old versions accumulate forever. Publish a support policy (for example: at least 12 months after deprecation) and follow it with data.</li>
+  <li><strong>No default for unversioned requests.</strong> With header versioning, decide what a request without the header gets, and never silently move it to a newer version.</li>
+  <li><strong>Caches ignoring the version.</strong> If the version lives in a header, responses must send <code>Vary</code> on it, or a CDN may serve a v2 body to a v1 client.</li>
+  <li><strong>Clients that crash on unknown fields or enum values.</strong> Write your own clients as tolerant readers, and document that you'll add fields and values over time.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Additive changes don't need a version; breaking changes do.</li>
+  <li>URL path majors (<code>/v1</code>, <code>/v2</code>) are the pragmatic default; date-pinned versions suit APIs with many small changes.</li>
+  <li>Keep one core and thin per-version adapters.</li>
+  <li>Deprecate with <code>Deprecation</code>/<code>Sunset</code> headers and data on who still calls the old version, then remove it.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#api-gateways">API Gateways</a> · <a href="#schema-versioning">Schema Versioning</a> · <a href="#semantic-versioning">Semantic Versioning</a> · <a href="#database-migrations">Database Migrations</a> · <a href="#grpc">gRPC</a> · <a href="#real-world-traffic-stack">Real-World Traffic Stack</a></p>
+`;
+
+
