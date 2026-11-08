@@ -744,3 +744,163 @@ func authenticate(next http.Handler) http.Handler {
 `;
 
 
+CONTENT["service-discovery"] = `
+<p class="tldr"><strong>TL;DR</strong>: Service discovery is how a service finds the current network addresses of the services it calls, when those addresses keep changing. Instances register themselves (or are registered) in a <strong>registry</strong>, health checks remove dead ones, and callers look up a <em>name</em> like <code>orders</code> instead of hard-coding <code>10.0.1.17:8080</code>. It's a phone book that updates itself every few seconds.</p>
+
+<h2>The problem it solves</h2>
+<p>In the old world, a service lived on a known server for years and its IP went into a config file. Today:</p>
+<ul>
+  <li>Containers and pods get <strong>new IPs</strong> every time they restart or are rescheduled.</li>
+  <li><strong>Autoscaling</strong> adds and removes instances all day.</li>
+  <li>Instances <strong>fail</strong>, and callers must stop using them within seconds, not after someone edits a config file.</li>
+</ul>
+<p>Hard-coded addresses break on the next deploy. Service discovery keeps an always-current list of healthy instances per service.</p>
+
+<h2>How it works</h2>
+<ol>
+  <li><strong>Register</strong>: when an instance starts, it's added to the registry with its address and port, either by the instance itself (self-registration) or by the platform (Kubernetes adds pod IPs to a Service's endpoints).</li>
+  <li><strong>Health-check</strong>: the registry checks each instance (or expects heartbeats); failing instances are marked unhealthy and removed from answers.</li>
+  <li><strong>Look up</strong>: a caller asks "where is <code>orders</code>?", through DNS, an API, or a local proxy, and gets healthy addresses.</li>
+  <li><strong>Deregister</strong>: on shutdown the instance is removed, ideally <em>before</em> it stops serving.</li>
+</ol>
+<p>Who does the lookup and the choosing is the main design decision:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 262" role="img" aria-label="Client-side discovery: the caller queries the registry, gets the list of instances and picks one itself. Server-side discovery: the caller sends to a load balancer or virtual IP, which consults the registry and picks an instance.">
+  <defs><marker id="arr-sd-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="195" y="22" text-anchor="middle" class="title">Client-side discovery</text>
+  <text x="590" y="22" text-anchor="middle" class="title">Server-side discovery</text>
+  <path class="line" d="M390 10 V254" style="stroke: var(--line)"/>
+
+  <rect class="box accent" x="130" y="40" width="130" height="44" rx="8"/><text x="195" y="60" text-anchor="middle" class="title">Registry</text><text x="195" y="76" text-anchor="middle" class="small">Consul, Eureka</text>
+  <rect class="box" x="20" y="130" width="120" height="44" rx="8"/><text x="80" y="150" text-anchor="middle" class="title">caller</text><text x="80" y="166" text-anchor="middle" class="small">picks an instance</text>
+  <path class="line" d="M95 130 L150 86" marker-end="url(#arr-sd-1)"/>
+  <text x="18" y="96" class="small">1 where is orders?</text>
+  <path class="line dashed" d="M175 86 L120 128" marker-end="url(#arr-sd-1)"/>
+  <text x="168" y="118" class="small">2 [a, b, c]</text>
+  <rect class="box ok" x="250" y="120" width="120" height="30" rx="6"/><text x="310" y="140" text-anchor="middle" class="small">orders a</text>
+  <rect class="box ok" x="250" y="160" width="120" height="30" rx="6"/><text x="310" y="180" text-anchor="middle" class="small">orders b</text>
+  <rect class="box ok" x="250" y="200" width="120" height="30" rx="6"/><text x="310" y="220" text-anchor="middle" class="small">orders c</text>
+  <path class="line accent" d="M140 160 L248 175" marker-end="url(#arr-sd-1)"/>
+  <text x="140" y="204" class="small">3 call b directly</text>
+
+  <rect class="box" x="410" y="130" width="110" height="44" rx="8"/><text x="465" y="150" text-anchor="middle" class="title">caller</text><text x="465" y="166" text-anchor="middle" class="small">calls one name</text>
+  <rect class="box accent" x="550" y="40" width="130" height="44" rx="8"/><text x="615" y="60" text-anchor="middle" class="title">Registry</text><text x="615" y="76" text-anchor="middle" class="small">k8s API, Cloud Map</text>
+  <rect class="box" x="550" y="130" width="100" height="44" rx="8"/><text x="600" y="150" text-anchor="middle" class="title">LB / VIP</text><text x="600" y="166" text-anchor="middle" class="small">picks one</text>
+  <path class="line" d="M520 152 H548" marker-end="url(#arr-sd-1)"/>
+  <path class="line dashed" d="M610 128 V86" marker-end="url(#arr-sd-1)"/>
+  <rect class="box ok" x="680" y="120" width="85" height="30" rx="6"/><text x="722" y="140" text-anchor="middle" class="small">orders a</text>
+  <rect class="box ok" x="680" y="160" width="85" height="30" rx="6"/><text x="722" y="180" text-anchor="middle" class="small">orders b</text>
+  <rect class="box ok" x="680" y="200" width="85" height="30" rx="6"/><text x="722" y="220" text-anchor="middle" class="small">orders c</text>
+  <path class="line accent" d="M650 160 L678 175" marker-end="url(#arr-sd-1)"/>
+  <text x="590" y="248" text-anchor="middle" class="small">e.g. http://orders.shop.svc.cluster.local</text>
+</svg>
+<figcaption>Client-side: smarter callers, one less hop, but every language needs a client library. Server-side: dumb callers, one extra hop, the platform does the work. A service mesh is client-side discovery done by a sidecar proxy, so your code stays dumb.</figcaption>
+</figure>
+
+<h3>Life of an instance in the registry</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 196" role="img" aria-label="Timeline: an instance starts and registers, passes health checks and receives traffic. On graceful shutdown it deregisters first, drains in-flight requests, then stops. On a crash, health checks fail a few times before the registry removes it, and some requests fail in that window.">
+  <text x="20" y="44" class="title">Graceful</text>
+  <rect class="box muted" x="130" y="26" width="110" height="28" rx="4"/><text x="185" y="45" text-anchor="middle" class="small">start + register</text>
+  <rect class="box ok" x="240" y="26" width="290" height="28" rx="4"/><text x="385" y="45" text-anchor="middle" class="small">healthy: receiving traffic</text>
+  <rect class="box accent" x="530" y="26" width="90" height="28" rx="4"/><text x="575" y="45" text-anchor="middle" class="small">deregister</text>
+  <rect class="box accent" x="620" y="26" width="80" height="28" rx="4"/><text x="660" y="45" text-anchor="middle" class="small">drain</text>
+  <text x="710" y="45" class="small">stop</text>
+  <text x="575" y="74" text-anchor="middle" class="small">callers stop picking it before it goes away</text>
+
+  <text x="20" y="124" class="title">Crash</text>
+  <rect class="box muted" x="130" y="106" width="110" height="28" rx="4"/><text x="185" y="125" text-anchor="middle" class="small">start + register</text>
+  <rect class="box ok" x="240" y="106" width="210" height="28" rx="4"/><text x="345" y="125" text-anchor="middle" class="small">healthy: receiving traffic</text>
+  <rect class="box bad" x="450" y="106" width="170" height="28" rx="4"/><text x="535" y="125" text-anchor="middle" class="small">dead, still listed ✗</text>
+  <text x="630" y="125" class="small">removed</text>
+  <text x="535" y="154" text-anchor="middle" class="small">failures until health checks catch up</text>
+  <text x="535" y="170" text-anchor="middle" class="small">(interval × failure threshold, plus DNS / cache TTLs)</text>
+</svg>
+<figcaption>Graceful shutdown should never cause errors. Crashes always cause a short window of errors, so callers need timeouts and retries on another instance.</figcaption>
+</figure>
+
+<h2>Tools and approaches</h2>
+<table>
+  <tr><th>Approach</th><th>How callers find services</th><th>Health</th><th>Notes</th></tr>
+  <tr><td>Kubernetes Services</td><td>DNS name → stable virtual IP; kube-proxy forwards to a ready pod</td><td>readiness probes</td><td>built in; a <em>headless</em> Service returns every pod IP instead</td></tr>
+  <tr><td>DNS (A / SRV records)</td><td>standard DNS lookup; SRV adds ports and weights</td><td>depends on who updates DNS</td><td>works everywhere, but cached by TTL (see <a href="#dns">DNS</a>)</td></tr>
+  <tr><td>HashiCorp Consul</td><td>HTTP API, DNS interface, or Connect sidecars</td><td>HTTP/TCP/script checks, TTL heartbeats</td><td>multi-platform: VMs, containers, multiple datacenters</td></tr>
+  <tr><td>etcd / ZooKeeper</td><td>clients watch keys</td><td>leases / ephemeral nodes vanish when the client dies</td><td>building blocks; Kubernetes itself stores state in etcd</td></tr>
+  <tr><td>Netflix Eureka</td><td>client library caches the registry</td><td>heartbeats</td><td>classic in Spring Cloud setups</td></tr>
+  <tr><td>AWS Cloud Map / ECS Service Connect</td><td>DNS or API</td><td>Route 53 or ECS health checks</td><td>managed, for ECS and EC2</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>Three ways a Go service finds <code>orders</code></strong>, from simplest to most explicit:</p>
+<pre><code>// 1. Kubernetes: the Service name IS the discovery. kube-proxy (or the mesh)
+//    picks a ready pod behind this stable name.
+resp, err := http.Get("http://orders.shop.svc.cluster.local:8080/orders/42")
+
+// 2. DNS SRV records: hosts AND ports, with priority and weight.
+//    (Consul answers DNS on port 8600; forward the .consul domain to it.)
+_, records, err := net.LookupSRV("", "", "orders.service.consul")
+for _, rec := range records {
+	fmt.Printf("%s:%d priority=%d weight=%d&#92;n", rec.Target, rec.Port, rec.Priority, rec.Weight)
+}
+
+// 3. Ask the registry's API for instances that pass their health checks.
+type consulEntry struct {
+	Node    struct{ Address string }
+	Service struct {
+		Address string
+		Port    int
+	}
+}
+
+func HealthyInstances(ctx context.Context, service string) ([]string, error) {
+	u := "http://127.0.0.1:8500/v1/health/service/" + url.PathEscape(service) + "?passing=true"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err // caller should fall back to its last known good list
+	}
+	defer resp.Body.Close()
+
+	var entries []consulEntry
+	if err := json.NewDecoder(resp.Body).Decode(&amp;entries); err != nil {
+		return nil, err
+	}
+	addrs := make([]string, 0, len(entries))
+	for _, e := range entries {
+		host := e.Service.Address
+		if host == "" {
+			host = e.Node.Address // Consul leaves it empty when it's the node's address
+		}
+		addrs = append(addrs, net.JoinHostPort(host, strconv.Itoa(e.Service.Port)))
+	}
+	return addrs, nil
+}</code></pre>
+
+<p><strong>Real-world scenario: the five-minute ghost.</strong> After scaling down, a payments service kept getting connection errors for several minutes, calling pods that no longer existed. Discovery was fine: the registry had removed them within seconds. But the calling service resolved the DNS name once at startup and kept the IPs in a long-lived connection pool, and one runtime cached DNS for far longer than the record's TTL. The fixes: respect DNS TTLs, cap connection lifetimes so pools periodically reconnect (and re-resolve), and retry failed calls on a different instance.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Stale answers.</strong> DNS TTLs, client caches and connection pools all keep using old addresses after the registry changed. Short TTLs, bounded connection lifetimes and retries on another instance close the gap.</li>
+  <li><strong>The registry is now critical.</strong> If it's down and callers can't resolve anything, everything is down. Cache the last known good list and keep using it when the registry is unreachable.</li>
+  <li><strong>Deregister before stopping.</strong> Stopping first and deregistering later causes errors on every deploy. Fail readiness, wait for callers to notice, drain, then exit (see <a href="#liveness-readiness-probes">Liveness &amp; Readiness Probes</a>).</li>
+  <li><strong>Health checks that lie.</strong> "Port is open" isn't "can serve requests". A registered-but-broken instance attracts traffic and returns errors.</li>
+  <li><strong>Client-side discovery in many languages.</strong> Every language needs a correct client with caching, health filtering and balancing. That's why meshes and platform-level discovery became popular.</li>
+  <li><strong>Hard-coded IPs "just for now".</strong> They always outlive the "now". Use names from day one; on Kubernetes it costs nothing.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Service discovery = a registry of healthy instances per service name, kept current automatically.</li>
+  <li>Client-side (caller picks) vs server-side (LB/VIP picks); a mesh does client-side for you.</li>
+  <li>On Kubernetes, a Service name is discovery; headless Services give you every pod IP.</li>
+  <li>Plan for staleness: TTLs, cached lists, connection lifetimes, graceful deregistration.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#load-balancing">Load Balancing</a> · <a href="#dns">DNS</a> · <a href="#health-checks">Health Checks</a> · <a href="#kubernetes">Kubernetes</a> · <a href="#grpc">gRPC</a> · <a href="#real-world-traffic-stack">Real-World Traffic Stack</a></p>
+`;
+
+
