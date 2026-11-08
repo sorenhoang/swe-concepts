@@ -138,13 +138,14 @@
 -->
 <script>const CONTENT = {};</script>
 <script src="content/networking-protocols.js"></script>
+<script src="content/real-time-integration.js"></script>
 
 <script>
   const GROUPS = [
     { name: "Networking & Protocols", desc: "How bytes move between machines: name resolution, transport, and modern wire protocols.",
       items: ["DNS", "TCP vs UDP", "HTTP/2 & HTTP/3", "gRPC", "What Happens When You Type google.com"] },
     { name: "Real-time & Integration", desc: "Pushing data to clients and to other systems without them asking over and over.",
-      items: ["WebSockets", "Long Polling", "Server-Sent Events", "Webhooks"] },
+      items: ["WebSockets", "Long Polling", "Server-Sent Events", "Webhooks", "Real-time Trade-offs & Use Cases"] },
     { name: "Traffic & API Management", desc: "What sits in front of your services: routing, shaping and protecting incoming requests.",
       items: ["Rate Limiting", "Load Balancing", "Reverse Proxies", "API Gateways", "Service Discovery", "API Versioning"] },
     { name: "Caching & Content Delivery", desc: "Serving data faster by keeping copies closer to the reader, and knowing when they go stale.",
