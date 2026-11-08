@@ -567,3 +567,180 @@ func ClientIP(r *http.Request, trusted func(netip.Addr) bool) string {
 `;
 
 
+CONTENT["api-gateways"] = `
+<p class="tldr"><strong>TL;DR</strong>: An API gateway is the single entry point for all your API clients. It routes each request to the right backend service and handles the cross-cutting chores every service would otherwise repeat: <strong>authentication, rate limits and quotas, request IDs, logging, transformations, CORS</strong>. Think of a hotel front desk: guests talk to one desk, which checks who they are and sends each request to the right department.</p>
+
+<h2>The problem it solves</h2>
+<p>Once a backend is split into many services, every client would have to know every service's address, and every service would have to re-implement the same edge logic:</p>
+<ul>
+  <li>Verifying JWTs or API keys, in 20 services, in 3 languages, with 20 chances to get it wrong.</li>
+  <li>Per-customer quotas ("free plan: 1,000 calls/day") that only make sense across <em>all</em> services.</li>
+  <li>Mobile apps making 6 calls to 6 services to render one screen over a slow network.</li>
+  <li>Internal structure leaking out: rename or split a service and every client breaks.</li>
+</ul>
+<p>The gateway gives clients one stable API and gives teams one place for edge policy.</p>
+
+<h2>How it works</h2>
+<ol>
+  <li>A request arrives at <code>api.example.com</code>.</li>
+  <li>The gateway runs a pipeline of <strong>policies</strong>: assign a request ID, authenticate the caller, check rate limits and quotas, maybe validate or transform the request.</li>
+  <li>It <strong>routes</strong> by path, host, header or version (<code>/v2/orders/*</code> → orders service) to a backend found via <a href="#service-discovery">service discovery</a>.</li>
+  <li>It returns the response, possibly transformed, and records metrics and logs for every call.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="Web, mobile and partner clients call one API gateway. The gateway runs request ID, authentication, rate limiting, routing and logging, then forwards to the orders, payments and users services.">
+  <defs><marker id="arr-gw-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="50" width="120" height="36" rx="8"/><text x="80" y="73" text-anchor="middle">web app</text>
+  <rect class="box" x="20" y="125" width="120" height="36" rx="8"/><text x="80" y="148" text-anchor="middle">mobile app</text>
+  <rect class="box" x="20" y="200" width="120" height="36" rx="8"/><text x="80" y="223" text-anchor="middle">partner API</text>
+  <path class="line" d="M140 68 L228 120" marker-end="url(#arr-gw-1)"/>
+  <path class="line" d="M140 143 H228" marker-end="url(#arr-gw-1)"/>
+  <path class="line" d="M140 218 L228 166" marker-end="url(#arr-gw-1)"/>
+
+  <rect class="box accent" x="230" y="20" width="250" height="250" rx="12"/>
+  <text x="355" y="46" text-anchor="middle" class="title">API gateway</text>
+  <rect class="box" x="250" y="60" width="210" height="30" rx="6"/><text x="355" y="80" text-anchor="middle" class="small">1 request ID + access log</text>
+  <rect class="box" x="250" y="98" width="210" height="30" rx="6"/><text x="355" y="118" text-anchor="middle" class="small">2 authenticate (JWT / API key)</text>
+  <rect class="box" x="250" y="136" width="210" height="30" rx="6"/><text x="355" y="156" text-anchor="middle" class="small">3 rate limit + quota per plan</text>
+  <rect class="box" x="250" y="174" width="210" height="30" rx="6"/><text x="355" y="194" text-anchor="middle" class="small">4 transform / validate</text>
+  <rect class="box" x="250" y="212" width="210" height="30" rx="6"/><text x="355" y="232" text-anchor="middle" class="small">5 route by path / version</text>
+
+  <rect class="box ok" x="590" y="50" width="170" height="40" rx="8"/><text x="675" y="75" text-anchor="middle">orders service</text>
+  <rect class="box ok" x="590" y="125" width="170" height="40" rx="8"/><text x="675" y="150" text-anchor="middle">payments service</text>
+  <rect class="box ok" x="590" y="200" width="170" height="40" rx="8"/><text x="675" y="225" text-anchor="middle">users service</text>
+  <path class="line" d="M480 210 L588 72" marker-end="url(#arr-gw-1)"/>
+  <path class="line" d="M480 222 L588 147" marker-end="url(#arr-gw-1)"/>
+  <path class="line" d="M480 232 L588 220" marker-end="url(#arr-gw-1)"/>
+  <text x="584" y="64" text-anchor="end" class="small">/orders/*</text>
+  <text x="584" y="139" text-anchor="end" class="small">/payments/*</text>
+  <text x="584" y="211" text-anchor="end" class="small">/users/*</text>
+</svg>
+<figcaption>Policies run once at the edge, in order; services receive requests that are already authenticated, limited and tagged with an ID.</figcaption>
+</figure>
+
+<h3>Common gateway features</h3>
+<ul>
+  <li><strong>Routing and versioning</strong>: path, host and header rules; <code>/v1</code> and <code>/v2</code> to different backends (see <a href="#api-versioning">API Versioning</a>).</li>
+  <li><strong>Security</strong>: JWT validation, API keys, OAuth scopes, mTLS to backends, CORS, IP allow lists.</li>
+  <li><strong>Traffic control</strong>: <a href="#rate-limiting">rate limits</a>, quotas and usage plans per customer, timeouts, retries, circuit breaking.</li>
+  <li><strong>Transformation</strong>: header injection, request/response rewriting, REST → gRPC translation.</li>
+  <li><strong>Aggregation</strong>: one call fans out to several services and merges the results. When each client type gets its own tailored gateway, that's the <em>Backend for Frontend</em> (BFF) pattern.</li>
+  <li><strong>Observability</strong>: one place for access logs, latency metrics per route and customer, and trace headers.</li>
+</ul>
+
+<h3>Gateway, load balancer, reverse proxy, service mesh</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 232" role="img" aria-label="North-south traffic from the internet enters through the API gateway at the edge of the cluster. East-west traffic between services inside the cluster goes through service mesh sidecars next to each service.">
+  <defs><marker id="arr-gw-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="96" width="110" height="40" rx="8"/><text x="75" y="121" text-anchor="middle">internet</text>
+  <rect class="box muted" x="170" y="14" width="590" height="206" rx="12"/>
+  <text x="465" y="34" text-anchor="middle" class="small">your cluster / VPC</text>
+  <rect class="box accent" x="190" y="90" width="130" height="52" rx="10"/>
+  <text x="255" y="113" text-anchor="middle" class="title">API gateway</text>
+  <text x="255" y="130" text-anchor="middle" class="small">north-south</text>
+  <path class="line accent" d="M130 116 H188" marker-end="url(#arr-gw-2)"/>
+
+  <rect class="box" x="390" y="54" width="150" height="48" rx="8"/><text x="465" y="76" text-anchor="middle">orders</text><text x="465" y="93" text-anchor="middle" class="small">+ sidecar proxy</text>
+  <rect class="box" x="390" y="148" width="150" height="48" rx="8"/><text x="465" y="170" text-anchor="middle">payments</text><text x="465" y="187" text-anchor="middle" class="small">+ sidecar proxy</text>
+  <rect class="box" x="600" y="100" width="150" height="48" rx="8"/><text x="675" y="122" text-anchor="middle">inventory</text><text x="675" y="139" text-anchor="middle" class="small">+ sidecar proxy</text>
+  <path class="line accent" d="M320 110 L388 80" marker-end="url(#arr-gw-2)"/>
+  <path class="line ok dashed" d="M465 102 V146" marker-end="url(#arr-gw-2)"/>
+  <path class="line ok dashed" d="M540 82 L598 116" marker-end="url(#arr-gw-2)"/>
+  <text x="560" y="210" text-anchor="middle" class="small">east-west traffic between services: the service mesh (Istio, Linkerd)</text>
+</svg>
+<figcaption>The gateway guards the edge (north-south); a service mesh handles service-to-service traffic (east-west). Many systems have both.</figcaption>
+</figure>
+<table>
+  <tr><th>Component</th><th>Main job</th><th>Knows about</th><th>Examples</th></tr>
+  <tr><td>Load balancer</td><td>spread traffic across copies of one service</td><td>connections or requests, health</td><td>AWS ALB/NLB, HAProxy</td></tr>
+  <tr><td>Reverse proxy</td><td>front door: TLS, routing, buffering, caching</td><td>HTTP</td><td>nginx, Caddy, Envoy</td></tr>
+  <tr><td>API gateway</td><td>API products: auth, quotas, versions, keys, analytics</td><td>callers, plans, API routes</td><td>AWS API Gateway, Kong, Apigee, Tyk</td></tr>
+  <tr><td>Service mesh</td><td>service-to-service: mTLS, retries, traffic splitting</td><td>every internal call</td><td>Istio, Linkerd</td></tr>
+</table>
+<p>The lines blur: Envoy can be all four, and many "gateways" are a reverse proxy plus plugins. Pick by the job, not the label.</p>
+
+<h2>Example</h2>
+<p><strong>A minimal gateway in Go</strong>: request IDs, JWT auth, per-key rate limiting (from <a href="#rate-limiting">Rate Limiting</a>) and prefix routing, all with the standard library's reverse proxy:</p>
+<pre><code>func main() {
+	routes := map[string]string{
+		"/orders/":   "http://orders.internal:8080",
+		"/payments/": "http://payments.internal:8080",
+		"/users/":    "http://users.internal:8080",
+	}
+	mux := http.NewServeMux()
+	for prefix, backend := range routes {
+		target, err := url.Parse(backend)
+		if err != nil {
+			log.Fatal(err)
+		}
+		mux.Handle(prefix, &amp;httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.SetURL(target)
+				pr.SetXForwarded()
+			},
+		})
+	}
+
+	limiter := NewRateLimiter(10, 20) // see Rate Limiting
+	// Order matters: ID first (so even rejections are traceable), then auth, then limits.
+	handler := withRequestID(authenticate(limiter.Middleware(mux)))
+
+	srv := &amp;http.Server{Addr: ":8443", Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	log.Fatal(srv.ListenAndServeTLS("gw.crt", "gw.key"))
+}
+
+func withRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-ID")
+		if id == "" {
+			id = rand.Text() // Go 1.24+: random, URL-safe
+		}
+		r.Header.Set("X-Request-ID", id) // forwarded to the service
+		w.Header().Set("X-Request-ID", id) // returned to the caller for support tickets
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("id=%s %s %s took=%s", id, r.Method, r.URL.Path, time.Since(start))
+	})
+}
+
+func authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		claims, err := verifyJWT(token) // signature, expiry, audience
+		if !ok || err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// Set, not Add: overwrites any X-User-ID the client tried to sneak in.
+		r.Header.Set("X-User-ID", claims.Subject)
+		r.Header.Set("X-API-Key", claims.Subject) // rate-limit key for the next step
+		next.ServeHTTP(w, r)
+	})
+}</code></pre>
+<p>A real deployment would use an off-the-shelf gateway (Kong, Envoy Gateway, AWS API Gateway, KrakenD) configured declaratively, but they run exactly this kind of pipeline.</p>
+
+<p><strong>Real-world scenario: launching a public API.</strong> A SaaS company wants to open its internal services to partners. Instead of hardening each service, it puts a gateway in front: partners get API keys tied to usage plans (free: 10 requests/second and 10,000/day; enterprise: much more), every call is logged per key for billing and support, <code>/v1</code> routes stay stable while internal services are refactored freely, and an abusive key can be revoked in one place. The services themselves only see requests that already passed auth and quotas, carrying an <code>X-Request-ID</code> and the caller's identity.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Business logic creeping into the gateway.</strong> Once teams start adding "just a little" logic in gateway scripts, it becomes a distributed monolith that every deploy depends on. Keep it to cross-cutting policy; domain logic belongs in services.</li>
+  <li><strong>A single point of failure and an extra hop.</strong> Every request passes through it, so it needs redundancy, capacity headroom and tight latency budgets.</li>
+  <li><strong>Trusting the edge only.</strong> If services accept any request because "the gateway checked it", anything inside the network can impersonate a user. Services should still verify identity (mTLS, signed headers or JWTs): zero trust.</li>
+  <li><strong>Identity headers from clients.</strong> If the gateway forwards an <code>X-User-ID</code> the client sent, anyone can be anyone. The gateway must overwrite such headers itself.</li>
+  <li><strong>Timeouts in the wrong order.</strong> The gateway's timeout must be longer than the backend's, or it returns 504 while the backend keeps working. Managed gateways have hard limits too (AWS API Gateway's integration timeout defaults to 29 seconds).</li>
+  <li><strong>Chatty aggregation.</strong> Fan-out calls make the slowest backend set the response time and multiply failures; use timeouts and partial responses.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>An API gateway = one entry point + a policy pipeline (auth, limits, IDs, logging) + routing to services.</li>
+  <li>It's for cross-cutting edge concerns, not business logic.</li>
+  <li>Gateway = north-south (clients to services); service mesh = east-west (service to service).</li>
+  <li>Make it redundant, overwrite identity headers, and still verify identity inside.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#reverse-proxies">Reverse Proxies</a> · <a href="#rate-limiting">Rate Limiting</a> · <a href="#api-versioning">API Versioning</a> · <a href="#service-discovery">Service Discovery</a> · <a href="#oauth">OAuth</a> · <a href="#real-world-traffic-stack">Real-World Traffic Stack</a></p>
+`;
+
+
