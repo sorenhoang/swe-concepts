@@ -393,3 +393,177 @@ func main() {
 `;
 
 
+CONTENT["reverse-proxies"] = `
+<p class="tldr"><strong>TL;DR</strong>: A reverse proxy is a server that stands in front of your application servers and receives every request on their behalf, then forwards it to the right one. Clients think they're talking to your app; they're actually talking to nginx, HAProxy, Envoy, Caddy or Traefik, which handles TLS, routing, buffering, caching and more, so your app doesn't have to.</p>
+
+<h2>The problem it solves</h2>
+<p>Exposing application servers directly to the internet means each one must handle TLS certificates, slow or malicious clients, compression, static files, request limits and routing between services. A reverse proxy does all of that once, in one hardened place:</p>
+<ul>
+  <li><strong>One front door</strong> for many backends: <code>api.example.com/orders</code> and <code>/users</code> can live on different services.</li>
+  <li><strong>Protection</strong>: the app's real addresses stay private, and the proxy absorbs slow clients (it buffers a slow upload, then hands the app the full request in one go).</li>
+  <li><strong>Offloading</strong>: TLS, compression and caching use battle-tested C code instead of your app's CPU.</li>
+</ul>
+
+<h2>How it works</h2>
+<p>A <strong>forward</strong> proxy works for <em>clients</em> (a company proxy that all employees' traffic goes through). A <strong>reverse</strong> proxy works for <em>servers</em>: the client connects to the proxy, which opens its own connection to a backend, forwards the request, and relays the response back.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 214" role="img" aria-label="Forward proxy: several clients go through one proxy to reach many internet sites; it acts for the clients. Reverse proxy: many internet clients reach one proxy that forwards to several backend servers; it acts for the servers.">
+  <defs><marker id="arr-rp-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="195" y="22" text-anchor="middle" class="title">Forward proxy (for clients)</text>
+  <text x="590" y="22" text-anchor="middle" class="title">Reverse proxy (for servers)</text>
+  <path class="line" d="M390 10 V206" style="stroke: var(--line)"/>
+  <rect class="box" x="20" y="50" width="90" height="30" rx="6"/><text x="65" y="70" text-anchor="middle" class="small">laptop</text>
+  <rect class="box" x="20" y="100" width="90" height="30" rx="6"/><text x="65" y="120" text-anchor="middle" class="small">laptop</text>
+  <rect class="box" x="20" y="150" width="90" height="30" rx="6"/><text x="65" y="170" text-anchor="middle" class="small">laptop</text>
+  <rect class="box accent" x="150" y="92" width="100" height="46" rx="8"/><text x="200" y="120" text-anchor="middle">proxy</text>
+  <path class="line" d="M110 65 L148 105 M110 115 H148 M110 165 L148 125"/>
+  <rect class="box muted" x="280" y="50" width="95" height="30" rx="6"/><text x="327" y="70" text-anchor="middle" class="small">site A</text>
+  <rect class="box muted" x="280" y="100" width="95" height="30" rx="6"/><text x="327" y="120" text-anchor="middle" class="small">site B</text>
+  <rect class="box muted" x="280" y="150" width="95" height="30" rx="6"/><text x="327" y="170" text-anchor="middle" class="small">site C</text>
+  <path class="line" d="M250 105 L278 65 M250 115 H278 M250 125 L278 165"/>
+  <text x="195" y="202" text-anchor="middle" class="small">company network: filtering, caching, one exit IP</text>
+
+  <rect class="box muted" x="410" y="50" width="95" height="30" rx="6"/><text x="457" y="70" text-anchor="middle" class="small">user</text>
+  <rect class="box muted" x="410" y="100" width="95" height="30" rx="6"/><text x="457" y="120" text-anchor="middle" class="small">user</text>
+  <rect class="box muted" x="410" y="150" width="95" height="30" rx="6"/><text x="457" y="170" text-anchor="middle" class="small">user</text>
+  <rect class="box accent" x="545" y="92" width="100" height="46" rx="8"/><text x="595" y="120" text-anchor="middle">proxy</text>
+  <path class="line" d="M505 65 L543 105 M505 115 H543 M505 165 L543 125"/>
+  <rect class="box" x="675" y="50" width="90" height="30" rx="6"/><text x="720" y="70" text-anchor="middle" class="small">orders</text>
+  <rect class="box" x="675" y="100" width="90" height="30" rx="6"/><text x="720" y="120" text-anchor="middle" class="small">users</text>
+  <rect class="box" x="675" y="150" width="90" height="30" rx="6"/><text x="720" y="170" text-anchor="middle" class="small">static</text>
+  <path class="line" d="M645 105 L673 65 M645 115 H673 M645 125 L673 165"/>
+  <text x="590" y="202" text-anchor="middle" class="small">your servers stay private behind one address</text>
+</svg>
+<figcaption>Same machinery, opposite sides. This concept is about the right-hand one.</figcaption>
+</figure>
+
+<h3>What a reverse proxy typically does</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Mindmap: a reverse proxy in the center, with TLS termination, routing by host and path, load balancing, caching, compression, buffering slow clients, request limits and timeouts, header handling with X-Forwarded-For, and serving static files.">
+  <path class="line" d="M390 150 L150 50 M390 150 L150 150 M390 150 L150 250 M390 150 L630 50 M390 150 L630 150 M390 150 L630 250 M390 150 L390 40 M390 150 L390 262"/>
+  <rect class="box accent" x="300" y="122" width="180" height="56" rx="12"/>
+  <text x="390" y="148" text-anchor="middle" class="title">Reverse proxy</text>
+  <text x="390" y="166" text-anchor="middle" class="small">nginx · HAProxy · Envoy · Caddy</text>
+  <rect class="box" x="300" y="14" width="180" height="40" rx="8"/><text x="390" y="32" text-anchor="middle" class="title">TLS termination</text><text x="390" y="47" text-anchor="middle" class="small">certificates in one place</text>
+  <rect class="box" x="300" y="246" width="180" height="40" rx="8"/><text x="390" y="264" text-anchor="middle" class="title">Static files</text><text x="390" y="279" text-anchor="middle" class="small">served without the app</text>
+  <rect class="box" x="30" y="30" width="200" height="40" rx="8"/><text x="130" y="48" text-anchor="middle" class="title">Routing</text><text x="130" y="63" text-anchor="middle" class="small">by host and path</text>
+  <rect class="box" x="30" y="130" width="200" height="40" rx="8"/><text x="130" y="148" text-anchor="middle" class="title">Load balancing</text><text x="130" y="163" text-anchor="middle" class="small">across backend copies</text>
+  <rect class="box" x="30" y="230" width="200" height="40" rx="8"/><text x="130" y="248" text-anchor="middle" class="title">Caching + compression</text><text x="130" y="263" text-anchor="middle" class="small">gzip / brotli, cached responses</text>
+  <rect class="box" x="550" y="30" width="200" height="40" rx="8"/><text x="650" y="48" text-anchor="middle" class="title">Buffering</text><text x="650" y="63" text-anchor="middle" class="small">absorbs slow clients</text>
+  <rect class="box" x="550" y="130" width="200" height="40" rx="8"/><text x="650" y="148" text-anchor="middle" class="title">Limits + timeouts</text><text x="650" y="163" text-anchor="middle" class="small">body size, rate, idle time</text>
+  <rect class="box" x="550" y="230" width="200" height="40" rx="8"/><text x="650" y="248" text-anchor="middle" class="title">Headers</text><text x="650" y="263" text-anchor="middle" class="small">X-Forwarded-For / -Proto</text>
+</svg>
+<figcaption>A load balancer and an API gateway are both specialised reverse proxies: one focuses on spreading load, the other on API concerns like auth and quotas.</figcaption>
+</figure>
+
+<h3>The forwarded headers</h3>
+<p>The backend's TCP connection comes from the proxy, so it would see the proxy's IP and plain HTTP. The proxy passes the original details in headers: <code>X-Forwarded-For</code> (client IP, plus any earlier proxies), <code>X-Forwarded-Proto</code> (<code>https</code>), <code>X-Forwarded-Host</code>, or the standardised <code>Forwarded</code> header (RFC 7239). Your app should trust these <strong>only when the request came from your proxy</strong>.</p>
+
+<table>
+  <tr><th>Tool</th><th>Known for</th></tr>
+  <tr><td>nginx</td><td>the classic: fast static files, TLS, caching, huge ecosystem</td></tr>
+  <tr><td>HAProxy</td><td>high-performance L4/L7 load balancing, detailed stats</td></tr>
+  <tr><td>Envoy</td><td>dynamic config via API (xDS); the data plane of most service meshes and many gateways</td></tr>
+  <tr><td>Caddy</td><td>automatic HTTPS certificates out of the box, simple config</td></tr>
+  <tr><td>Traefik</td><td>discovers routes from Docker/Kubernetes labels automatically</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>nginx in front of two app instances</strong>: TLS, static files, upstream keepalive, forwarded headers, limits:</p>
+<pre><code>upstream app {
+  server 10.0.1.10:8080;
+  server 10.0.1.11:8080;
+  keepalive 32;                        # reuse connections to the app
+}
+
+server {
+  listen 443 ssl;
+  server_name api.example.com;
+  ssl_certificate     /etc/ssl/api.crt;
+  ssl_certificate_key /etc/ssl/api.key;
+
+  client_max_body_size 10m;            # reject huge uploads at the door
+  gzip on;
+
+  location /static/ {
+    root /var/www;                     # served by nginx, never reaches the app
+    expires 7d;
+  }
+
+  location / {
+    proxy_pass http://app;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";    # required for upstream keepalive
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 30s;            # keep the app's own timeout below this
+  }
+}</code></pre>
+
+<p><strong>The same idea in Go</strong> with <code>httputil.ReverseProxy</code>. <code>SetXForwarded</code> adds the forwarded headers correctly:</p>
+<pre><code>func main() {
+	app, err := url.Parse("http://127.0.0.1:8080")
+	if err != nil {
+		log.Fatal(err)
+	}
+	proxy := &amp;httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(app)     // send to the app, keep the path and query
+			pr.SetXForwarded() // X-Forwarded-For, -Host, -Proto
+		},
+	}
+	srv := &amp;http.Server{
+		Addr:              ":443",
+		Handler:           proxy,
+		ReadHeaderTimeout: 5 * time.Second, // slow-header (slowloris) protection
+	}
+	log.Fatal(srv.ListenAndServeTLS("api.crt", "api.key"))
+}</code></pre>
+
+<p><strong>On the app side</strong>, find the real client IP without letting clients spoof it. Clients can send any <code>X-Forwarded-For</code> they like; only the entries added by <em>your</em> proxies are trustworthy, so read from the right:</p>
+<pre><code>// trusted reports whether an address belongs to our own proxies / load balancers.
+func ClientIP(r *http.Request, trusted func(netip.Addr) bool) string {
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	peer, err := netip.ParseAddr(host)
+	if err != nil || !trusted(peer) {
+		return host // not from our proxy: ignore X-Forwarded-For entirely
+	}
+	hops := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(hops) - 1; i &gt;= 0; i-- { // right to left: nearest proxy first
+		addr, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			break
+		}
+		if !trusted(addr) {
+			return addr.String() // first address our proxies didn't add = the client
+		}
+	}
+	return host
+}</code></pre>
+
+<p><strong>Real-world scenario: everyone was rate-limited at once.</strong> After moving an app behind a new proxy, the per-IP rate limiter started rejecting <em>everyone</em>. Every request now came from the proxy's IP, so all users shared one bucket. The first "fix", trusting <code>X-Forwarded-For</code> blindly, let attackers bypass the limit by sending a fake header with a random IP each time. The real fix: trust the header only from the proxy's address, and take the rightmost untrusted entry.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Blindly trusting forwarded headers.</strong> Anyone can send <code>X-Forwarded-For: 1.2.3.4</code>. Only honour it from known proxy addresses, or IP-based limits and audit logs become fiction.</li>
+  <li><strong>Timeouts that don't line up.</strong> If the proxy gives up after 60 s but the app keeps working for 120 s, users see a 504 while the work still happens. Set the app's timeout below the proxy's (see <a href="#timeouts">Timeouts</a>).</li>
+  <li><strong>Buffering breaks streaming.</strong> Response buffering is great for normal requests but turns SSE and long responses into one late blob (see <a href="#server-sent-events">Server-Sent Events</a>).</li>
+  <li><strong>No upstream keepalive.</strong> By default nginx opens a new connection to the backend for every request. Enable <code>keepalive</code> on the upstream, or you pay connection setup each time and can run out of ports.</li>
+  <li><strong>Request smuggling.</strong> If proxy and backend disagree about where a request ends (<code>Content-Length</code> vs <code>Transfer-Encoding</code>), an attacker can hide a second request inside the first. Keep proxies patched and reject ambiguous requests.</li>
+  <li><strong>Another hop, another thing to run.</strong> A self-hosted proxy needs redundancy, monitoring and config management of its own.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>A reverse proxy receives requests on behalf of your servers and forwards them: one hardened front door.</li>
+  <li>It centralises TLS, routing, buffering, compression, caching, limits and timeouts.</li>
+  <li>Forwarded headers carry the client's IP and scheme; trust them only from your own proxies.</li>
+  <li>Align timeouts, enable upstream keepalive, and turn off buffering for streaming endpoints.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#load-balancing">Load Balancing</a> · <a href="#api-gateways">API Gateways</a> · <a href="#tls">TLS</a> · <a href="#caching">Caching</a> · <a href="#rate-limiting">Rate Limiting</a> · <a href="#real-world-traffic-stack">Real-World Traffic Stack</a></p>
+`;
+
+
