@@ -2447,3 +2447,224 @@ sum(increase(http_requests_total{job="checkout"}[30d]))</code></pre>
 <p><strong>Related:</strong> <a href="#slis">SLIs</a> · <a href="#error-budgets">Error Budgets</a> · <a href="#alerts">Alerts</a> · <a href="#monitoring">Monitoring</a> · <a href="#metrics">Metrics</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
 `;
 
+CONTENT["error-budgets"] = `
+<p class="tldr"><strong>TL;DR</strong>: An error budget is the amount of unreliability your SLO allows: budget = 1 − SLO. A 99.9% SLO gives you 0.1% of requests (43 min 12 s per 30 days) to spend on deploys, experiments and bad luck. The <strong>burn rate</strong> says how fast you're spending it, alerts fire when it burns too fast, and a written policy says what happens when it runs out. It's a monthly allowance: spend it on shipping, not on avoidable outages.</p>
+
+<h2>The problem it solves</h2>
+<p>An SLO on its own is a scoreboard. It tells you whether you're winning, not what to do about it. Teams still fight the old fight: developers want to ship, operations want nothing to change. The error budget turns that into arithmetic both sides accept:</p>
+<ul>
+  <li><strong>Budget left?</strong> Ship features, run experiments, take risks. Unused budget is wasted speed.</li>
+  <li><strong>Budget gone?</strong> Reliability work comes first until the service is back within its SLO.</li>
+  <li><strong>Alerting with a reason.</strong> Instead of "error rate &gt; 1%" (why 1%?), page when the budget is being spent fast enough to matter.</li>
+</ul>
+
+<h2>How it works</h2>
+<h3>Budget and burn rate</h3>
+<ul>
+  <li><strong>Budget</strong> = 1 − SLO. For 99.9% over 30 days: 0.1% of valid requests may fail. At 12M requests so far this window, that's 12,000 failures.</li>
+  <li><strong>Burn rate</strong> = observed error ratio ÷ budget. The SRE workbook calls it "how fast, relative to the SLO, the service consumes the error budget". Burn rate 1 spends exactly the whole budget by the end of the window. Burn rate 2 spends it in half the window.</li>
+  <li><strong>Budget consumed</strong> in a period = burn rate × period ÷ window. Burning at 14.4 for 1 hour of a 30-day (720 h) window uses 14.4 × 1 ÷ 720 = 2%.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 780 286" role="img" aria-label="Error budget burn-down over a 30-day window. The ideal line falls from 100 percent to 0 at day 30. The actual line falls 1 percent a day, drops 25 percent on day 9 after an incident, then 50 percent on day 20 after a bad deploy, and reaches 0 on day 25, which triggers a release freeze for the rest of the window.">
+  <rect class="box muted" x="628.3" y="40" width="111.7" height="190" rx="2"/>
+  <text x="684.2" y="60" text-anchor="middle" class="title">release freeze</text>
+  <text x="684.2" y="76" text-anchor="middle" class="small">P0 + security only</text>
+  <path class="line" d="M70 30 V230 H740"/>
+  <text x="64" y="44" text-anchor="end" class="small">100%</text>
+  <text x="64" y="140" text-anchor="end" class="small">50%</text>
+  <text x="64" y="234" text-anchor="end" class="small">0%</text>
+  <path class="line dashed" d="M70 40 L740 230"/>
+  <path class="line accent" d="M70.0 40.0 L271.0 57.1 L274.4 104.6 L516.7 125.5 L520.0 220.5 L628.3 230.0" style="stroke-width:2.2"/>
+  <text x="290" y="70" class="small">day 9: incident spends 25% in 4 h</text>
+  <text x="290" y="84" class="small">→ postmortem (one incident &gt; 20%)</text>
+  <text x="528" y="120" class="small">day 20:</text>
+  <text x="528" y="134" class="small">deploy, 50%</text>
+  <text x="70" y="250" class="small">day 0</text>
+  <text x="405" y="250" text-anchor="middle" class="small">day 15</text>
+  <text x="740" y="250" text-anchor="end" class="small">day 30</text>
+  <path class="line accent" d="M210 272 H240" style="stroke-width:2.2"/><text x="248" y="276" class="small">budget remaining</text>
+  <path class="line dashed" d="M400 272 H430"/><text x="438" y="276" class="small">burn rate 1 (spends exactly the budget)</text>
+</svg>
+<figcaption>A burn-down chart. Above the dashed line you're spending slower than budgeted; below it, faster. Two events, not the daily trickle, spent almost all of this budget, which is typical.</figcaption>
+</figure>
+
+<h3>Multi-window, multi-burn-rate alerts</h3>
+<p>Alerting on "budget burn" needs two things at once: catch fast burns quickly, and don't page for blips that cost almost nothing. The Google SRE workbook (chapter "Alerting on SLOs") recommends three alerts for a 99.9% SLO, each requiring <strong>both</strong> a long and a short window to exceed the same burn rate:</p>
+<table>
+  <tr><th>Severity</th><th>Long window</th><th>Short window</th><th>Burn rate</th><th>Budget consumed</th><th>Error ratio at 99.9%</th></tr>
+  <tr><td>Page</td><td>1 hour</td><td>5 minutes</td><td>14.4</td><td>2%</td><td>&gt; 1.44%</td></tr>
+  <tr><td>Page</td><td>6 hours</td><td>30 minutes</td><td>6</td><td>5%</td><td>&gt; 0.6%</td></tr>
+  <tr><td>Ticket</td><td>3 days</td><td>6 hours</td><td>1</td><td>10%</td><td>&gt; 0.1%</td></tr>
+</table>
+<p>The long window proves the burn is significant (2% of the month's budget in one hour). The short window, which the workbook suggests should be 1/12 of the long one, proves it's <em>still happening</em>, so the alert stops soon after the problem is fixed instead of firing for another hour. The chart below is computed: errors jump from 0.05% to 5% (burn rate 50) for 30 minutes.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 286" role="img" aria-label="Error ratio averaged over 5 minutes and over 1 hour during a 30-minute spike to 5 percent. The threshold is 1.44 percent. The alert fires only while both averages are above the threshold: from minute 37 to minute 53. The 1-hour average alone would stay above the threshold until minute 93.">
+  <rect class="box bad" x="276.6" y="36" width="89.3" height="194" rx="2" style="opacity:.35"/>
+  <text x="321.2" y="52" text-anchor="middle" class="title">page fires</text>
+  <text x="321.2" y="66" text-anchor="middle" class="small">min 37–53</text>
+  <path class="line" d="M70 30 V230 H740"/>
+  <text x="64" y="54" text-anchor="end" class="small">6%</text>
+  <text x="64" y="144" text-anchor="end" class="small">3%</text>
+  <text x="64" y="191" text-anchor="end" class="small">1.44%</text>
+  <text x="64" y="234" text-anchor="end" class="small">0</text>
+  <path class="line bad dashed" d="M70 186.8 H740"/>
+  <path class="line accent" d="M70.0 228.5 L181.7 228.5 L209.6 80.0 L349.2 80.0 L377.1 228.5 L740.0 228.5" style="stroke-width:2"/>
+  <path class="line ok" d="M70.0 228.5 L181.7 228.5 L349.2 154.2 L516.7 154.2 L684.2 228.5 L740.0 228.5" style="stroke-width:2"/>
+  <text x="620" y="130" text-anchor="middle" class="small">1 h alone would page until min 93</text>
+  <text x="70" y="250" class="small">min 0</text>
+  <text x="182" y="250" text-anchor="middle" class="small">spike starts (20)</text>
+  <text x="405" y="250" text-anchor="middle" class="small">min 60</text>
+  <text x="740" y="250" text-anchor="end" class="small">min 120</text>
+  <path class="line accent" d="M200 272 H230" style="stroke-width:2"/><text x="238" y="276" class="small">5 min average</text>
+  <path class="line ok" d="M350 272 H380" style="stroke-width:2"/><text x="388" y="276" class="small">1 h average</text>
+  <path class="line bad dashed" d="M480 272 H510"/><text x="518" y="276" class="small">14.4 × 0.1%</text>
+</svg>
+<figcaption>The 5-minute average crosses the line within two minutes, but one noisy 5-minute window shouldn't page anyone. The 1-hour average crosses only once 2% of the budget is gone. Requiring both gives a significant, current signal that also clears quickly.</figcaption>
+</figure>
+
+<h3>The error budget policy</h3>
+<p>A budget without consequences is just a number. Write down, in advance and agreed by product and engineering, what happens at each level. The SRE workbook's example policy says: if the service "has exceeded its error budget for the preceding four-week window, we will halt all changes and releases other than P0 issues or security fixes" until it is back within its SLO, and "if a single incident consumes more than 20% of error budget over four weeks, then the team must conduct a postmortem". An example in table form:</p>
+<table>
+  <tr><th>Budget state</th><th>What the team does</th></tr>
+  <tr><td>Plenty left, burning at or under 1×</td><td>ship normally; consider riskier experiments, chaos tests</td></tr>
+  <tr><td>One incident spent more than 20%</td><td>postmortem with at least one high-priority action item</td></tr>
+  <tr><td>Burning faster than 1× for days (ticket alert)</td><td>prioritise the top reliability bugs this sprint</td></tr>
+  <tr><td>Exhausted over the window</td><td>freeze releases except P0 and security fixes until back within SLO</td></tr>
+  <tr><td>Spent by something outside your control (a company-wide network outage, load tests)</td><td>the workbook's policy lets the team continue; record it, don't punish it</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>The budget math in Go.</strong> This is the arithmetic behind every SLO dashboard:</p>
+<pre><code>package main
+
+import (
+	"fmt"
+	"time"
+)
+
+// Budget is the fraction of events allowed to be bad: 1 - SLO.
+func Budget(slo float64) float64 { return 1 - slo }
+
+// BurnRate says how fast errors spend the budget. 1 = exactly on budget.
+func BurnRate(errorRatio, slo float64) float64 { return errorRatio / Budget(slo) }
+
+// Consumed is the share of the window's budget spent by burning at rate for d.
+func Consumed(rate float64, d, window time.Duration) float64 {
+	return rate * d.Hours() / window.Hours()
+}
+
+// TimeToExhaust is how long a full budget lasts at this burn rate.
+func TimeToExhaust(rate float64, window time.Duration) time.Duration {
+	return time.Duration(float64(window) / rate).Round(time.Second)
+}
+
+// Remaining is the share of the budget left, given this window's traffic so far.
+func Remaining(good, valid int64, slo float64) float64 {
+	allowedBad := Budget(slo) * float64(valid)
+	return 1 - float64(valid-good)/allowedBad
+}
+
+func main() {
+	const slo = 0.999
+	window := 30 * 24 * time.Hour
+
+	fmt.Println("burn  long window  budget used")
+	for _, a := range []struct {
+		rate float64
+		long time.Duration
+	}{{14.4, time.Hour}, {6, 6 * time.Hour}, {1, 72 * time.Hour}} {
+		fmt.Printf("%-5v %-12v %.0f%%&#92;n", a.rate, a.long, Consumed(a.rate, a.long, window)*100)
+	}
+
+	fmt.Println("&#92;nerror ratio  burn rate  full budget lasts")
+	for _, e := range []float64{0.001, 0.006, 0.0144, 1} {
+		r := BurnRate(e, slo)
+		fmt.Printf("%-12v %-10.1f %v&#92;n", fmt.Sprintf("%.2f%%", e*100), r, TimeToExhaust(r, window))
+	}
+
+	// Day 12 of the window: 12M valid requests so far, 7,800 of them bad.
+	fmt.Printf("&#92;nremaining budget: %.0f%%&#92;n", Remaining(12_000_000-7_800, 12_000_000, slo)*100)
+}</code></pre>
+<p>Real output of <code>go run .</code>; the first block reproduces the workbook's "budget consumed" column:</p>
+<pre><code>burn  long window  budget used
+14.4  1h0m0s       2%
+6     6h0m0s       5%
+1     72h0m0s      10%
+
+error ratio  burn rate  full budget lasts
+0.10%        1.0        720h0m0s
+0.60%        6.0        120h0m0s
+1.44%        14.4       50h0m0s
+100.00%      1000.0     43m12s
+
+remaining budget: 35%</code></pre>
+<p><strong>The same alerts as Prometheus rules</strong>, following the workbook's expressions. Recording rules precompute the error ratio per window so the alert stays cheap:</p>
+<pre><code>groups:
+  - name: checkout-slo
+    rules:
+      # error ratio = 5xx / all requests, one recording rule per window
+      - record: job:slo_errors_per_request:ratio_rate5m
+        expr: |
+          sum by (job) (rate(http_requests_total{job="checkout", code=~"5.."}[5m]))
+          /
+          sum by (job) (rate(http_requests_total{job="checkout"}[5m]))
+      - record: job:slo_errors_per_request:ratio_rate1h
+        expr: |
+          sum by (job) (rate(http_requests_total{job="checkout", code=~"5.."}[1h]))
+          /
+          sum by (job) (rate(http_requests_total{job="checkout"}[1h]))
+      # ...the same rule again for 30m, 6h and 3d (ratio_rate30m, ratio_rate6h, ratio_rate3d)
+
+      - alert: CheckoutErrorBudgetBurn
+        expr: |
+          (
+            job:slo_errors_per_request:ratio_rate1h{job="checkout"} &gt; (14.4 * 0.001)
+            and
+            job:slo_errors_per_request:ratio_rate5m{job="checkout"} &gt; (14.4 * 0.001)
+          )
+          or
+          (
+            job:slo_errors_per_request:ratio_rate6h{job="checkout"} &gt; (6 * 0.001)
+            and
+            job:slo_errors_per_request:ratio_rate30m{job="checkout"} &gt; (6 * 0.001)
+          )
+        labels:
+          severity: page
+        annotations:
+          summary: "checkout is burning its 30-day error budget fast"
+          runbook_url: "https://runbooks.example.com/checkout/error-budget"
+
+      - alert: CheckoutErrorBudgetSlowBurn
+        expr: |
+          job:slo_errors_per_request:ratio_rate3d{job="checkout"} &gt; 0.001
+          and
+          job:slo_errors_per_request:ratio_rate6h{job="checkout"} &gt; 0.001
+        labels:
+          severity: ticket</code></pre>
+
+<p><strong>Real-world scenario.</strong> It's 14:05 on day 12 of the window, and the checkout dashboard shows 35% of the budget left (the last line of the output: 7,800 failures out of 12M requests, against 12,000 allowed). A deploy at 14:00 starts failing 2% of payments, burn rate 20. By 14:04 the 5-minute ratio is above 1.44%; at 14:00 + about 43 minutes, the 1-hour ratio would join it and page. The on-call doesn't wait: the deploy dashboard shows the correlation and they roll back at 14:12. Twelve minutes at burn rate 20 cost 20 × 0.2 h ÷ 720 h ≈ 0.6% of the budget. No page fired, the budget stays healthy, and the team keeps shipping.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>A policy nobody signed.</strong> If product can overrule a freeze whenever a launch is close, the budget means nothing. Get the policy agreed before the first freeze, with an escalation path for real disagreements.</li>
+  <li><strong>Low traffic makes ratios jumpy.</strong> At 50 requests an hour, one failure is a 2% error ratio and a 14.4× page. Use longer windows, count minutes instead of requests, add synthetic traffic, or group small services together.</li>
+  <li><strong>Alerting on a single window.</strong> Long-only alerts fire late and stay red long after recovery; short-only alerts page on every blip. Use both, as in the table.</li>
+  <li><strong>Treating unspent budget as success.</strong> Ending every month at 100% means the SLO is too loose or the team is too cautious. Spend it on faster releases.</li>
+  <li><strong>Counting the wrong failures.</strong> Load tests, penetration testers and clients sending garbage aren't real users. Exclude them from the SLI, or they spend budget you never had.</li>
+  <li><strong>Freezes as punishment.</strong> A freeze is time to fix the causes, not a penalty. If it doesn't come with reliability work, the next window ends the same way.</li>
+</ul>
+
+<div class="callout warn"><strong>Raw 3-day and 30-day ranges are expensive.</strong> <code>rate(...[3d])</code> over high-cardinality counters can make the rule evaluation slow. Aggregate first (sum away labels you don't need), record short windows, and keep the label set of the SLI series small.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Budget = 1 − SLO; burn rate = error ratio ÷ budget; 1× spends it exactly over the window.</li>
+  <li>Page on 14.4× over 1 h and 5 min, or 6× over 6 h and 30 min; ticket on 1× over 3 days and 6 h.</li>
+  <li>The policy, agreed in advance, turns the number into decisions: ship, postmortem, freeze.</li>
+  <li>A burn-down chart shows the story: a few incidents usually spend most of the budget.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#slos">SLOs</a> · <a href="#slis">SLIs</a> · <a href="#alerts">Alerts</a> · <a href="#postmortems">Postmortems</a> · <a href="#canary-releases">Canary Releases</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
+`;
+
