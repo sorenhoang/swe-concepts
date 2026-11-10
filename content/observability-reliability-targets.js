@@ -1980,3 +1980,226 @@ func main() {
 <p><strong>Related:</strong> <a href="#monitoring">Monitoring</a> · <a href="#slos">SLOs</a> · <a href="#error-budgets">Error Budgets</a> · <a href="#on-call">On-Call</a> · <a href="#production-incidents">Production Incidents</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
 `;
 
+CONTENT["slis"] = `
+<p class="tldr"><strong>TL;DR</strong>: A Service Level Indicator (SLI) is a number that measures how well your service is doing <em>from the user's point of view</em>, usually expressed as <strong>good events ÷ valid events</strong>, e.g. "99.88% of checkout requests succeeded". It's the speedometer reading; the <a href="#slos">SLO</a> is the speed limit you compare it against.</p>
+
+<h2>The problem it solves</h2>
+<p>Teams argue about reliability using whatever numbers they happen to have: "CPU is fine", "uptime is 100%", "the pods are healthy". None of that says whether users can actually check out. Without an agreed SLI:</p>
+<ul>
+  <li>Each team measures something different, so "reliable" means nothing.</li>
+  <li>You can't set an <a href="#slos">SLO</a>, compute an <a href="#error-budgets">error budget</a>, or write a symptom-based <a href="#alerts">alert</a>, because they all need an SLI underneath.</li>
+  <li>"The server was up" hides failures users saw: requests that errored, timed out, or never reached the server at all.</li>
+</ul>
+<p>An SLI fixes the definition first: <em>which events count</em>, <em>what makes one good</em>, and <em>where it's measured</em>.</p>
+
+<h2>How it works</h2>
+<p>The Google SRE Workbook recommends expressing every SLI as a ratio, so it always runs from 0% (nothing works) to 100% (nothing is broken):</p>
+<p style="text-align:center"><strong>SLI = good events ÷ valid events × 100%</strong></p>
+<ul>
+  <li><strong>Valid events</strong>: the ones that should count. Exclude health checks, your own load tests, and requests for routes that don't exist.</li>
+  <li><strong>Good events</strong>: valid events that met the bar: not a 5xx, faster than 300 ms, fresher than 1 hour.</li>
+</ul>
+<p>The ratio form makes SLIs comparable across services, and it plugs straight into SLOs ("99.9% good") and error budgets ("0.1% may be bad").</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Of 1,000,000 requests, 20,000 are not valid, such as health checks and load tests. Of the 980,000 valid requests, 978,800 are good, non-5xx responses, and 1,200 are 5xx. The SLI is 978,800 divided by 980,000, which is 99.88 percent.">
+  <rect class="box muted" x="20" y="20" width="440" height="215" rx="10"/>
+  <text x="36" y="42" class="title">all requests: 1,000,000</text>
+  <rect class="box accent" x="40" y="56" width="400" height="140" rx="8"/>
+  <text x="56" y="78" class="title">valid: 980,000</text>
+  <rect class="box ok" x="60" y="92" width="300" height="88" rx="6"/>
+  <text x="210" y="132" text-anchor="middle" class="title">good: 978,800</text>
+  <text x="210" y="150" text-anchor="middle" class="small">non-5xx responses</text>
+  <rect class="box bad" x="370" y="92" width="56" height="88" rx="6"/>
+  <text x="398" y="132" text-anchor="middle" class="title">5xx</text>
+  <text x="398" y="150" text-anchor="middle" class="small">1,200</text>
+  <text x="36" y="220" class="small">not valid: health checks, load tests, unknown routes (20,000)</text>
+
+  <text x="620" y="80" text-anchor="middle" class="title">SLI = good ÷ valid</text>
+  <text x="620" y="110" text-anchor="middle">978,800 ÷ 980,000</text>
+  <text x="620" y="142" text-anchor="middle" class="title">= 99.88%</text>
+  <path class="line dashed" d="M500 164 H740"/>
+  <text x="620" y="188" text-anchor="middle" class="small">compared with an SLO of 99.9%:</text>
+  <text x="620" y="204" text-anchor="middle" class="small">just below target</text>
+</svg>
+<figcaption>Boxes are not to scale. Deciding what counts as valid is as important as deciding what counts as good.</figcaption>
+</figure>
+
+<h3>Where to measure</h3>
+<p>The same SLI can be measured at different points. The closer to the user, the more accurate, and the harder to collect:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 262" role="img" aria-label="A request path from the user's browser through the internet and CDN, the load balancer, the app server and the database. Measurement points below: client-side instrumentation is closest to users; probers send synthetic requests and catch DNS and TLS outages; load balancer metrics see 502s from dead pods; app metrics have rich labels but miss requests that never arrive. The database is not an SLI source because users don't call it.">
+  <defs><marker id="arr-sli-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="20" y="22" class="small">← closer to what users experience</text>
+  <text x="760" y="22" text-anchor="end" class="small">easier to instrument →</text>
+  <rect class="box" x="20" y="36" width="130" height="50" rx="8"/><text x="85" y="66" text-anchor="middle" class="title">user's browser</text>
+  <rect class="box" x="175" y="36" width="130" height="50" rx="8"/><text x="240" y="66" text-anchor="middle" class="title">internet / CDN</text>
+  <rect class="box" x="330" y="36" width="130" height="50" rx="8"/><text x="395" y="66" text-anchor="middle" class="title">load balancer</text>
+  <rect class="box" x="485" y="36" width="130" height="50" rx="8"/><text x="550" y="66" text-anchor="middle" class="title">app server</text>
+  <rect class="box muted" x="640" y="36" width="120" height="50" rx="8"/><text x="700" y="66" text-anchor="middle" class="title">database</text>
+  <path class="line" d="M150 61 H173" marker-end="url(#arr-sli-2)"/>
+  <path class="line" d="M305 61 H328" marker-end="url(#arr-sli-2)"/>
+  <path class="line" d="M460 61 H483" marker-end="url(#arr-sli-2)"/>
+  <path class="line" d="M615 61 H638" marker-end="url(#arr-sli-2)"/>
+
+  <rect class="box ok" x="20" y="150" width="130" height="96" rx="8"/>
+  <text x="85" y="172" text-anchor="middle" class="title">client-side</text>
+  <text x="85" y="194" text-anchor="middle" class="small">closest to users</text>
+  <text x="85" y="210" text-anchor="middle" class="small">needs an SDK and</text>
+  <text x="85" y="226" text-anchor="middle" class="small">its own pipeline</text>
+  <rect class="box ok" x="175" y="150" width="130" height="96" rx="8"/>
+  <text x="240" y="172" text-anchor="middle" class="title">prober</text>
+  <text x="240" y="194" text-anchor="middle" class="small">synthetic requests</text>
+  <text x="240" y="210" text-anchor="middle" class="small">catch DNS/TLS</text>
+  <text x="240" y="226" text-anchor="middle" class="small">outages; few paths</text>
+  <rect class="box ok" x="330" y="150" width="130" height="96" rx="8"/>
+  <text x="395" y="172" text-anchor="middle" class="title">LB metrics</text>
+  <text x="395" y="194" text-anchor="middle" class="small">sees 502s from</text>
+  <text x="395" y="210" text-anchor="middle" class="small">dead or full pods</text>
+  <text x="395" y="226" text-anchor="middle" class="small">few labels</text>
+  <rect class="box ok" x="485" y="150" width="130" height="96" rx="8"/>
+  <text x="550" y="172" text-anchor="middle" class="title">app metrics</text>
+  <text x="550" y="194" text-anchor="middle" class="small">rich labels (route)</text>
+  <text x="550" y="210" text-anchor="middle" class="small">misses requests</text>
+  <text x="550" y="226" text-anchor="middle" class="small">that never arrive</text>
+  <rect class="box muted" x="640" y="150" width="120" height="96" rx="8"/>
+  <text x="700" y="172" text-anchor="middle" class="title">not an SLI</text>
+  <text x="700" y="194" text-anchor="middle" class="small">users don't call</text>
+  <text x="700" y="210" text-anchor="middle" class="small">it; it's a cause,</text>
+  <text x="700" y="226" text-anchor="middle" class="small">not a symptom</text>
+  <path class="line dashed" d="M85 148 V90" marker-end="url(#arr-sli-2)"/>
+  <path class="line dashed" d="M240 148 V90" marker-end="url(#arr-sli-2)"/>
+  <path class="line dashed" d="M395 148 V90" marker-end="url(#arr-sli-2)"/>
+  <path class="line dashed" d="M550 148 V90" marker-end="url(#arr-sli-2)"/>
+  <text x="96" y="124" class="small">measured here</text>
+</svg>
+<figcaption>Many teams start with load balancer or app metrics because they already exist, and add probers to catch "the whole site is unreachable".</figcaption>
+</figure>
+
+<h2>Choosing SLIs by service type</h2>
+<p>The SRE Workbook groups SLIs by what the service does. Pick one or two per user journey, not twenty.</p>
+<table>
+  <tr><th>Service type</th><th>SLI</th><th>Good event</th><th>Valid event</th></tr>
+  <tr><td rowspan="3">Request-driven<br>(API, website)</td><td>Availability</td><td>response that isn't a 5xx</td><td>requests, excluding health checks</td></tr>
+  <tr><td>Latency</td><td>response faster than 300 ms</td><td>same</td></tr>
+  <tr><td>Quality</td><td>full answer, not a degraded fallback (e.g. results without recommendations)</td><td>same</td></tr>
+  <tr><td rowspan="3">Pipeline<br>(batch, stream)</td><td>Freshness</td><td>reads served from data updated less than 1 hour ago</td><td>reads (or minutes, if measured over time)</td></tr>
+  <tr><td>Correctness</td><td>output records that pass verification</td><td>records checked</td></tr>
+  <tr><td>Coverage</td><td>input records processed</td><td>input records received</td></tr>
+  <tr><td>Storage</td><td>Durability</td><td>written objects that can be read back</td><td>objects written</td></tr>
+</table>
+<p><strong>What about 4xx?</strong> Usually they count as good: the service correctly rejected a bad request. Exceptions are worth thinking about: a <code>429</code> from your own overload protection, or a <code>404</code> caused by a bug, is your failure, not the client's.</p>
+
+<h2>Example</h2>
+<p><strong>Instrumenting a Go service for SLIs</strong> with <code>prometheus/client_golang</code>. Two details matter: the route label is the pattern (low cardinality), and the latency threshold, 300 ms, is an exact histogram bucket boundary.</p>
+<pre><code>package main
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+var (
+	requests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "Requests by route and status code.",
+	}, []string{"route", "code"})
+
+	// 0.3 must be a bucket boundary: the latency SLI counts requests
+	// "faster than 300 ms", and PromQL can only read exact bucket edges.
+	duration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "Request latency.",
+		Buckets: []float64{0.05, 0.1, 0.3, 1, 3},
+	}, []string{"route"})
+)
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func Instrument(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &amp;statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		route := r.Pattern // low cardinality: "GET /orders/{id}", never the raw path
+		requests.WithLabelValues(route, strconv.Itoa(sw.status)).Inc()
+		duration.WithLabelValues(route).Observe(time.Since(start).Seconds())
+	})
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /orders/{id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(&#96;{"id":"&#96; + r.PathValue("id") + &#96;"}&#96;))
+	})
+	http.Handle("/", Instrument(mux))
+	http.Handle("GET /metrics", promhttp.Handler()) // not instrumented: not a user request
+	http.ListenAndServe(":8080", nil)
+}</code></pre>
+<p>After three successful requests and one 500 (from an <code>httptest</code> run), <code>/metrics</code> really contains:</p>
+<pre><code># TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{route="GET /orders/{id}",le="0.05"} 4
+http_request_duration_seconds_bucket{route="GET /orders/{id}",le="0.1"} 4
+http_request_duration_seconds_bucket{route="GET /orders/{id}",le="0.3"} 4
+http_request_duration_seconds_bucket{route="GET /orders/{id}",le="1"} 4
+http_request_duration_seconds_bucket{route="GET /orders/{id}",le="3"} 4
+http_request_duration_seconds_bucket{route="GET /orders/{id}",le="+Inf"} 4
+http_request_duration_seconds_sum{route="GET /orders/{id}"} 7.716800000000002e-05
+http_request_duration_seconds_count{route="GET /orders/{id}"} 4
+# TYPE http_requests_total counter
+http_requests_total{code="200",route="GET /orders/{id}"} 3
+http_requests_total{code="500",route="GET /orders/{id}"} 1</code></pre>
+<p>Here availability is 3 ÷ 4 = 75%, and the latency SLI is 4 ÷ 4 = 100% (all four were under 0.3 s). In PromQL:</p>
+<pre><code># Availability SLI, last 5 minutes: non-5xx ÷ all instrumented requests
+sum(rate(http_requests_total{code!~"5.."}[5m]))
+  / sum(rate(http_requests_total[5m]))
+
+# Latency SLI: requests under 300 ms ÷ all requests (needs the le="0.3" bucket)
+sum(rate(http_request_duration_seconds_bucket{le="0.3"}[5m]))
+  / sum(rate(http_request_duration_seconds_count[5m]))
+
+# The same availability SLI over a 30-day SLO window
+sum(increase(http_requests_total{code!~"5.."}[30d]))
+  / sum(increase(http_requests_total[30d]))
+
+# Pipeline freshness: fraction of minutes in 30 days where data was under 1 hour old
+# (the job sets this gauge when a run succeeds)
+avg_over_time((time() - pipeline_last_success_timestamp_seconds &lt; bool 3600)[30d:1m])</code></pre>
+
+<p><strong>Real-world scenario.</strong> A team defined checkout availability from app metrics, and it read 99.97% for the month. Yet support saw complaints after every deploy. The load balancer's metrics explained it: during each rolling deploy, pods were killed before they were removed from the load balancer, and for about 10 minutes the LB returned 502 for roughly 1,800 of 120,000 requests, around 1.5%. None of those requests reached the app, so app metrics never counted them. Measuring the SLI at the load balancer exposed the gap. The fix was graceful shutdown (see <a href="#liveness-readiness-probes">Liveness &amp; Readiness Probes</a>), and the SLI moved to the LB permanently.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Measuring what's easy instead of what users feel.</strong> CPU, memory and "pod is up" are not SLIs. Ask: if this number gets worse, does a user notice?</li>
+  <li><strong>Averages as latency SLIs.</strong> Mean latency hides the slow tail. Use "fraction of requests faster than X", which is also a proper good/valid ratio (see <a href="#p99-latency">p99 Latency</a>).</li>
+  <li><strong>Thresholds that don't match buckets.</strong> If 300 ms isn't a bucket boundary, you can't count requests under 300 ms exactly. Choose buckets after choosing the SLI.</li>
+  <li><strong>Counting health checks and synthetic traffic.</strong> Thousands of cheap <code>/healthz</code> hits inflate the SLI. Exclude them in the valid-events selector, or keep them off the instrumented handler as the example does.</li>
+  <li><strong>One SLI for the whole service.</strong> A 99.95% overall ratio can hide a broken checkout behind millions of healthy product-page reads. Define SLIs per critical user journey.</li>
+  <li><strong>Too many SLIs.</strong> Twenty indicators per service means nobody watches any of them. Start with availability and latency for your top journeys.</li>
+  <li><strong>Low traffic.</strong> At 50 requests an hour, one failure moves the ratio 2%. Use longer windows, or add probers to create a steady baseline of events.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>An SLI is good events ÷ valid events, measured from the user's point of view.</li>
+  <li>Request services: availability and latency (plus quality). Pipelines: freshness, correctness, coverage. Storage: durability.</li>
+  <li>Where you measure changes what you see: LB and client-side catch failures app metrics miss.</li>
+  <li>Design instrumentation for the SLI: low-cardinality labels and a bucket at the latency threshold.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#slos">SLOs</a> · <a href="#error-budgets">Error Budgets</a> · <a href="#metrics">Metrics</a> · <a href="#alerts">Alerts</a> · <a href="#p99-latency">p99 Latency</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
+`;
+
