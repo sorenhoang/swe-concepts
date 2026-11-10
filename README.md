@@ -1,6 +1,6 @@
 # swe-concepts
 
-**Software Engineer Concept** is a single-page tracker for 114 software engineering concepts, grouped into 17 topics. The original 111 come from [@nataindata](https://www.instagram.com/nataindata/)'s "Who's gonna tell vibe coders about…".
+**Software Engineer Concept** is a single-page tracker for 115 software engineering concepts, grouped into 17 topics. The original 111 come from [@nataindata](https://www.instagram.com/nataindata/)'s "Who's gonna tell vibe coders about…".
 
 **Live:** https://sorenhoang.github.io/swe-concepts/
 
@@ -43,7 +43,7 @@ Load the file in `index.html` with `<script src="content/<group-slug>.js"></scri
 | Scalability & Performance | 10 |
 | Containers & Infrastructure as Code | 5 |
 | CI/CD & Release Engineering | 9 |
-| Observability & Reliability Targets | 11 |
+| Observability & Reliability Targets | 12 |
 | Security: Identity & Encryption | 7 |
 | Security: Web Threats & Defense | 7 |
 | Disaster Recovery & High Availability | 5 |
