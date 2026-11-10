@@ -499,3 +499,270 @@ $ curl -s -w " %{http_code}" localhost:8080/orders
 <p><strong>Related:</strong> <a href="#health-checks">Health Checks</a> · <a href="#kubernetes">Kubernetes</a> · <a href="#rolling-deployments">Rolling Deployments</a> · <a href="#service-discovery">Service Discovery</a> · <a href="#cold-starts">Cold Starts</a> · <a href="#monitoring">Monitoring</a></p>
 `;
 
+CONTENT["monitoring"] = `
+<p class="tldr"><strong>TL;DR</strong>: Monitoring means collecting numbers about a running system (request rate, error rate, latency, how full things are), graphing them on dashboards and alerting when they cross a line. It watches for <em>known</em> failure modes: you decide in advance what "broken" looks like. It's a car's dashboard: speed, fuel and engine temperature, plus a warning light. It tells you <em>something</em> is wrong, and roughly where to look.</p>
+
+<h2>The problem it solves</h2>
+<p>Without monitoring, the first signal of an outage is a customer. Nobody knows whether last night's deploy made checkout slower, whether the database disk will fill up this week, or whether errors went from 0.1% to 3% an hour ago. Logs alone don't answer these questions quickly: you can't eyeball a trend across ten million lines.</p>
+<p>The Google SRE book defines monitoring as "collecting, processing, aggregating, and displaying real-time quantitative data about a system", and says it should answer two questions: <strong>what's broken</strong> (the symptom) and <strong>why</strong> (the cause).</p>
+
+<h2>How it works</h2>
+<ol>
+  <li><strong>Instrument</strong>: code and infrastructure expose numbers, such as a request counter or a latency histogram. Exporters do it for things you didn't write (node exporter for CPU and disk, postgres exporter for the database).</li>
+  <li><strong>Collect</strong>: a monitoring system gathers those numbers every 10 to 60 seconds and stores them as time series.</li>
+  <li><strong>Visualize</strong>: dashboards graph the series so humans can spot changes and correlate them.</li>
+  <li><strong>Alert</strong>: rules evaluate continuously; when one holds long enough, it notifies a human. See <a href="#alerts">Alerts</a>.</li>
+</ol>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="Prometheus pulls metrics: it scrapes GET /metrics from checkout, payments and a node exporter every 15 seconds. A nightly batch job pushes to a Pushgateway, which Prometheus then scrapes. A blackbox exporter probes the public URL like a user, and Prometheus scrapes its results. Prometheus feeds Grafana dashboards and sends firing alerts to Alertmanager, which pages on-call.">
+  <defs><marker id="arr-mon-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="95" y="22" text-anchor="middle" class="title">Targets</text>
+  <rect class="box" x="20" y="36" width="150" height="44" rx="8"/><text x="95" y="55" text-anchor="middle">checkout</text><text x="95" y="71" text-anchor="middle" class="small">white-box: /metrics</text>
+  <rect class="box" x="20" y="96" width="150" height="44" rx="8"/><text x="95" y="115" text-anchor="middle">payments</text><text x="95" y="131" text-anchor="middle" class="small">white-box: /metrics</text>
+  <rect class="box" x="20" y="156" width="150" height="44" rx="8"/><text x="95" y="175" text-anchor="middle">node exporter</text><text x="95" y="191" text-anchor="middle" class="small">CPU, memory, disk</text>
+  <rect class="box muted" x="20" y="226" width="150" height="44" rx="8"/><text x="95" y="245" text-anchor="middle">nightly batch job</text><text x="95" y="261" text-anchor="middle" class="small">exits in 2 minutes</text>
+
+  <rect class="box accent" x="350" y="80" width="160" height="110" rx="10"/>
+  <text x="430" y="106" text-anchor="middle" class="title">Prometheus</text>
+  <text x="430" y="128" text-anchor="middle" class="small">scrapes every 15 s</text>
+  <text x="430" y="145" text-anchor="middle" class="small">stores time series</text>
+  <text x="430" y="162" text-anchor="middle" class="small">evaluates alert rules</text>
+
+  <path class="line" d="M348 100 L172 60" marker-end="url(#arr-mon-1)"/>
+  <path class="line" d="M348 125 L172 118" marker-end="url(#arr-mon-1)"/>
+  <path class="line" d="M348 150 L172 178" marker-end="url(#arr-mon-1)"/>
+  <text x="262" y="66" text-anchor="middle" class="small">pull: GET /metrics</text>
+
+  <rect class="box" x="200" y="226" width="120" height="44" rx="8"/><text x="260" y="245" text-anchor="middle">Pushgateway</text><text x="260" y="261" text-anchor="middle" class="small">holds last value</text>
+  <path class="line accent" d="M170 248 H198" marker-end="url(#arr-mon-1)"/>
+  <text x="184" y="218" text-anchor="middle" class="small">push</text>
+  <path class="line" d="M370 190 L300 224" marker-end="url(#arr-mon-1)"/>
+
+  <rect class="box" x="350" y="226" width="160" height="44" rx="8"/><text x="430" y="245" text-anchor="middle">blackbox exporter</text><text x="430" y="261" text-anchor="middle" class="small">probes like a user</text>
+  <path class="line" d="M450 190 V224" marker-end="url(#arr-mon-1)"/>
+  <rect class="box muted" x="560" y="226" width="200" height="44" rx="8"/><text x="660" y="245" text-anchor="middle">https://shop.example.com</text><text x="660" y="261" text-anchor="middle" class="small">black-box: outside view</text>
+  <path class="line dashed" d="M510 248 H558" marker-end="url(#arr-mon-1)"/>
+
+  <rect class="box ok" x="590" y="30" width="170" height="44" rx="8"/><text x="675" y="49" text-anchor="middle">Grafana</text><text x="675" y="65" text-anchor="middle" class="small">dashboards (PromQL)</text>
+  <rect class="box" x="590" y="100" width="170" height="44" rx="8"/><text x="675" y="119" text-anchor="middle">Alertmanager</text><text x="675" y="135" text-anchor="middle" class="small">group, route, silence</text>
+  <rect class="box bad" x="590" y="166" width="170" height="36" rx="8"/><text x="675" y="189" text-anchor="middle">on-call pager</text>
+  <path class="line" d="M590 60 L512 104" marker-end="url(#arr-mon-1)"/>
+  <text x="565" y="98" text-anchor="middle" class="small">query</text>
+  <path class="line" d="M512 140 L588 124" marker-end="url(#arr-mon-1)"/>
+  <path class="line" d="M675 144 V164" marker-end="url(#arr-mon-1)"/>
+</svg>
+<figcaption>Arrows show who starts the connection. Prometheus <strong>pulls</strong> from long-running targets, so a target that stops answering shows up immediately as <code>up == 0</code>. Short-lived jobs <strong>push</strong> to a Pushgateway instead. The blackbox exporter adds the user's view from outside.</figcaption>
+</figure>
+
+<h3>What to watch: three checklists</h3>
+<ul>
+  <li><strong>The four golden signals</strong> (Google SRE book), for any user-facing system: <strong>latency</strong> (time to serve a request; track failed requests separately, since fast errors flatter the average), <strong>traffic</strong> (demand, such as requests per second), <strong>errors</strong> (the rate of failing requests), <strong>saturation</strong> (how "full" the service is: CPU, memory, connection pool, queue depth).</li>
+  <li><strong>RED</strong> (popularised by Tom Wilkie), for every request-driven service: <strong>R</strong>ate, <strong>E</strong>rrors, <strong>D</strong>uration. It's the golden signals minus saturation, applied uniformly so every service dashboard looks the same.</li>
+  <li><strong>USE</strong> (Brendan Gregg), for every <em>resource</em>: "For every resource, check utilization, saturation, and errors." Utilization is how busy it is, saturation is work queued that it can't serve yet, errors are error events. It finds bottlenecks in CPUs, disks, NICs and pools.</li>
+</ul>
+<p>RED tells you a service is unhappy; USE tells you which resource is the reason. Use both.</p>
+
+<h3>Reading a golden-signals dashboard</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 214" role="img" aria-label="Four dashboard panels from 14:00 to 14:10 with a marker at 14:05. Traffic stays flat. Errors jump from near zero to about 4 percent. Latency p99 jumps from 180 milliseconds to 2 seconds while p50 barely moves. Database connection pool usage climbs to 100 percent of its limit.">
+  <rect class="box muted" x="10" y="10" width="182" height="194" rx="8"/>
+  <rect class="box muted" x="202" y="10" width="182" height="194" rx="8"/>
+  <rect class="box muted" x="394" y="10" width="182" height="194" rx="8"/>
+  <rect class="box muted" x="586" y="10" width="182" height="194" rx="8"/>
+  <text x="101" y="32" text-anchor="middle" class="title">Traffic (req/s)</text>
+  <text x="293" y="32" text-anchor="middle" class="title">Errors (5xx %)</text>
+  <text x="485" y="32" text-anchor="middle" class="title">Latency</text>
+  <text x="677" y="32" text-anchor="middle" class="title">Saturation</text>
+
+  <path class="line" d="M22 170 H180 M22 50 V170"/>
+  <path class="line" d="M214 170 H372 M214 50 V170"/>
+  <path class="line" d="M406 170 H564 M406 50 V170"/>
+  <path class="line" d="M598 170 H756 M598 50 V170"/>
+  <path class="line accent dashed" d="M101 50 V170 M293 50 V170 M485 50 V170 M677 50 V170"/>
+
+  <path class="line ok" d="M22 96 L38 92 L54 98 L70 94 L86 97 L101 93 L117 99 L133 95 L149 97 L165 92 L180 96"/>
+  <text x="140" y="80" text-anchor="middle" class="small">~1,200 flat</text>
+
+  <path class="line bad" d="M214 164 L240 165 L266 163 L293 164 L305 100 L320 86 L340 90 L356 84 L372 88"/>
+  <text x="250" y="150" text-anchor="middle" class="small">0.1%</text>
+  <text x="340" y="74" text-anchor="middle" class="small">4%</text>
+
+  <path class="line bad" d="M406 140 L430 142 L456 139 L485 141 L497 72 L515 64 L535 68 L550 62 L564 66"/>
+  <path class="line ok dashed" d="M406 158 L485 158 L500 155 L564 156"/>
+  <text x="440" y="128" text-anchor="middle" class="small">p99 180 ms</text>
+  <text x="528" y="54" text-anchor="middle" class="small">p99 2 s</text>
+  <text x="440" y="150" text-anchor="middle" class="small">p50 flat</text>
+
+  <path class="line bad dashed" d="M598 62 H756"/>
+  <text x="628" y="58" text-anchor="middle" class="small">limit</text>
+  <path class="line bad" d="M598 130 L620 128 L645 131 L677 129 L690 95 L705 70 L720 63 L740 62 L756 62"/>
+  <text x="606" y="118" class="small">pool in use</text>
+
+  <text x="22" y="188" class="small">14:00</text><text x="180" y="188" text-anchor="end" class="small">14:10</text>
+  <text x="214" y="188" class="small">14:00</text><text x="372" y="188" text-anchor="end" class="small">14:10</text>
+  <text x="406" y="188" class="small">14:00</text><text x="564" y="188" text-anchor="end" class="small">14:10</text>
+  <text x="598" y="188" class="small">14:00</text><text x="756" y="188" text-anchor="end" class="small">14:10</text>
+</svg>
+<figcaption>Same traffic, more errors, slower tail, a full pool: the problem is inside, not a traffic spike. The p50 line shows why averages and medians hide trouble (see <a href="#p99-latency">p99 Latency</a>).</figcaption>
+</figure>
+
+<h2>Methods and models compared</h2>
+<table>
+  <tr><th></th><th>Golden signals</th><th>RED</th><th>USE</th></tr>
+  <tr><td>Point of view</td><td>the user of a service</td><td>each request-driven service</td><td>each resource</td></tr>
+  <tr><td>Signals</td><td>latency, traffic, errors, saturation</td><td>rate, errors, duration</td><td>utilization, saturation, errors</td></tr>
+  <tr><td>Typical source</td><td>app metrics, load balancer, black-box probes</td><td>HTTP/gRPC middleware</td><td>node exporter, cAdvisor, DB and pool stats</td></tr>
+  <tr><td>Answers</td><td>"are users hurting?"</td><td>"which service is unhappy?"</td><td>"which resource is the bottleneck?"</td></tr>
+</table>
+<p>And the two ways numbers get collected:</p>
+<table>
+  <tr><th></th><th>Pull (Prometheus scrape)</th><th>Push (OTLP, StatsD, Pushgateway, remote write)</th></tr>
+  <tr><td>Who connects</td><td>the monitoring server calls each target</td><td>the app sends to a collector or backend</td></tr>
+  <tr><td>Target down?</td><td>visible for free: the scrape fails, <code>up == 0</code></td><td>silence looks like "no traffic"; needs separate checks</td></tr>
+  <tr><td>Needs</td><td>a list of targets (service discovery), reachability</td><td>only an outbound route to the collector</td></tr>
+  <tr><td>Good for</td><td>long-running services on a network you control</td><td>short-lived jobs, serverless, devices behind NAT</td></tr>
+</table>
+<p><strong>White-box</strong> monitoring uses what the system reports about itself (the metrics above). <strong>Black-box</strong> monitoring tests what a user sees from outside. White-box catches problems early and explains them; black-box catches what white-box can't see, such as expired TLS certificates, DNS mistakes, or a dead load balancer in front of healthy pods.</p>
+
+<h2>Example</h2>
+<p><strong>RED metrics for a Go service</strong> using <code>client_golang</code>'s ready-made <code>promhttp</code> middleware, so there's no hand-written timing code:</p>
+<pre><code>// RED per route: Rate and Errors from one counter, Duration from a histogram.
+// The in-flight gauge is a cheap saturation signal.
+var (
+	requests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "HTTP requests by route and status code.",
+	}, []string{"route", "code"})
+
+	duration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "HTTP request latency by route.",
+		Buckets: []float64{0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5},
+	}, []string{"route"})
+
+	inFlight = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "http_requests_in_flight",
+		Help: "Requests currently being served.",
+	})
+)
+
+// instrument wraps a handler with promhttp's ready-made middleware.
+// route is the pattern ("/orders"), never the raw path ("/orders/8812"),
+// or every ID becomes its own time series.
+func instrument(route string, h http.Handler) http.Handler {
+	l := prometheus.Labels{"route": route}
+	return promhttp.InstrumentHandlerInFlight(inFlight,
+		promhttp.InstrumentHandlerDuration(duration.MustCurryWith(l),
+			promhttp.InstrumentHandlerCounter(requests.MustCurryWith(l), h)))
+}
+
+func checkout(w http.ResponseWriter, r *http.Request) {
+	time.Sleep(time.Duration(20+rand.IntN(100)) * time.Millisecond)
+	if rand.IntN(10) == 0 {
+		http.Error(w, "payment provider timeout", http.StatusBadGateway)
+		return
+	}
+	w.Write([]byte("ok&#92;n"))
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.Handle("POST /checkout", instrument("/checkout", http.HandlerFunc(checkout)))
+	mux.Handle("GET /metrics", promhttp.Handler()) // Prometheus pulls this
+	http.ListenAndServe(":8080", mux)
+}</code></pre>
+
+<p>Real <code>/metrics</code> output after 50 requests (from an <code>httptest</code> run; the default registry also exports Go runtime and process metrics, trimmed here except one):</p>
+<pre><code># HELP go_goroutines Number of goroutines that currently exist.
+# TYPE go_goroutines gauge
+go_goroutines 13
+# HELP http_request_duration_seconds HTTP request latency by route.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{route="/checkout",le="0.025"} 2
+http_request_duration_seconds_bucket{route="/checkout",le="0.05"} 16
+http_request_duration_seconds_bucket{route="/checkout",le="0.1"} 39
+http_request_duration_seconds_bucket{route="/checkout",le="0.25"} 50
+http_request_duration_seconds_bucket{route="/checkout",le="0.5"} 50
+http_request_duration_seconds_bucket{route="/checkout",le="1"} 50
+http_request_duration_seconds_bucket{route="/checkout",le="2.5"} 50
+http_request_duration_seconds_bucket{route="/checkout",le="+Inf"} 50
+http_request_duration_seconds_sum{route="/checkout"} 3.5481269199999996
+http_request_duration_seconds_count{route="/checkout"} 50
+# HELP http_requests_in_flight Requests currently being served.
+# TYPE http_requests_in_flight gauge
+http_requests_in_flight 0
+# HELP http_requests_total HTTP requests by route and status code.
+# TYPE http_requests_total counter
+http_requests_total{code="200",route="/checkout"} 47
+http_requests_total{code="502",route="/checkout"} 3</code></pre>
+
+<p>Prometheus config: scrape the service, and probe the public site from outside with the blackbox exporter:</p>
+<pre><code>scrape_configs:
+  - job_name: checkout
+    scrape_interval: 15s
+    kubernetes_sd_configs:          # discover pods instead of listing IPs
+      - role: pod
+    relabel_configs:                # keep only pods labelled app=checkout
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: checkout
+        action: keep
+
+  - job_name: blackbox
+    metrics_path: /probe
+    params:
+      module: [http_2xx]            # expect a 2xx from the URL below
+    static_configs:
+      - targets: ['https://shop.example.com/healthz']
+    relabel_configs:                # turn the target into ?target=...
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115</code></pre>
+
+<p>The dashboard queries behind the four panels above (PromQL; <a href="#metrics">Metrics</a> explains <code>rate</code> and <code>histogram_quantile</code>):</p>
+<pre><code># Traffic: requests per second, per route
+sum by (route) (rate(http_requests_total[5m]))
+
+# Errors: share of requests that returned 5xx
+sum(rate(http_requests_total{code=~"5.."}[5m]))
+  / sum(rate(http_requests_total[5m]))
+
+# Latency: p99 and p50 from the histogram
+histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+
+# Saturation: DB pool usage vs its limit (from collectors.NewDBStatsCollector)
+max by (pod) (go_sql_in_use_connections{db_name="checkout"}
+  / go_sql_max_open_connections{db_name="checkout"})
+
+# Black-box: 0 means the public URL failed its probe; up == 0 means a scrape failed
+probe_success{job="blackbox"}
+up{job="checkout"} == 0</code></pre>
+
+<p><strong>Real-world scenario.</strong> It's 14:05. A page fires: the checkout error rate has been above 2% for 5 minutes. The on-call engineer opens the checkout dashboard. Traffic is flat at about 1,200 req/s, so it isn't a spike. The 5xx rate is 4% and p99 latency went from 180 ms to 2 s, while p50 barely moved, so only some requests are slow. The saturation panel shows the database connection pool pinned at its limit since 14:04. The USE panel for the database host shows normal CPU, so the database isn't overloaded; connections are being held too long. The deploy annotation at 14:03 points to a release that added a slow query inside a transaction. Rolling back clears all four panels within two minutes. Monitoring didn't name the query, but it narrowed the search from "everything" to "one service, one pool, one deploy". Traces and logs (see <a href="#observability">Observability</a>) find the rest.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Dashboards nobody reads.</strong> Forty panels per service hide the four that matter. Put the golden signals at the top of every service dashboard, in the same order, and add detail panels below.</li>
+  <li><strong>Watching causes, paging on causes.</strong> "CPU at 90%" is worth a graph, not a 3 a.m. page; the SRE book recommends putting far more effort into catching symptoms than causes. Page on what users feel, and use cause metrics to diagnose.</li>
+  <li><strong>Averages.</strong> A 50 ms average can hide a 3 s p99 that hits your best customers. Record histograms and graph p50, p95 and p99.</li>
+  <li><strong>Only white-box.</strong> Every pod reports healthy while the certificate on the load balancer expired an hour ago. Add at least one black-box probe per public entry point.</li>
+  <li><strong>Raw paths and user IDs as labels.</strong> <code>route="/orders/8812"</code> creates a new time series for every order and can take Prometheus down. Use route patterns (see <a href="#metrics">Metrics</a>).</li>
+  <li><strong>Monitoring that shares the outage.</strong> If Prometheus runs in the same cluster that just failed, it goes dark when you need it most. Monitor the monitor from somewhere else, even if it's a single external uptime check.</li>
+  <li><strong>Pushgateway as a general push endpoint.</strong> Prometheus's docs say its only valid use case is usually capturing the outcome of a service-level batch job. Used for services, it becomes a single point of failure, loses <code>up</code>, and remembers series forever.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Monitoring watches known failure modes: collect numbers, graph them, alert on the ones users feel.</li>
+  <li>Golden signals for user-facing health, RED per service, USE per resource.</li>
+  <li>Pull makes "target down" visible for free; push suits short-lived and unreachable workloads.</li>
+  <li>Combine white-box metrics (early, explanatory) with black-box probes (the user's real view).</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#metrics">Metrics</a> · <a href="#alerts">Alerts</a> · <a href="#observability">Observability</a> · <a href="#slis">SLIs</a> · <a href="#health-checks">Health Checks</a> · <a href="#p99-latency">p99 Latency</a></p>
+`;
+
