@@ -254,3 +254,248 @@ ok</code></pre>
 <p><strong>Related:</strong> <a href="#liveness-readiness-probes">Liveness &amp; Readiness Probes</a> · <a href="#load-balancing">Load Balancing</a> · <a href="#service-discovery">Service Discovery</a> · <a href="#circuit-breakers">Circuit Breakers</a> · <a href="#timeouts">Timeouts</a> · <a href="#monitoring">Monitoring</a></p>
 `;
 
+CONTENT["liveness-readiness-probes"] = `
+<p class="tldr"><strong>TL;DR</strong>: Kubernetes asks each container three different questions. <strong>Startup</strong>: "have you finished booting?" <strong>Liveness</strong>: "are you stuck?" If not alive, the kubelet <em>restarts</em> the container. <strong>Readiness</strong>: "should you get traffic right now?" If not ready, the pod is <em>removed from Service endpoints</em> but keeps running. Mixing up "restart me" and "don't send me traffic" is the source of most probe outages.</p>
+
+<h2>The problem it solves</h2>
+<p>A generic <a href="#health-checks">health check</a> gives one yes/no answer. An orchestrator needs to make three separate decisions, and each needs a different answer:</p>
+<ul>
+  <li><strong>A slow starter</strong> (loads a 2 GB model, warms caches) looks dead for 90 seconds. Judge it too early and Kubernetes kills it before it ever starts, forever: a crash loop.</li>
+  <li><strong>A deadlocked process</strong> keeps its port open and answers nothing. Only a restart fixes it.</li>
+  <li><strong>A healthy but busy or shutting-down pod</strong> should stop getting <em>new</em> requests, but must not be killed: killing it drops the requests it's already handling.</li>
+</ul>
+<p>Without probes, Kubernetes only knows "the process exited or it didn't". It sends traffic to pods that are still booting, never restarts wedged ones, and sends requests to pods in the middle of shutting down.</p>
+
+<h2>How it works</h2>
+<p>The <strong>kubelet</strong> on each node runs the probes against its own containers. Each probe uses one mechanism: <code>httpGet</code> (success is a status from 200 to 399), <code>tcpSocket</code> (port open), <code>grpc</code> (the standard gRPC health service answers <code>SERVING</code>; stable since Kubernetes 1.27), or <code>exec</code> (a command exits 0). The three probes differ in <em>when</em> they run and <em>what happens on failure</em>:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 262" role="img" aria-label="Timeline of one pod. The startup probe fails while the app warms up, then passes, and is never run again. Only then do liveness and readiness start. Liveness passes for the rest of the pod's life. Readiness passes, so the pod is in the Service endpoints and gets traffic, until SIGTERM, when readiness fails and the pod drains.">
+  <text x="20" y="54" class="title">startup</text>
+  <text x="20" y="99" class="title">liveness</text>
+  <text x="20" y="144" class="title">readiness</text>
+  <text x="20" y="189" class="title">gets traffic?</text>
+
+  <rect class="box bad" x="150" y="36" width="190" height="28" rx="4"/><text x="245" y="55" text-anchor="middle" class="small">503 starting… (tolerated)</text>
+  <rect class="box ok" x="340" y="36" width="50" height="28" rx="4"/><text x="365" y="55" text-anchor="middle" class="small">pass</text>
+  <text x="400" y="55" class="small">done, never runs again</text>
+
+  <rect class="box muted" x="150" y="81" width="240" height="28" rx="4"/><text x="270" y="100" text-anchor="middle" class="small">not run yet</text>
+  <rect class="box ok" x="390" y="81" width="370" height="28" rx="4"/><text x="575" y="100" text-anchor="middle" class="small">pass every 10 s; 3 fails in a row → restart container</text>
+
+  <rect class="box muted" x="150" y="126" width="240" height="28" rx="4"/><text x="270" y="145" text-anchor="middle" class="small">not run yet</text>
+  <rect class="box ok" x="390" y="126" width="250" height="28" rx="4"/><text x="515" y="145" text-anchor="middle" class="small">pass: listed in EndpointSlices</text>
+  <rect class="box bad" x="640" y="126" width="120" height="28" rx="4"/><text x="700" y="145" text-anchor="middle" class="small">503: removed</text>
+
+  <rect class="box muted" x="150" y="171" width="250" height="28" rx="4"/><text x="275" y="190" text-anchor="middle" class="small">no</text>
+  <rect class="box ok" x="400" y="171" width="240" height="28" rx="4"/><text x="520" y="190" text-anchor="middle" class="small">yes</text>
+  <rect class="box accent" x="640" y="171" width="120" height="28" rx="4"/><text x="700" y="190" text-anchor="middle" class="small">drain in-flight</text>
+
+  <path class="line" d="M150 222 H760"/>
+  <path class="line" d="M150 216 V228 M390 216 V228 M640 216 V228"/>
+  <text x="150" y="246" class="small">container starts</text>
+  <text x="390" y="246" text-anchor="middle" class="small">app warmed up</text>
+  <text x="640" y="246" text-anchor="middle" class="small">SIGTERM</text>
+</svg>
+<figcaption>The startup probe holds the other two back, so a slow boot isn't mistaken for a hang. Liveness and readiness then run independently for the rest of the pod's life.</figcaption>
+</figure>
+
+<h3>The fields, and their defaults</h3>
+<p>Every probe takes the same timing fields. With the defaults, a pod is declared failed after about 30 seconds of failures (3 × 10 s):</p>
+<table>
+  <tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+  <tr><td><code>initialDelaySeconds</code></td><td>0</td><td>wait before the first probe (prefer a startup probe)</td></tr>
+  <tr><td><code>periodSeconds</code></td><td>10</td><td>how often to probe</td></tr>
+  <tr><td><code>timeoutSeconds</code></td><td>1</td><td>no answer within this time counts as a failure</td></tr>
+  <tr><td><code>failureThreshold</code></td><td>3</td><td>consecutive failures before acting</td></tr>
+  <tr><td><code>successThreshold</code></td><td>1</td><td>consecutive successes to count as passing again; must be 1 for liveness and startup</td></tr>
+  <tr><td><code>terminationGracePeriodSeconds</code></td><td>pod's value (30)</td><td>probe-level override: how long a container killed by a failed liveness or startup probe gets to shut down</td></tr>
+</table>
+<p>A startup probe's budget is <code>failureThreshold × periodSeconds</code>: 24 × 5 s gives a slow app two minutes to boot, while liveness keeps its tight 30-second reaction time afterwards.</p>
+
+<h2>The three probes compared</h2>
+<table>
+  <tr><th></th><th>Startup</th><th>Liveness</th><th>Readiness</th></tr>
+  <tr><td>Question</td><td>finished booting?</td><td>able to make progress?</td><td>should I get new requests?</td></tr>
+  <tr><td>Runs</td><td>only at start, until it passes once</td><td>periodically, after startup</td><td>periodically, for the whole life</td></tr>
+  <tr><td>On failure</td><td>kill; restart policy applies</td><td>kill and restart the container</td><td>remove the pod IP from Service endpoints; keep running and probing</td></tr>
+  <tr><td>Should check</td><td>init finished (same endpoint as liveness)</td><td>only the process itself: event loop, worker heartbeat</td><td>started, not shutting down, not overloaded, own critical config</td></tr>
+  <tr><td>Must not check</td><td>things that take longer than its budget</td><td>databases, caches, other services</td><td>shared dependencies that fail on every pod at once</td></tr>
+  <tr><td>Skip it when</td><td>the app boots within the liveness window</td><td>the process crashes by itself when broken</td><td>never for pods behind a Service</td></tr>
+</table>
+
+<h3>Shutdown: the race readiness can't win alone</h3>
+<p>When a pod is deleted (a rollout, a scale-down, a node drain), two things start <strong>at the same time</strong>: the kubelet begins stopping the container, and the control plane marks the endpoint not ready, which then has to reach kube-proxy on every node, ingress controllers and cloud load balancers. That takes a few seconds. If your app exits on SIGTERM immediately, proxies still send it new connections, and every deploy produces a burst of <code>502</code>s.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 232" role="img" aria-label="When a pod is deleted, two lanes start at once. Kubelet lane: SIGTERM reaches the app, which fails readiness, keeps serving for 5 seconds, then stops accepting and finishes in-flight requests, then exits. Control plane lane: the endpoint is marked not ready, then kube-proxy, ingress and load balancers update, then no new traffic arrives. The 5 second pause covers the propagation delay.">
+  <defs><marker id="arr-probe-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="20" y="86" width="120" height="50" rx="8"/><text x="80" y="107" text-anchor="middle" class="title">pod deleted</text><text x="80" y="124" text-anchor="middle" class="small">rollout, scale-in</text>
+  <path class="line" d="M140 100 L178 60" marker-end="url(#arr-probe-2)"/>
+  <path class="line" d="M140 122 L178 160" marker-end="url(#arr-probe-2)"/>
+
+  <text x="190" y="28" class="small">kubelet → your container</text>
+  <rect class="box" x="180" y="36" width="130" height="44" rx="6"/><text x="245" y="55" text-anchor="middle">SIGTERM</text><text x="245" y="71" text-anchor="middle" class="small">readiness → 503</text>
+  <rect class="box ok" x="320" y="36" width="160" height="44" rx="6"/><text x="400" y="55" text-anchor="middle">keep serving 5 s</text><text x="400" y="71" text-anchor="middle" class="small">drainDelay</text>
+  <rect class="box" x="490" y="36" width="190" height="44" rx="6"/><text x="585" y="55" text-anchor="middle">srv.Shutdown</text><text x="585" y="71" text-anchor="middle" class="small">finish in-flight requests</text>
+  <rect class="box muted" x="690" y="36" width="70" height="44" rx="6"/><text x="725" y="63" text-anchor="middle">exit</text>
+
+  <text x="190" y="128" class="small">control plane → every node and LB</text>
+  <rect class="box" x="180" y="136" width="170" height="44" rx="6"/><text x="265" y="155" text-anchor="middle">endpoint not ready</text><text x="265" y="171" text-anchor="middle" class="small">EndpointSlice updated</text>
+  <rect class="box bad" x="360" y="136" width="200" height="44" rx="6"/><text x="460" y="155" text-anchor="middle">proxies catch up</text><text x="460" y="171" text-anchor="middle" class="small">still sending for a few s</text>
+  <rect class="box ok" x="570" y="136" width="190" height="44" rx="6"/><text x="665" y="155" text-anchor="middle">no new traffic</text><text x="665" y="171" text-anchor="middle" class="small">safe to stop</text>
+
+  <path class="line dashed" d="M480 88 V128" style="stroke: var(--line)"/>
+  <text x="390" y="214" text-anchor="middle" class="small">Without the pause the container exits during "proxies catch up", and those requests get connection refused / 502.</text>
+</svg>
+<figcaption>Fail readiness, keep serving for a few seconds, then shut down gracefully. Total time must fit in <code>terminationGracePeriodSeconds</code> (default 30 s), or the container is killed with SIGKILL. A <code>preStop</code> hook that sleeps does the same job when you can't change the app.</figcaption>
+</figure>
+
+<h2>Example</h2>
+<p><strong>A Go service with the three probes and graceful shutdown.</strong> <code>/livez</code> touches nothing external. It fails only during startup, so the startup probe and liveness can share it. <code>/readyz</code> also fails while shutting down.</p>
+<pre><code>const (
+	drainDelay      = 5 * time.Second  // time for endpoints and proxies to drop us
+	shutdownTimeout = 20 * time.Second // must fit inside terminationGracePeriodSeconds
+)
+
+var started, shuttingDown atomic.Bool
+
+// /livez: "is this process able to make progress?" Never checks the DB.
+// It fails only until startup is done, so the startup probe can share it.
+func livez(w http.ResponseWriter, r *http.Request) {
+	if !started.Load() {
+		http.Error(w, "starting", http.StatusServiceUnavailable)
+		return
+	}
+	w.Write([]byte("ok&#92;n"))
+}
+
+// /readyz: "should this pod get NEW requests right now?"
+func readyz(w http.ResponseWriter, r *http.Request) {
+	if !started.Load() || shuttingDown.Load() {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+	w.Write([]byte("ok&#92;n"))
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /livez", livez)
+	mux.HandleFunc("GET /readyz", readyz)
+	mux.HandleFunc("GET /orders", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond) // pretend work
+		w.Write([]byte("[]&#92;n"))
+	})
+	srv := &amp;http.Server{Addr: ":8080", Handler: mux}
+
+	// Listen first, so probes get a clear "503 starting" instead of
+	// "connection refused" while we warm up.
+	go func() {
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server failed", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	slog.Info("warming up: loading caches, running migrations check")
+	time.Sleep(2 * time.Second) // stand-in for slow startup work
+	started.Store(true)
+	slog.Info("started")
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	&lt;-ctx.Done()
+
+	// 1. Fail readiness, but KEEP SERVING: proxies may still send us requests
+	//    for a few seconds while the endpoint removal spreads.
+	shuttingDown.Store(true)
+	slog.Info("SIGTERM: readiness now failing, draining", "delay", drainDelay)
+	time.Sleep(drainDelay)
+
+	// 2. Stop accepting new connections and wait for in-flight requests.
+	sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(sctx); err != nil {
+		slog.Error("forced shutdown", "err", err)
+	}
+	slog.Info("shutdown complete")
+}</code></pre>
+
+<p>The matching probe config (with resource limits, so a memory leak is an OOM kill rather than a node problem):</p>
+<pre><code>      terminationGracePeriodSeconds: 30  # &gt; 5 s drain + 20 s shutdown timeout
+      containers:
+      - name: orders
+        image: registry.example.com/orders:1.8.0
+        ports:
+        - containerPort: 8080
+        resources:
+          requests: {cpu: 250m, memory: 256Mi}
+          limits: {cpu: "1", memory: 256Mi}
+        startupProbe:            # allows up to 24 × 5 s = 120 s to start
+          httpGet: {path: /livez, port: 8080}
+          periodSeconds: 5
+          failureThreshold: 24
+        livenessProbe:           # restart after ~30 s stuck (3 × 10 s)
+          httpGet: {path: /livez, port: 8080}
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+        readinessProbe:          # out of rotation after ~10 s (2 × 5 s)
+          httpGet: {path: /readyz, port: 8080}
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 2</code></pre>
+
+<p>A real run: probes during warm-up, after startup, and right after SIGTERM. Readiness fails at once, but liveness and normal requests still succeed while the pod drains:</p>
+<pre><code>$ curl -s -w " %{http_code}" localhost:8080/livez
+starting  503
+$ curl -s -w " %{http_code}" localhost:8080/readyz
+not ready  503
+
+# 2 s later
+$ curl -s -w " %{http_code}" localhost:8080/livez
+ok  200
+$ curl -s -w " %{http_code}" localhost:8080/readyz
+ok  200
+
+$ kill -TERM $PID
+$ curl -s -w " %{http_code}" localhost:8080/readyz
+not ready  503
+$ curl -s -w " %{http_code}" localhost:8080/livez
+ok  200
+$ curl -s -w " %{http_code}" localhost:8080/orders
+[]  200
+
+# app logs (stderr)
+2026/11/08 19:31:08 INFO warming up: loading caches, running migrations check
+2026/11/08 19:31:10 INFO started
+2026/11/08 19:31:11 INFO SIGTERM: readiness now failing, draining delay=5s
+2026/11/08 19:31:16 INFO shutdown complete</code></pre>
+
+<p><strong>Real-world scenario.</strong> A team put a database ping in their liveness probe "to be safe": 20 pods, default timings. At 14:05 the Postgres primary fails over, which takes about 45 seconds. After 3 failed probes (30 s), the kubelet restarts all 20 pods at roughly the same moment. The database comes back at 14:05:45 to a herd of 20 cold pods opening connection pools at once, while their caches are empty. Customer-facing errors last around five minutes instead of 45 seconds, and the dashboard shows 20 restarts that look like a code crash. With liveness on <code>/livez</code>, the pods would have stayed up, returned errors (or served from cache) for 45 seconds, and recovered the moment the database did.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Dependencies in liveness.</strong> Restarting your pod never fixes someone else's database. It adds cold starts and connection storms to an outage. Keep liveness about your own process.</li>
+  <li><strong>Liveness that fails under load.</strong> With the default <code>timeoutSeconds: 1</code>, a CPU-throttled pod or a long GC pause can miss probes. The kubelet restarts the busiest pods, the rest get even more load, and they fail too. Give liveness a generous timeout and a higher <code>failureThreshold</code> than readiness, so a pod is taken out of rotation long before it's killed.</li>
+  <li><strong>No startup probe for a slow app.</strong> A big <code>initialDelaySeconds</code> slows every restart. Too small and the pod enters <code>CrashLoopBackOff</code>, killed before it finishes booting. A startup probe solves both.</li>
+  <li><strong>The same check in readiness on every pod.</strong> A readiness check on a shared database marks <em>all</em> pods unready together. The Service then has zero endpoints, and callers get errors instead of a useful error message. See <a href="#health-checks">Health Checks</a>.</li>
+  <li><strong>Exiting on SIGTERM immediately.</strong> This causes 502s on every rollout. Fail readiness, wait, then <code>Shutdown</code>.</li>
+  <li><strong>Grace period too short.</strong> Drain delay + longest request + shutdown must fit in <code>terminationGracePeriodSeconds</code>. Anything left is killed with SIGKILL mid-request.</li>
+  <li><strong>Probing through middleware.</strong> Auth, rate limiting or redirects on the probe path cause surprises: a redirect to a login page still ends in success, because the kubelet either follows it (same host, and the login page answers <code>200</code>) or treats an off-host redirect as a pass. Register probe handlers before the middleware, or on a separate port.</li>
+</ul>
+
+<div class="callout warn"><strong>If in doubt, leave liveness out.</strong> A missing liveness probe means a rare deadlock goes unnoticed until your alerts fire. A bad liveness probe can restart your whole fleet during someone else's outage. The Kubernetes docs themselves warn that a wrong liveness probe can cause cascading failures.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Startup = "booted yet?", liveness = "restart me", readiness = "don't send me traffic". Different failures, different actions.</li>
+  <li>Liveness checks only the process itself, never dependencies; readiness gates traffic and drains shutdowns.</li>
+  <li>Defaults react in about 30 s (3 × 10 s, 1 s timeout). Use startup probes for slow boots instead of long initial delays.</li>
+  <li>Graceful shutdown: readiness 503, pause a few seconds, <code>srv.Shutdown</code>, all inside the grace period.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#health-checks">Health Checks</a> · <a href="#kubernetes">Kubernetes</a> · <a href="#rolling-deployments">Rolling Deployments</a> · <a href="#service-discovery">Service Discovery</a> · <a href="#cold-starts">Cold Starts</a> · <a href="#monitoring">Monitoring</a></p>
+`;
+
