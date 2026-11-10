@@ -766,3 +766,255 @@ up{job="checkout"} == 0</code></pre>
 <p><strong>Related:</strong> <a href="#metrics">Metrics</a> · <a href="#alerts">Alerts</a> · <a href="#observability">Observability</a> · <a href="#slis">SLIs</a> · <a href="#health-checks">Health Checks</a> · <a href="#p99-latency">p99 Latency</a></p>
 `;
 
+CONTENT["logging"] = `
+<p class="tldr"><strong>TL;DR</strong>: A log is a timestamped record of one thing that happened, written by your code. Make each line <strong>structured</strong> (JSON key/value pairs, not prose), give it a <strong>level</strong>, stamp it with a <strong>request ID</strong> so every line of one request can be pulled together, and never put secrets or personal data in it. Logs are the flight recorder: metrics tell you <em>that</em> checkout is failing, logs tell you <em>which order failed and why</em>.</p>
+
+<h2>The problem it solves</h2>
+<p>In production you can't attach a debugger; you only have what the code wrote down at the time. Bad logging fails in predictable ways:</p>
+<ul>
+  <li><strong>Unsearchable text.</strong> <code>"user 42 failed to pay 19.99"</code> can only be grepped, not filtered by user, amount or provider.</li>
+  <li><strong>No correlation.</strong> At 2,000 requests per second, lines from different requests interleave, and you can't follow one request into the next service.</li>
+  <li><strong>Noise or silence.</strong> Debug spam buries the one useful line and costs a fortune; or the error path logs nothing useful.</li>
+  <li><strong>Leaks.</strong> A logged password or card number is copied into every system the logs flow through.</li>
+</ul>
+
+<h2>How it works</h2>
+<p>In a modern setup the application does one thing: write <strong>one JSON object per line to stdout</strong>. Everything else, shipping, enriching, storing and searching, is the platform's job:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 222" role="img" aria-label="Log pipeline: the service writes JSON lines to stdout; the container runtime writes them to files on the node; a node agent such as Fluent Bit, Vector or the OpenTelemetry Collector tails, parses, enriches and filters them; they are stored in Loki, Elasticsearch or CloudWatch; and queried in Grafana or Kibana.">
+  <defs><marker id="arr-log-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="235" y="22" text-anchor="middle" class="small">inside the pod / VM</text>
+  <path class="line dashed" d="M10 30 H460" style="stroke: var(--line)"/>
+  <text x="625" y="22" text-anchor="middle" class="small">central, shared</text>
+  <path class="line dashed" d="M475 30 H770" style="stroke: var(--line)"/>
+
+  <rect class="box accent" x="10" y="44" width="140" height="80" rx="8"/>
+  <text x="80" y="70" text-anchor="middle" class="title">your service</text>
+  <text x="80" y="90" text-anchor="middle" class="small">slog JSON → stdout</text>
+  <text x="80" y="106" text-anchor="middle" class="small">one event per line</text>
+
+  <rect class="box" x="165" y="44" width="140" height="80" rx="8"/>
+  <text x="235" y="70" text-anchor="middle" class="title">runtime</text>
+  <text x="235" y="90" text-anchor="middle" class="small">writes to node disk</text>
+  <text x="235" y="106" text-anchor="middle" class="small">/var/log/containers</text>
+
+  <rect class="box" x="320" y="44" width="140" height="80" rx="8"/>
+  <text x="390" y="70" text-anchor="middle" class="title">node agent</text>
+  <text x="390" y="90" text-anchor="middle" class="small">Fluent Bit, Vector,</text>
+  <text x="390" y="106" text-anchor="middle" class="small">OTel Collector</text>
+
+  <rect class="box" x="475" y="44" width="140" height="80" rx="8"/>
+  <text x="545" y="70" text-anchor="middle" class="title">log store</text>
+  <text x="545" y="90" text-anchor="middle" class="small">Loki, Elasticsearch,</text>
+  <text x="545" y="106" text-anchor="middle" class="small">CloudWatch Logs</text>
+
+  <rect class="box ok" x="630" y="44" width="140" height="80" rx="8"/>
+  <text x="700" y="70" text-anchor="middle" class="title">query</text>
+  <text x="700" y="90" text-anchor="middle" class="small">Grafana, Kibana</text>
+  <text x="700" y="106" text-anchor="middle" class="small">by request_id, level</text>
+
+  <path class="line" d="M150 84 H163" marker-end="url(#arr-log-1)"/>
+  <path class="line" d="M305 84 H318" marker-end="url(#arr-log-1)"/>
+  <path class="line" d="M460 84 H473" marker-end="url(#arr-log-1)"/>
+  <path class="line" d="M615 84 H628" marker-end="url(#arr-log-1)"/>
+
+  <path class="line dashed" d="M390 124 V146"/>
+  <rect class="box muted" x="190" y="146" width="400" height="58" rx="6"/>
+  <text x="390" y="166" text-anchor="middle" class="small">tail files · parse JSON · add pod, namespace, node labels</text>
+  <text x="390" y="182" text-anchor="middle" class="small">drop or sample noisy lines · redact · buffer and retry</text>
+  <text x="390" y="198" text-anchor="middle" class="small">so an outage of the store never blocks your app</text>
+</svg>
+<figcaption>The app stays dumb: it writes to stdout and never knows where logs end up. Writing directly to a remote store from request handlers makes your latency depend on the log backend.</figcaption>
+</figure>
+
+<p>A useful line has a <strong>fixed message</strong> (<code>"charge failed"</code>) you can count and group, <strong>fields</strong> for the variables (<code>user_id</code>, <code>provider</code>, <code>err</code>), a <strong>level</strong>, <strong>context</strong> attached once per request (service, version, request ID, trace ID), and a <strong>UTC</strong> ISO 8601 timestamp so lines from many machines sort correctly.</p>
+
+<table>
+  <tr><th>Level</th><th>slog value</th><th>Use it for</th><th>Example</th></tr>
+  <tr><td>DEBUG</td><td><code>-4</code></td><td>developer detail; off in production by default</td><td><code>"cache miss", "key", k</code></td></tr>
+  <tr><td>INFO</td><td><code>0</code></td><td>normal, notable events: one per request, state changes</td><td><code>"order created"</code></td></tr>
+  <tr><td>WARN</td><td><code>4</code></td><td>something odd that was handled; worth a look if it repeats</td><td><code>"retrying", "attempt", 2</code></td></tr>
+  <tr><td>ERROR</td><td><code>8</code></td><td>an operation failed and someone may need to act</td><td><code>"charge failed", "err", err</code></td></tr>
+</table>
+<p>Go's <code>log/slog</code> has no FATAL level. Log at ERROR and return; let <code>main</code> decide to exit.</p>
+
+<h3>Correlation: one ID, every service</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 270" role="img" aria-label="A request ID created at the gateway is passed in the X-Request-ID header to checkout and then payments. Each service writes log lines containing request_id 7f3a. A single query for that request_id returns all lines from all three services in time order.">
+  <defs><marker id="arr-log-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="30" y="20" width="160" height="44" rx="8"/><text x="110" y="47" text-anchor="middle" class="title">gateway</text>
+  <rect class="box" x="310" y="20" width="160" height="44" rx="8"/><text x="390" y="47" text-anchor="middle" class="title">checkout</text>
+  <rect class="box" x="590" y="20" width="160" height="44" rx="8"/><text x="670" y="47" text-anchor="middle" class="title">payments</text>
+  <path class="line accent" d="M190 42 H308" marker-end="url(#arr-log-2)"/>
+  <text x="249" y="34" text-anchor="middle" class="small">X-Request-ID: 7f3a</text>
+  <path class="line accent" d="M470 42 H588" marker-end="url(#arr-log-2)"/>
+  <text x="529" y="34" text-anchor="middle" class="small">X-Request-ID: 7f3a</text>
+
+  <rect class="box muted" x="20" y="96" width="180" height="40" rx="4"/>
+  <text x="110" y="113" text-anchor="middle" class="small">request_id=7f3a</text>
+  <text x="110" y="128" text-anchor="middle" class="small">"route matched"</text>
+  <rect class="box muted" x="300" y="96" width="180" height="40" rx="4"/>
+  <text x="390" y="113" text-anchor="middle" class="small">request_id=7f3a</text>
+  <text x="390" y="128" text-anchor="middle" class="small">"charge failed" 502</text>
+  <rect class="box bad" x="580" y="96" width="180" height="40" rx="4"/>
+  <text x="670" y="113" text-anchor="middle" class="small">request_id=7f3a</text>
+  <text x="670" y="128" text-anchor="middle" class="small">"acme-pay timeout 2s"</text>
+  <path class="line dashed" d="M110 64 V94"/>
+  <path class="line dashed" d="M390 64 V94"/>
+  <path class="line dashed" d="M670 64 V94"/>
+
+  <path class="line" d="M110 136 L330 182" marker-end="url(#arr-log-2)"/>
+  <path class="line" d="M390 136 V180" marker-end="url(#arr-log-2)"/>
+  <path class="line" d="M670 136 L450 182" marker-end="url(#arr-log-2)"/>
+  <rect class="box ok" x="190" y="184" width="400" height="66" rx="8"/>
+  <text x="390" y="206" text-anchor="middle" class="title">one query, whole story</text>
+  <text x="390" y="224" text-anchor="middle" class="small">{namespace="shop"} | json | request_id="7f3a9c0e5b21d4f8"</text>
+  <text x="390" y="240" text-anchor="middle" class="small">3 services, 6 lines, in time order</text>
+</svg>
+<figcaption>Generate the ID at the edge (or accept a trusted one), pass it on every outgoing call, and put it on every log line and in error responses. With OpenTelemetry the trace ID plays the same role and also links logs to traces.</figcaption>
+</figure>
+
+<h3>What never goes in a log</h3>
+<table>
+  <tr><th>Never log</th><th>Why</th><th>Log instead</th></tr>
+  <tr><td>passwords, API keys, tokens, session cookies, <code>Authorization</code> headers</td><td>anyone with log access can impersonate the user or service</td><td>nothing, or a key ID / last 4 characters</td></tr>
+  <tr><td>full card numbers, bank details</td><td>payment card rules (PCI DSS) forbid storing them in logs</td><td>a payment token or the last 4 digits</td></tr>
+  <tr><td>personal data: email, phone, address, ID numbers, health data</td><td>privacy laws in many countries; logs are copied widely and kept long</td><td>an internal user ID</td></tr>
+  <tr><td>full request and response bodies</td><td>contain all of the above, and are huge</td><td>size, content type, a few chosen fields</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>Structured logging in Go with <code>log/slog</code></strong>: a JSON handler, redaction, a runtime-adjustable level, and middleware that gives every request its own logger carrying a request ID.</p>
+<pre><code>// Secret values redact themselves, whatever handler or key they end up under.
+type Secret string
+
+func (Secret) LogValue() slog.Value { return slog.StringValue("[REDACTED]") }
+
+// Change at runtime (e.g. from an admin endpoint) without a restart.
+var level = new(slog.LevelVar) // zero value = INFO
+
+func NewLogger() *slog.Logger {
+	h := slog.NewJSONHandler(os.Stdout, &amp;slog.HandlerOptions{
+		Level: level,
+		// Belt and braces: mask well-known sensitive keys at any depth.
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey &amp;&amp; len(groups) == 0 {
+				a.Value = slog.TimeValue(a.Value.Time().UTC()) // logs in UTC, always
+			}
+			switch a.Key {
+			case "password", "authorization", "token":
+				return slog.String(a.Key, "[REDACTED]")
+			}
+			return a
+		},
+	})
+	return slog.New(h).With("service", "checkout", "version", "1.4.2")
+}
+
+type ctxKey struct{}
+
+// L returns the request-scoped logger, or the default one outside a request.
+func L(ctx context.Context) *slog.Logger {
+	if l, ok := ctx.Value(ctxKey{}).(*slog.Logger); ok {
+		return l
+	}
+	return slog.Default()
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// Logging middleware: one request ID per request, reused by every log line,
+// echoed back to the client. Copy it onto outgoing calls as well.
+func WithRequestLog(base *slog.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-ID")
+		if id == "" {
+			b := make([]byte, 8)
+			rand.Read(b)
+			id = hex.EncodeToString(b)
+		}
+		w.Header().Set("X-Request-ID", id)
+		l := base.With("request_id", id)
+		ctx := context.WithValue(r.Context(), ctxKey{}, l)
+
+		sw := &amp;statusWriter{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(sw, r.WithContext(ctx))
+
+		lvl := slog.LevelInfo
+		if sw.status &gt;= 500 {
+			lvl = slog.LevelError
+		}
+		l.LogAttrs(ctx, lvl, "http request",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", sw.status),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+		)
+	})
+}
+
+func createOrder(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	card := Secret(r.FormValue("card")) // never log the raw value
+	L(ctx).Debug("validating cart", "items", 3) // dropped at INFO
+	if r.FormValue("user") == "u_42" {
+		L(ctx).Error("charge failed", "user_id", "u_42", "card", card,
+			"provider", "acme-pay", "err", "upstream timeout after 2s")
+		http.Error(w, "payment failed", http.StatusBadGateway)
+		return
+	}
+	L(ctx).Info("order created", "user_id", r.FormValue("user"), "order_id", "o_981", "card", card)
+	w.WriteHeader(http.StatusCreated)
+}
+
+func main() {
+	logger := NewLogger()
+	slog.SetDefault(logger)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /orders", createOrder)
+	http.ListenAndServe(":8080", WithRequestLog(logger, mux))
+}</code></pre>
+
+<p>Two requests (the second arrives with an ID from an upstream service) and a login attempt produce this real output. Note the missing DEBUG line, the redacted card and password, and the shared <code>request_id</code> per request:</p>
+<pre><code>{"time":"2026-11-08T12:26:36.467084Z","level":"INFO","msg":"order created","service":"checkout","version":"1.4.2","request_id":"e16642bcd1eb8c63","user_id":"u_7","order_id":"o_981","card":"[REDACTED]"}
+{"time":"2026-11-08T12:26:36.467429Z","level":"INFO","msg":"http request","service":"checkout","version":"1.4.2","request_id":"e16642bcd1eb8c63","method":"POST","path":"/orders","status":201,"duration_ms":0}
+{"time":"2026-11-08T12:26:36.467475Z","level":"ERROR","msg":"charge failed","service":"checkout","version":"1.4.2","request_id":"7f3a9c0e5b21d4f8","user_id":"u_42","card":"[REDACTED]","provider":"acme-pay","err":"upstream timeout after 2s"}
+{"time":"2026-11-08T12:26:36.467487Z","level":"ERROR","msg":"http request","service":"checkout","version":"1.4.2","request_id":"7f3a9c0e5b21d4f8","method":"POST","path":"/orders","status":502,"duration_ms":0}
+{"time":"2026-11-08T12:26:36.467492Z","level":"INFO","msg":"login attempt","service":"checkout","version":"1.4.2","user_id":"u_7","password":"[REDACTED]"}</code></pre>
+<p><code>slog.SetDefault</code> also routes the old <code>log.Printf</code> calls through the same JSON handler, so legacy code doesn't break the format.</p>
+
+<p><strong>Real-world scenario.</strong> It's 14:05. Support forwards a customer complaint: "payment failed, reference 7f3a9c0e5b21d4f8". The error page showed the request ID, so on-call runs one query, <code>{namespace="shop"} | json | request_id="7f3a9c0e5b21d4f8"</code>, and in seconds sees the gateway, checkout and payments lines for that request: payments timed out calling acme-pay after 2 s. A second query, <code>{app="payments"} | json | level="ERROR" | provider="acme-pay"</code>, shows 300 similar errors since 13:58. That is a provider incident, not a bug. Without structure and IDs, the same investigation means grepping a time window across millions of interleaved lines.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Cost grows with traffic.</strong> 2,000 requests/s × 5 lines × 500 bytes is 5 MB/s, about 432 GB per day before indexing and replication. Log one summary line per request, keep DEBUG off, and set retention per level (errors longer, access logs shorter).</li>
+  <li><strong>Sampling, carefully.</strong> <code>slog</code> has no built-in sampler; wrap a handler or let the agent drop lines. Keep 100% of WARN and ERROR, and sample successful access logs (say 1 in 100). Never sample away the evidence you'll need: errors and slow requests.</li>
+  <li><strong>Variables in the message.</strong> <code>fmt.Sprintf("payment %s failed", id)</code> makes every message unique, so you can't group or count them. Fixed message, variables in fields.</li>
+  <li><strong>Log-and-return.</strong> Logging an error and also returning it means every layer logs it again: one failure, five lines. Either handle (and log) it, or wrap and return it; log once at the boundary.</li>
+  <li><strong>Logs as metrics.</strong> Counting errors per minute with log queries is slow and expensive. Use a counter (see <a href="#metrics">Metrics</a>) for rates and alerts, and logs for the details.</li>
+  <li><strong>Trusting the client's request ID.</strong> Accept <code>X-Request-ID</code> only from your own gateway, and cap its length; otherwise anyone can inject arbitrary text into your logs.</li>
+</ul>
+
+<div class="callout warn"><strong>Redaction is a safety net, not a plan.</strong> Key-based scrubbing only catches the keys you thought of. A token pasted into an error string, or a whole struct logged with <code>"%+v"</code>, slips through. Decide what is logged at the call site, and give sensitive types a <code>LogValue</code> method so they redact themselves.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>One JSON object per line to stdout; the platform ships, stores and indexes it.</li>
+  <li>Fixed messages, variables in fields, a consistent level vocabulary, UTC timestamps.</li>
+  <li>A request ID (or trace ID) on every line and every outgoing call turns scattered lines into one story.</li>
+  <li>No secrets or personal data; budget volume and sample successes, never errors.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#metrics">Metrics</a> · <a href="#distributed-tracing">Distributed Tracing</a> · <a href="#observability">Observability</a> · <a href="#monitoring">Monitoring</a> · <a href="#secrets-management">Secrets Management</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
+`;
+
