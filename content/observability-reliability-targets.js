@@ -2203,3 +2203,247 @@ avg_over_time((time() - pipeline_last_success_timestamp_seconds &lt; bool 3600)[
 <p><strong>Related:</strong> <a href="#slos">SLOs</a> · <a href="#error-budgets">Error Budgets</a> · <a href="#metrics">Metrics</a> · <a href="#alerts">Alerts</a> · <a href="#p99-latency">p99 Latency</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
 `;
 
+CONTENT["slos"] = `
+<p class="tldr"><strong>TL;DR</strong>: A Service Level Objective (SLO) is a target for an SLI over a time window, for example "99.9% of checkout requests succeed in under 300 ms, measured over a rolling 30 days". It turns "be reliable" into a number the team can check, plan against and argue about. Think of it as the speed limit for unreliability: you don't have to drive at zero, you have to stay under the line.</p>
+
+<h2>The problem it solves</h2>
+<p>Without an explicit target, reliability is a feeling. Product wants features, operations wants stability, and nobody can say whether last week's 12 minutes of errors was fine or a disaster. Common symptoms:</p>
+<ul>
+  <li><strong>Everything is urgent.</strong> Every blip pages someone, because there's no line between "normal noise" and "users are hurting".</li>
+  <li><strong>100% as the implicit goal.</strong> It's impossible, and chasing it freezes releases. Users can't tell 99.999% from 100% anyway: their own Wi-Fi, phone and ISP fail more often than that.</li>
+  <li><strong>No shared language.</strong> "Is the API reliable enough to build on?" has no answer until someone writes the number down.</li>
+</ul>
+<p>The Google SRE book defines an SLO as "a target value or range of values for a service level that is measured by an SLI". The SLI (see <a href="#slis">SLIs</a>) is the measurement; the SLO is the line you hold it to.</p>
+
+<h2>How it works</h2>
+<p>An SLO has three parts. Leave one out and it can't be checked:</p>
+<ol>
+  <li><strong>An SLI</strong>: what you count, usually <em>good events / valid events</em>.</li>
+  <li><strong>A target</strong>: the fraction that must be good, such as 99.9%.</li>
+  <li><strong>A window</strong>: the period you measure over, such as a rolling 30 days.</li>
+</ol>
+<figure class="diagram">
+<svg viewBox="0 0 780 206" role="img" aria-label="Anatomy of an SLO: an SLI of good over valid requests, a target of at least 99.9 percent and a rolling 30-day window combine into a met or missed result. The result is used by the error budget, burn-rate alerts, release decisions and reliability reviews.">
+  <defs><marker id="arr-slo-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="295" y="20" text-anchor="middle" class="small">"99.9% of checkout requests succeed in under 300 ms, over a rolling 30 days"</text>
+  <path class="line" d="M10 40 V32 H580 V40"/>
+  <rect class="box" x="10" y="50" width="170" height="80" rx="10"/>
+  <text x="95" y="74" text-anchor="middle" class="title">SLI</text>
+  <text x="95" y="94" text-anchor="middle" class="small">good ÷ valid requests</text>
+  <text x="95" y="110" text-anchor="middle" class="small">good = non-5xx, &lt; 300 ms</text>
+  <rect class="box accent" x="210" y="50" width="170" height="80" rx="10"/>
+  <text x="295" y="74" text-anchor="middle" class="title">Target</text>
+  <text x="295" y="94" text-anchor="middle" class="small">≥ 99.9% good</text>
+  <text x="295" y="110" text-anchor="middle" class="small">(0.1% may be bad)</text>
+  <rect class="box accent" x="410" y="50" width="170" height="80" rx="10"/>
+  <text x="495" y="74" text-anchor="middle" class="title">Window</text>
+  <text x="495" y="94" text-anchor="middle" class="small">rolling 30 days</text>
+  <text x="495" y="110" text-anchor="middle" class="small">or a calendar month</text>
+  <rect class="box ok" x="610" y="50" width="160" height="80" rx="10"/>
+  <text x="690" y="74" text-anchor="middle" class="title">Met / missed</text>
+  <text x="690" y="94" text-anchor="middle" class="small">99.94% ≥ 99.9% ✓</text>
+  <text x="690" y="110" text-anchor="middle" class="small">checked continuously</text>
+  <path class="line" d="M180 90 H208" marker-end="url(#arr-slo-1)"/>
+  <path class="line" d="M380 90 H408" marker-end="url(#arr-slo-1)"/>
+  <path class="line" d="M580 90 H608" marker-end="url(#arr-slo-1)"/>
+  <path class="line" d="M690 130 V156" marker-end="url(#arr-slo-1)"/>
+  <rect class="box muted" x="10" y="158" width="760" height="40" rx="8"/>
+  <text x="390" y="183" text-anchor="middle" class="small">used by: error budget (1 − target) · burn-rate alerts · release decisions · reliability reviews</text>
+</svg>
+<figcaption>The SLI is a measurement, the SLO is a promise about it. "99.9%" alone is not an SLO: 99.9% of what, measured where, over how long?</figcaption>
+</figure>
+
+<h3>The nines: what a target allows</h3>
+<p>Every target implies how much "bad" you may have. For a time-based SLI ("minutes the service was up"), that's downtime. For a request-based SLI it's the same fraction of requests. These numbers come from the Go program below, plus simple multiplication for the day and year columns.</p>
+<table>
+  <tr><th>Target</th><th>Bad allowed per day</th><th>Per 30 days</th><th>Per year (365 d)</th><th>What it usually takes</th></tr>
+  <tr><td>99%</td><td>14 min 24 s</td><td>7 h 12 min</td><td>3.65 days</td><td>business hours fixes, manual deploys can be fine</td></tr>
+  <tr><td>99.5%</td><td>7 min 12 s</td><td>3 h 36 min</td><td>43.8 h</td><td>someone reachable out of hours</td></tr>
+  <tr><td>99.9%</td><td>1 min 26 s</td><td>43 min 12 s</td><td>8.76 h</td><td>on-call, alerts on symptoms, quick rollback</td></tr>
+  <tr><td>99.95%</td><td>43 s</td><td>21 min 36 s</td><td>4.38 h</td><td>automated rollback, redundancy in every layer</td></tr>
+  <tr><td>99.99%</td><td>8.6 s</td><td>4 min 19 s</td><td>52.6 min</td><td>failover without humans; a human can barely log in that fast</td></tr>
+  <tr><td>99.999%</td><td>0.86 s</td><td>26 s</td><td>5.3 min</td><td>multi-region, automated everything, very few changes</td></tr>
+</table>
+<p>Each extra nine cuts the allowance by 10× and usually costs far more than 10× the effort. Also note the ceiling from dependencies: a request that needs three services in series, each at 99.9%, succeeds at best 0.999³ ≈ 99.7% of the time if they fail independently. You can't promise more than your critical path delivers.</p>
+
+<h3>Rolling vs calendar windows</h3>
+<p>A <strong>calendar</strong> window (this month, this quarter) resets on a fixed date. A <strong>rolling</strong> window (the last 30 days) slides forward every day, so a bad day counts for exactly 30 days and then drops out. The chart uses the real output from the Go example: 1M requests a day, and an outage on day 30 that fails 40,000 of them.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 304" role="img" aria-label="Two charts of the same 60 days. Rolling 30-day window: after the outage on day 30, compliance drops below the 99.9 percent target and stays there until day 60. Calendar window: compliance drops on day 30 but resets to 100 percent on day 31 when month 2 starts.">
+  <text x="70" y="22" class="title">Rolling 30 days</text>
+  <text x="411" y="22" class="small">month 2 starts →</text>
+  <path class="line dashed" d="M405 30 V276"/>
+  <text x="64" y="54" text-anchor="end" class="small">100%</text>
+  <text x="64" y="94" text-anchor="end" class="small">99.9%</text>
+  <path class="line bad dashed" d="M70 90 H740"/>
+  <path class="line" d="M70 136 H740"/>
+  <path class="line accent" d="M70 50 H388 L399 103 H729 L740 50"/>
+  <text x="570" y="74" text-anchor="middle" class="small">the day-30 outage still counts on day 59</text>
+  <text x="300" y="118" text-anchor="middle" class="small">day 30: 99.867% (missed)</text>
+  <text x="64" y="140" text-anchor="end" class="small">99.8%</text>
+
+  <text x="70" y="162" class="title">Calendar month</text>
+  <text x="64" y="194" text-anchor="end" class="small">100%</text>
+  <text x="64" y="234" text-anchor="end" class="small">99.9%</text>
+  <path class="line bad dashed" d="M70 230 H740"/>
+  <path class="line" d="M70 276 H740"/>
+  <path class="line accent" d="M70 190 H388 L399 243 L411 190 H740"/>
+  <text x="575" y="212" text-anchor="middle" class="small">day 31: a fresh month, 100% again</text>
+  <text x="300" y="258" text-anchor="middle" class="small">day 30: 99.867% (missed)</text>
+  <text x="64" y="280" text-anchor="end" class="small">99.8%</text>
+  <text x="70" y="294" class="small">day 1</text>
+  <text x="399" y="294" text-anchor="middle" class="small">day 30</text>
+  <text x="740" y="294" text-anchor="end" class="small">day 60</text>
+</svg>
+<figcaption>Same data, two verdicts. A rolling window always reflects what users felt in the last 30 days, whatever the date. A calendar window lines up with billing and SLAs, but a bad day just before the reset is forgotten a day later.</figcaption>
+</figure>
+
+<h3>Choosing a target</h3>
+<ul>
+  <li><strong>Start from users, not from your graphs.</strong> The SRE book's advice is "don't pick a target based on current performance": if today's system happens to do 99.99%, adopting that can lock you into heroics to keep it.</li>
+  <li><strong>Different journeys, different targets.</strong> Checkout at 99.9%, the recommendations widget at 99%, the nightly report "finished by 06:00 on 99% of days". Batch and pipeline SLOs often target freshness or completion time, not availability.</li>
+  <li><strong>Few SLOs.</strong> Two or three per service (availability, latency, maybe freshness) beat twenty nobody reads.</li>
+  <li><strong>Start loose, then tighten.</strong> "Perfection can wait": you can raise a target once you know what it costs. Lowering one later feels like failure.</li>
+</ul>
+
+<h3>SLA, external SLO, internal SLO</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 220" role="img" aria-label="Nested targets: the SLA at 99.5 percent, with service credits on breach, contains the external SLO at 99.9 percent published to customers, which contains the internal SLO at 99.95 percent that the team plans and alerts on.">
+  <rect class="box bad" x="20" y="14" width="740" height="196" rx="12"/>
+  <text x="36" y="36" class="title">SLA: 99.5% per month, breach → service credits (a contract, owned with legal and sales)</text>
+  <rect class="box accent" x="60" y="50" width="660" height="150" rx="10"/>
+  <text x="76" y="72" class="title">External SLO: 99.9% (published to customers, e.g. on a status page)</text>
+  <rect class="box ok" x="100" y="86" width="580" height="104" rx="10"/>
+  <text x="116" y="108" class="title">Internal SLO: 99.95% (what the team alerts and plans on)</text>
+  <text x="116" y="134" class="small">missed first, so the team reacts while customers are still inside the promise</text>
+  <text x="116" y="154" class="small">measured over the last 30 days: 99.97% ✓</text>
+  <text x="116" y="174" class="small">each ring is looser than the one inside it: that gap is the safety margin</text>
+</svg>
+<figcaption>The SRE book recommends "using a tighter internal SLO than the SLO advertised to users". The SLA is the loosest of all, because breaking it costs money.</figcaption>
+</figure>
+<table>
+  <tr><th></th><th>Internal SLO</th><th>External SLO</th><th>SLA</th></tr>
+  <tr><td>Audience</td><td>the owning team</td><td>customers, other teams</td><td>customers, lawyers</td></tr>
+  <tr><td>Typical tightness</td><td>tightest</td><td>middle</td><td>loosest</td></tr>
+  <tr><td>Missed means</td><td>slow down releases, fix reliability</td><td>trust drops, status page update</td><td>refunds or credits, contract terms</td></tr>
+  <tr><td>Window</td><td>usually rolling</td><td>rolling or calendar</td><td>usually calendar (matches billing)</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>An SLO in Go: allowed bad time, and rolling vs calendar compliance.</strong></p>
+<pre><code>package main
+
+import (
+	"fmt"
+	"time"
+)
+
+// An SLO is a target for an SLI over a window.
+type SLO struct {
+	Name   string
+	Target float64       // 0.999 means 99.9%
+	Window time.Duration // e.g. 30 days
+}
+
+// AllowedBad is the bad time a time-based SLI may have in one window.
+func (s SLO) AllowedBad() time.Duration {
+	return time.Duration((1 - s.Target) * float64(s.Window)).Round(time.Second)
+}
+
+// Day holds one day of a request-based SLI: good and valid events.
+type Day struct{ Good, Valid int64 }
+
+// Ratio is good / valid. No valid traffic means nothing failed.
+func Ratio(days []Day) float64 {
+	var good, valid int64
+	for _, d := range days {
+		good += d.Good
+		valid += d.Valid
+	}
+	if valid == 0 {
+		return 1
+	}
+	return float64(good) / float64(valid)
+}
+
+// Rolling: the n days that end on day i (inclusive).
+func Rolling(days []Day, i, n int) []Day {
+	return days[max(0, i-n+1) : i+1]
+}
+
+// Calendar: from the first day of the month up to day i.
+func Calendar(days []Day, i, monthStart int) []Day {
+	return days[monthStart : i+1]
+}
+
+func main() {
+	month := 30 * 24 * time.Hour
+	for _, t := range []float64{0.99, 0.995, 0.999, 0.9995, 0.9999, 0.99999} {
+		s := SLO{Target: t, Window: month}
+		fmt.Printf("%-8s allows %v per 30 days&#92;n", fmt.Sprintf("%.3f%%", t*100), s.AllowedBad())
+	}
+
+	// 60 days of 1M requests/day. Day 30 (index 29, the last day of month 1) has an
+	// outage that fails 40,000 requests. Month 2 starts at index 30.
+	days := make([]Day, 60)
+	for i := range days {
+		days[i] = Day{Good: 1_000_000, Valid: 1_000_000}
+	}
+	days[29].Good -= 40_000
+
+	slo := SLO{Name: "checkout availability", Target: 0.999, Window: month}
+	fmt.Println()
+	for _, i := range []int{29, 30, 45, 58, 59} {
+		r := Ratio(Rolling(days, i, 30))
+		monthStart := 0
+		if i &gt;= 30 {
+			monthStart = 30
+		}
+		c := Ratio(Calendar(days, i, monthStart))
+		fmt.Printf("day %2d  rolling-30d %.4f%% met=%-5v  calendar %.4f%% met=%v&#92;n",
+			i+1, r*100, r &gt;= slo.Target, c*100, c &gt;= slo.Target)
+	}
+}</code></pre>
+<p>Real output of <code>go run .</code>:</p>
+<pre><code>99.000%  allows 7h12m0s per 30 days
+99.500%  allows 3h36m0s per 30 days
+99.900%  allows 43m12s per 30 days
+99.950%  allows 21m36s per 30 days
+99.990%  allows 4m19s per 30 days
+99.999%  allows 26s per 30 days
+
+day 30  rolling-30d 99.8667% met=false  calendar 99.8667% met=false
+day 31  rolling-30d 99.8667% met=false  calendar 100.0000% met=true
+day 46  rolling-30d 99.8667% met=false  calendar 100.0000% met=true
+day 59  rolling-30d 99.8667% met=false  calendar 100.0000% met=true
+day 60  rolling-30d 100.0000% met=true   calendar 100.0000% met=true</code></pre>
+<p><strong>The same SLO in PromQL</strong>, as a ratio over 30 days. A 30-day range over raw counters is expensive, so in practice you build it from recording rules (the SLI page shows how; see <a href="#slis">SLIs</a>):</p>
+<pre><code># fraction of checkout requests in the last 30 days that were not 5xx
+sum(increase(http_requests_total{job="checkout", code!~"5.."}[30d]))
+/
+sum(increase(http_requests_total{job="checkout"}[30d]))</code></pre>
+
+<p><strong>Real-world scenario: the target copied from a dashboard.</strong> A team launches an internal payments API. Its dashboard shows 99.995% over the last quarter, so they publish a 99.99% SLO: 4 min 19 s of bad per 30 days. It's 14:05 on a Tuesday when the primary database fails over. The failover itself takes 90 seconds, but clients hold dead connections for another 4 minutes until their pools recycle. One routine event has spent more than the whole month's allowance. The SLO is now "missed" for the next 30 days, and the error budget policy says freeze releases. The fix was not heroics: they moved the external SLO to 99.9% (43 min), kept 99.95% internally, and put connection lifetime limits on the pool, which a 99.9% target gave them room to ship.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Aiming for 100%.</strong> It forbids change, because every deploy is a risk. It also hides the real question: how unreliable can we be before users care?</li>
+  <li><strong>Copying current performance.</strong> A lucky quarter becomes an obligation. Set targets from user needs and dependency limits.</li>
+  <li><strong>An SLO without a window or SLI definition.</strong> "99.9% uptime" measured how, from where, over what period? Two people will compute two different numbers.</li>
+  <li><strong>Too many SLOs.</strong> Twenty SLOs per service means none of them drive decisions. Cover what users notice: availability, latency, freshness.</li>
+  <li><strong>Averaging away the pain.</strong> One global SLO hides a region or a big customer having a terrible week. Split by user-visible dimension when it matters, or add a separate SLO for it.</li>
+  <li><strong>The SLA tighter than the SLO.</strong> Then you pay credits before your own alarms think anything is wrong. Keep the order: internal SLO &gt; external SLO &gt; SLA.</li>
+  <li><strong>An SLO nobody acts on.</strong> A target with no consequence is a dashboard decoration. Tie it to an error budget policy (see <a href="#error-budgets">Error Budgets</a>).</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>SLO = SLI + target + window. All three must be written down.</li>
+  <li>Each nine is 10× less room: 99.9% is 43 min 12 s per 30 days, 99.99% is 4 min 19 s.</li>
+  <li>Rolling windows show what users felt recently; calendar windows match contracts and billing.</li>
+  <li>Internal SLO tighter than external SLO, external tighter than SLA.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#slis">SLIs</a> · <a href="#error-budgets">Error Budgets</a> · <a href="#alerts">Alerts</a> · <a href="#monitoring">Monitoring</a> · <a href="#metrics">Metrics</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
+`;
+
