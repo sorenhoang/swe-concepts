@@ -1249,3 +1249,246 @@ sum(rate(http_request_duration_seconds_sum[5m]))
 <p><strong>Related:</strong> <a href="#monitoring">Monitoring</a> · <a href="#logging">Logging</a> · <a href="#slis">SLIs</a> · <a href="#p99-latency">p99 Latency</a> · <a href="#alerts">Alerts</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
 `;
 
+CONTENT["distributed-tracing"] = `
+<p class="tldr"><strong>TL;DR</strong>: Distributed tracing follows one request through every service it touches. Each unit of work is a <strong>span</strong> (name, start, duration, parent); all spans of one request share a <strong>trace ID</strong>, which travels between services in the W3C <code>traceparent</code> header. The result is a waterfall that shows where the time went and where it failed. It's a parcel tracking number for a request.</p>
+
+<h2>The problem it solves</h2>
+<p>A checkout request touches a gateway, the checkout service, a database, an inventory service, a payments service and an external provider. When p99 latency doubles:</p>
+<ul>
+  <li><strong>Metrics</strong> tell you checkout is slow, but not which of its six downstream calls is responsible.</li>
+  <li><strong>Logs</strong> from each service are separate; even with a shared request ID, reconstructing timing and nesting by hand is slow.</li>
+  <li>Every team sees their own service as "fine", because each one only sees its part.</li>
+</ul>
+<p>A trace shows the whole call tree of one real request, with timings, in one picture.</p>
+
+<h2>How it works</h2>
+<p>A <strong>trace</strong> is a tree of <strong>spans</strong>. A span records one operation: an incoming HTTP request, a DB query, an outgoing call. It holds a name, start and end time, a span ID, its parent's span ID, a status (OK / Error / unset) and attributes such as <code>http.response.status_code</code> or <code>order.id</code>. Spans are sent to a backend (Jaeger, Grafana Tempo, Zipkin or a vendor), usually through an <a href="#observability">OpenTelemetry Collector</a>, which reassembles them by trace ID into a waterfall:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 258" role="img" aria-label="Trace waterfall for POST /checkout taking 420 ms. Child spans: SELECT cart 12 ms, GET /stock 35 ms, and a client span POST /charge of 355 ms. Inside it, the payments service server span takes 349 ms, of which 335 ms is waiting for the acme-pay provider.">
+  <text x="20" y="24" class="small">trace 4bf92f35…</text>
+  <path class="line" d="M250 34 H750"/>
+  <text x="250" y="26" text-anchor="middle" class="small">0</text>
+  <text x="369" y="26" text-anchor="middle" class="small">100 ms</text>
+  <text x="488" y="26" text-anchor="middle" class="small">200 ms</text>
+  <text x="607" y="26" text-anchor="middle" class="small">300 ms</text>
+  <text x="726" y="26" text-anchor="middle" class="small">400 ms</text>
+  <text x="20" y="61" class="small">checkout</text>
+  <text x="90" y="61">POST /checkout</text>
+  <rect class="box accent" x="250" y="46" width="500" height="22" rx="3"/>
+  <text x="500" y="61" text-anchor="middle" class="small">420 ms</text>
+  <text x="20" y="95" class="small">checkout</text>
+  <text x="104" y="95">SELECT cart</text>
+  <rect class="box ok" x="256" y="80" width="14" height="22" rx="3"/>
+  <text x="276" y="95" class="small">12 ms</text>
+  <text x="20" y="129" class="small">checkout</text>
+  <text x="104" y="129">GET /stock</text>
+  <rect class="box ok" x="274" y="114" width="42" height="22" rx="3"/>
+  <text x="321" y="129" class="small">35 ms</text>
+  <text x="20" y="163" class="small">checkout</text>
+  <text x="104" y="163">POST /charge</text>
+  <rect class="box" x="321" y="148" width="423" height="22" rx="3"/>
+  <text x="533" y="163" text-anchor="middle" class="small">client span: 355 ms</text>
+  <text x="20" y="197" class="small">payments</text>
+  <text x="118" y="197">POST /charge</text>
+  <rect class="box" x="325" y="182" width="415" height="22" rx="3"/>
+  <text x="533" y="197" text-anchor="middle" class="small">server span: 349 ms</text>
+  <text x="20" y="231" class="small">payments</text>
+  <text x="132" y="231">POST acme-pay</text>
+  <rect class="box bad" x="333" y="216" width="399" height="22" rx="3"/>
+  <text x="533" y="231" text-anchor="middle" class="small">335 ms waiting on the provider</text>
+</svg>
+<figcaption>Read it top-down: indentation is the parent/child tree, bar position is time. The gap between the checkout client span (355 ms) and the payments server span (349 ms) is network time. 335 of the 420 ms are spent waiting for one external provider.</figcaption>
+</figure>
+
+<h3>Context propagation: how the trace crosses a network hop</h3>
+<p>Spans in different processes join the same trace because the caller sends its trace context along with the request. The standard is the W3C Trace Context header <code>traceparent</code>:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Checkout calls payments with a traceparent header made of four dash-separated fields: version 00, a 32-hex-digit trace-id shared by the whole trace, a 16-hex-digit parent-id which is the caller's span ID, and trace-flags 01 meaning sampled. Payments starts a child span with the same trace-id.">
+  <defs><marker id="arr-tr-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="40" y="16" width="180" height="48" rx="8"/>
+  <text x="130" y="38" text-anchor="middle" class="title">checkout</text>
+  <text x="130" y="54" text-anchor="middle" class="small">client span 5682…</text>
+  <rect class="box" x="560" y="16" width="180" height="48" rx="8"/>
+  <text x="650" y="38" text-anchor="middle" class="title">payments</text>
+  <text x="650" y="54" text-anchor="middle" class="small">new child span</text>
+  <path class="line accent" d="M220 40 H558" marker-end="url(#arr-tr-2)"/>
+  <text x="389" y="32" text-anchor="middle" class="small">POST /charge, with header:</text>
+
+  <text x="20" y="114" class="title">traceparent:</text>
+  <rect class="box muted" x="115" y="94" width="40" height="30" rx="4"/>
+  <text x="135" y="114" text-anchor="middle">00</text>
+  <rect class="box accent" x="165" y="94" width="270" height="30" rx="4"/>
+  <text x="300" y="114" text-anchor="middle">4bf92f3577b34da6a3ce929d0e0e4736</text>
+  <rect class="box ok" x="445" y="94" width="150" height="30" rx="4"/>
+  <text x="520" y="114" text-anchor="middle">5682939d16e55a99</text>
+  <rect class="box muted" x="605" y="94" width="40" height="30" rx="4"/>
+  <text x="625" y="114" text-anchor="middle">01</text>
+  <text x="135" y="144" text-anchor="middle" class="small">version</text>
+  <text x="300" y="144" text-anchor="middle" class="small">trace-id: same for the whole trace</text>
+  <text x="520" y="144" text-anchor="middle" class="small">parent-id: caller's span</text>
+  <text x="605" y="162" class="small">trace-flags: 01 = sampled</text>
+  <path class="line dashed" d="M130 64 V88 H515 V92"/>
+
+  <rect class="box muted" x="120" y="184" width="540" height="50" rx="6"/>
+  <text x="390" y="204" text-anchor="middle" class="small">payments extracts the header and starts its span with the same trace-id</text>
+  <text x="390" y="222" text-anchor="middle" class="small">and parent = 5682939d16e55a99, so the backend can nest it under checkout</text>
+</svg>
+<figcaption>A companion header, <code>tracestate</code>, carries vendor-specific data. <code>baggage</code> carries your own key/values (e.g. tenant) to every downstream service. Message queues need the same context copied into message headers.</figcaption>
+</figure>
+
+<h3>Sampling: which traces to keep</h3>
+<p>Recording every span of every request is expensive at scale, so most systems keep a subset. The key question is <em>when</em> you decide.</p>
+<table>
+  <tr><th>Strategy</th><th>Decided</th><th>Keeps all errors and slow requests?</th><th>Cost</th><th>Notes</th></tr>
+  <tr><td>Always on</td><td>n/a</td><td>yes</td><td>highest</td><td>fine for low traffic and staging</td></tr>
+  <tr><td>Head, ratio (<code>TraceIDRatioBased(0.1)</code>)</td><td>at the first service, before anything happens</td><td>no: 90% of failures are dropped too</td><td>low, predictable</td><td>decision is a function of the trace ID, so every service agrees</td></tr>
+  <tr><td>Parent-based (<code>ParentBased(...)</code>)</td><td>follows the caller's sampled flag</td><td>same as the root's choice</td><td>low</td><td>the usual SDK setting, so traces aren't cut in half</td></tr>
+  <tr><td>Tail (Collector <code>tail_sampling</code> processor)</td><td>after the trace finishes, in the Collector</td><td>yes: rules like "status = error" or "latency &gt; 1 s"</td><td>apps send 100% to the Collector; storage is reduced</td><td>all spans of a trace must reach the same Collector instance (route by trace ID)</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>OpenTelemetry in Go</strong>: SDK setup with an OTLP exporter, a server middleware that continues incoming traces, a client call that injects <code>traceparent</code>, error status on spans, and the trace ID on log lines. In real code, <code>otelhttp</code> from opentelemetry-go-contrib wraps handlers and transports for you; it's written out here to show the mechanism.</p>
+<pre><code>package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// Setup: export spans over OTLP to a collector (OTEL_EXPORTER_OTLP_ENDPOINT,
+// default localhost:4317), sample 10% of new traces, follow the caller's
+// decision otherwise, and propagate context with W3C traceparent headers.
+func InitTracing(ctx context.Context, service string) (func(context.Context) error, error) {
+	exp, err := otlptracegrpc.New(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp), // buffer and send in the background
+		sdktrace.WithResource(resource.NewSchemaless(semconv.ServiceName(service))),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(0.1))),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	return tp.Shutdown, nil // call on exit so buffered spans are flushed
+}
+
+var tracer = otel.Tracer("shop/checkout")
+
+// Server side: continue the trace the caller started (if any).
+// otelhttp.NewHandler from opentelemetry-go-contrib does this for you.
+func Traced(name string, next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := tracer.Start(ctx, name, trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+		next(w, r.WithContext(ctx))
+	})
+}
+
+// Client side: start a child span and inject traceparent into the request.
+func callPayments(ctx context.Context, url string) error {
+	ctx, span := tracer.Start(ctx, "POST /charge", trace.WithSpanKind(trace.SpanKindClient))
+	defer span.End()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "payments unreachable")
+		return err
+	}
+	defer resp.Body.Close()
+	span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
+	if resp.StatusCode &gt;= 500 {
+		span.SetStatus(codes.Error, resp.Status)
+		return errors.New(resp.Status)
+	}
+	return nil
+}
+
+func checkout(paymentsURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		span := trace.SpanFromContext(ctx)
+		span.SetAttributes(attribute.String("order.id", "o_981"), attribute.Int("cart.items", 3))
+
+		// Put the trace ID on log lines so logs and traces link both ways.
+		log := slog.With("trace_id", span.SpanContext().TraceID().String())
+
+		_, db := tracer.Start(ctx, "SELECT cart")
+		time.Sleep(5 * time.Millisecond) // stand-in for the query
+		db.End()
+
+		if err := callPayments(ctx, paymentsURL); err != nil {
+			span.SetStatus(codes.Error, "charge failed")
+			log.Error("charge failed", "err", err)
+			http.Error(w, "payment failed", http.StatusBadGateway)
+			return
+		}
+		log.Info("order created")
+	}
+}
+
+func main() {
+	ctx := context.Background()
+	shutdown, err := InitTracing(ctx, "checkout")
+	if err != nil {
+		panic(err)
+	}
+	defer shutdown(ctx)
+	http.ListenAndServe(":8080", Traced("POST /checkout", checkout("http://payments:8080/charge")))
+}</code></pre>
+
+<p>A test wires checkout to a fake payments service that returns 503, sends a request carrying the spec's example <code>traceparent</code>, and collects spans with the SDK's in-memory exporter. Real output: payments receives the trace ID plus checkout's client span as parent, and the spans form the expected tree.</p>
+<pre><code>payments got traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-5682939d16e55a99-01
+2026/11/08 12:31:59 ERROR charge failed trace_id=4bf92f3577b34da6a3ce929d0e0e4736 err="503 Service Unavailable"
+POST /checkout  span=b0d0fd000ba008c7 parent=00f067aa0ba902b7 status=Error
+SELECT cart     span=202b3957043432bf parent=b0d0fd000ba008c7 status=Unset
+POST /charge    span=5682939d16e55a99 parent=b0d0fd000ba008c7 status=Error
+POST /charge    span=6dbd5c0af22fefa5 parent=5682939d16e55a99 status=Unset</code></pre>
+<p>The root span's parent is <code>00f067aa0ba902b7</code>, the span ID from the incoming header: this service continued someone else's trace instead of starting its own. The payments server span is <code>Unset</code> because that handler never set a status; an instrumentation library like <code>otelhttp</code> marks server 5xx responses as errors for you.</p>
+
+<p><strong>Real-world scenario.</strong> It's 14:05 and checkout p99 has gone from 400 ms to 1.9 s. The latency panel has exemplars (trace IDs attached to histogram samples), so on-call clicks a slow point and opens a trace: <code>POST acme-pay</code> shows three back-to-back attempts of about 500 ms each, all ending in timeouts, then a success. The retry policy (see <a href="#retries">Retries</a>) is multiplying the provider's slowness. Search for traces with <code>error=true</code> on that span: hundreds since 13:58, all in one region. Logs for one of those trace IDs show the provider's error body. Ten minutes from alert to cause, without anyone guessing.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Broken context.</strong> One function that uses <code>context.Background()</code> instead of the request's <code>ctx</code>, a goroutine that drops it, or a queue message without headers, and the trace splits in two. Pass <code>ctx</code> everywhere, and copy context into message headers.</li>
+  <li><strong>Head sampling hides failures.</strong> At 1% sampling, 99% of error traces are thrown away. Use tail sampling, or at least always keep errors.</li>
+  <li><strong>High-cardinality span names.</strong> Name spans by operation (<code>GET /orders/{id}</code>), and put IDs in attributes. Span names with IDs in them break grouping and per-operation stats.</li>
+  <li><strong>Too many spans.</strong> A span per loop iteration or per cache lookup costs CPU, network and money. Trace network hops and meaningful work; use attributes or events for detail.</li>
+  <li><strong>Lost spans on exit.</strong> The batch processor buffers spans; without <code>Shutdown</code> on exit, the last seconds before a crash or deploy, often the most interesting, never arrive.</li>
+  <li><strong>Sensitive attributes.</strong> Spans are logs with a different shape: no tokens, card numbers or personal data in attributes or span events.</li>
+  <li><strong>Untrusted <code>traceparent</code> at the edge.</strong> Clients on the internet can send any trace ID and force the sampled flag. Many teams start a fresh trace at the public edge and keep the client's ID only as an attribute or link.</li>
+  <li><strong>Clock skew.</strong> Spans from different hosts use different clocks, so a child can appear to start before its parent. Keep NTP healthy and read small offsets with care (see <a href="#clock-skew">Clock Skew</a>).</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Trace = tree of spans sharing a trace ID; a span = one timed operation with a parent.</li>
+  <li>Propagation is the whole trick: <code>traceparent</code> on every outgoing call, extracted on every incoming one, and <code>ctx</code> passed everywhere in between.</li>
+  <li>OpenTelemetry is the vendor-neutral standard: SDK in the app, OTLP to a Collector, any backend behind it.</li>
+  <li>Head sampling is cheap but blind; tail sampling keeps the errors and slow requests you actually need. Put the trace ID on logs to jump between the two.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#observability">Observability</a> · <a href="#logging">Logging</a> · <a href="#metrics">Metrics</a> · <a href="#tail-latency">Tail Latency</a> · <a href="#retries">Retries</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
+`;
+
