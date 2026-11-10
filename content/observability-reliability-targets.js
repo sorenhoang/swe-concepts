@@ -1741,3 +1741,242 @@ service:
 <p><strong>Related:</strong> <a href="#monitoring">Monitoring</a> · <a href="#metrics">Metrics</a> · <a href="#logging">Logging</a> · <a href="#distributed-tracing">Distributed Tracing</a> · <a href="#slis">SLIs</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
 `;
 
+CONTENT["alerts"] = `
+<p class="tldr"><strong>TL;DR</strong>: An alert is a rule that notifies a human when something needs attention. Good alerts fire on <strong>symptoms users feel</strong> (errors, latency, an SLO burning), not on every cause (CPU at 80%). They're routed by urgency: a <em>page</em> wakes someone for "act now", a <em>ticket</em> waits for working hours. Think of a smoke alarm: it should go off for a fire, not every time you make toast.</p>
+
+<h2>The problem it solves</h2>
+<p>Dashboards only help when someone is looking at them. Alerts turn <a href="#monitoring">monitoring</a> data into action when nobody is. Badly designed alerts cause the opposite problem:</p>
+<ul>
+  <li><strong>Missed outages</strong>: users notice before you do, because nothing watched what they experience.</li>
+  <li><strong>Alert fatigue</strong>: 40 pages a week, most needing no action, so on-call starts ignoring them, including the real one.</li>
+  <li><strong>Alert storms</strong>: one database failure triggers 300 notifications from every service that depends on it.</li>
+  <li><strong>"Now what?"</strong>: a page at 03:00 with no context, no dashboard link and no runbook.</li>
+</ul>
+<p><strong>Symptoms vs causes.</strong> A symptom is what users feel: "checkout returns 5xx", "search p99 is 2 s". A cause is a possible reason: high CPU, a full disk, a restarted pod. Causes often don't hurt anyone (CPU at 90% may be fine), and the cause list is never complete. One symptom alert catches failures from causes you never thought of. Cause-based signals still belong on dashboards, or as tickets when they predict trouble ("disk full in 4 days").</p>
+
+<h2>How it works</h2>
+<p>In the Prometheus ecosystem, the work is split. <strong>Prometheus</strong> evaluates alerting rules (a PromQL expression plus a <code>for:</code> duration) and sends firing alerts to <strong>Alertmanager</strong>. Alertmanager deduplicates, groups, inhibits, silences and routes them to receivers. Hosted tools such as Grafana Alerting, Datadog and PagerDuty implement the same ideas under other names.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 272" role="img" aria-label="Prometheus evaluates rules and sends firing alerts to Alertmanager. Alertmanager dedupes and groups, applies inhibition and silences, then routes by labels: severity page goes to PagerDuty, severity ticket goes to Slack and a ticket queue.">
+  <defs><marker id="arr-al-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="70" width="170" height="110" rx="8"/>
+  <text x="105" y="94" text-anchor="middle" class="title">Prometheus</text>
+  <text x="105" y="118" text-anchor="middle" class="small">rule = PromQL expr</text>
+  <text x="105" y="133" text-anchor="middle" class="small">+ for: 5m</text>
+  <text x="105" y="157" text-anchor="middle" class="small">inactive → pending</text>
+  <text x="105" y="171" text-anchor="middle" class="small">→ firing</text>
+  <path class="line accent" d="M190 125 H238" marker-end="url(#arr-al-1)"/>
+  <text x="214" y="117" text-anchor="middle" class="small">alerts</text>
+
+  <rect class="box muted" x="240" y="30" width="300" height="200" rx="10"/>
+  <text x="390" y="52" text-anchor="middle" class="title">Alertmanager</text>
+  <rect class="box accent" x="260" y="64" width="260" height="30" rx="6"/>
+  <text x="390" y="83" text-anchor="middle" class="small">dedupe + group (group_by: alertname, service)</text>
+  <rect class="box accent" x="260" y="104" width="260" height="30" rx="6"/>
+  <text x="390" y="123" text-anchor="middle" class="small">inhibit: mute tickets while a page fires</text>
+  <rect class="box accent" x="260" y="144" width="260" height="30" rx="6"/>
+  <text x="390" y="163" text-anchor="middle" class="small">silence: muted for planned maintenance</text>
+  <rect class="box accent" x="260" y="184" width="260" height="30" rx="6"/>
+  <text x="390" y="203" text-anchor="middle" class="small">route: match labels → receiver</text>
+
+  <rect class="box bad" x="600" y="40" width="160" height="50" rx="8"/>
+  <text x="680" y="61" text-anchor="middle" class="title">PagerDuty</text>
+  <text x="680" y="78" text-anchor="middle" class="small">severity=page: phone</text>
+  <rect class="box" x="600" y="110" width="160" height="50" rx="8"/>
+  <text x="680" y="131" text-anchor="middle" class="title">Slack #payments</text>
+  <text x="680" y="148" text-anchor="middle" class="small">severity=ticket</text>
+  <rect class="box" x="600" y="180" width="160" height="50" rx="8"/>
+  <text x="680" y="201" text-anchor="middle" class="title">ticket queue</text>
+  <text x="680" y="218" text-anchor="middle" class="small">fix in working hours</text>
+  <path class="line bad" d="M520 199 L598 66" marker-end="url(#arr-al-1)"/>
+  <path class="line" d="M520 199 L598 136" marker-end="url(#arr-al-1)"/>
+  <path class="line" d="M520 199 L598 204" marker-end="url(#arr-al-1)"/>
+
+  <text x="390" y="258" text-anchor="middle" class="small">Defaults: group_wait 30s · group_interval 5m · repeat_interval 4h</text>
+</svg>
+<figcaption>Prometheus decides <em>whether</em> something is wrong. Alertmanager decides <em>who hears about it, how, and how often</em>.</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Grouping</strong>: alerts sharing the <code>group_by</code> labels become one notification. <code>group_wait</code> holds the first one briefly so related alerts arrive together. <code>group_interval</code> spaces out updates to a group, and <code>repeat_interval</code> re-sends while it's still firing.</li>
+  <li><strong>Inhibition</strong>: while a source alert fires, matching target alerts are muted. Typical uses: "the whole cluster is down" mutes every per-service alert in it, or a page mutes the ticket for the same service.</li>
+  <li><strong>Silences</strong>: time-boxed, manual mutes created in the UI or with <code>amtool</code>, for maintenance or a known issue.</li>
+  <li><strong>Routing</strong>: a tree of label matchers. An alert stops at the first matching child route unless <code>continue: true</code> is set.</li>
+</ul>
+
+<h3>What <code>for:</code> does</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 262" role="img" aria-label="Error rate over 20 minutes with a 2 percent threshold. A one-minute spike at 14:03 crosses the threshold but the rule only reaches pending and never fires. From about 14:08 the error rate stays above threshold; after 5 minutes pending, at about 14:13 the alert fires and a notification is sent. At 14:15 the rate drops and the alert resolves.">
+  <path class="line" d="M60 36 V200 H740"/>
+  <text x="52" y="44" text-anchor="end" class="small">6%</text>
+  <text x="52" y="204" text-anchor="end" class="small">0%</text>
+  <path class="line bad dashed" d="M60 147 H740"/>
+  <text x="736" y="140" text-anchor="end" class="small">threshold 2%</text>
+  <path class="line accent" d="M60 192 L162 192 L179 93 L196 192 L332 192 L349 88 L570 88 L587 190 L740 190" style="stroke-width: 2"/>
+  <text x="179" y="62" text-anchor="middle" class="small">1-min spike:</text>
+  <text x="179" y="76" text-anchor="middle" class="small">never fires</text>
+  <path class="line dashed" d="M513 88 V208"/>
+  <text x="400" y="70" class="small">notified at ~14:13 (after for: + group_wait)</text>
+
+  <rect class="box muted" x="60" y="210" width="110" height="24" rx="3"/>
+  <text x="115" y="226" text-anchor="middle" class="small">inactive</text>
+  <rect class="box accent" x="170" y="210" width="18" height="24" rx="3"/>
+  <rect class="box muted" x="188" y="210" width="155" height="24" rx="3"/>
+  <text x="265" y="226" text-anchor="middle" class="small">inactive</text>
+  <rect class="box accent" x="343" y="210" width="170" height="24" rx="3"/>
+  <text x="428" y="226" text-anchor="middle" class="small">pending (for: 5m)</text>
+  <rect class="box bad" x="513" y="210" width="67" height="24" rx="3"/>
+  <text x="546" y="226" text-anchor="middle" class="small">firing</text>
+  <rect class="box muted" x="580" y="210" width="160" height="24" rx="3"/>
+  <text x="660" y="226" text-anchor="middle" class="small">resolved</text>
+  <text x="60" y="252" text-anchor="middle" class="small">14:00</text>
+  <text x="230" y="252" text-anchor="middle" class="small">14:05</text>
+  <text x="400" y="252" text-anchor="middle" class="small">14:10</text>
+  <text x="570" y="252" text-anchor="middle" class="small">14:15</text>
+  <text x="740" y="252" text-anchor="middle" class="small">14:20</text>
+</svg>
+<figcaption><code>for:</code> trades detection time for fewer false alarms. Too short and blips page people; too long and a real outage burns minutes before anyone knows.</figcaption>
+</figure>
+
+<h2>Page, ticket, or neither</h2>
+<table>
+  <tr><th>Class</th><th>Use when</th><th>Delivered to</th><th>Example</th></tr>
+  <tr><td><strong>Page</strong></td><td>users are hurt now, or will be soon, and a human must act</td><td>on-call phone (PagerDuty, Opsgenie), any hour</td><td>checkout 5xx above 2% for 5 min; SLO burning fast</td></tr>
+  <tr><td><strong>Ticket</strong></td><td>real problem, but it can wait hours or days</td><td>team channel, issue tracker</td><td>p99 slowly creeping up; disk full in 4 days; cert expires in 14 days</td></tr>
+  <tr><td><strong>Dashboard only</strong></td><td>useful while debugging, not actionable alone</td><td>nobody is notified</td><td>CPU 85%, one pod restarted, GC pauses</td></tr>
+  <tr><td><strong>Burn-rate alert</strong></td><td>you have an SLO and want urgency to match budget spend</td><td>fast burn pages, slow burn tickets</td><td>2% of a 30-day budget gone in 1 hour (burn rate 14.4)</td></tr>
+</table>
+<p>A useful test for every page: is it <strong>urgent</strong>, <strong>actionable</strong>, and <strong>user-visible</strong>? If any answer is no, it's a ticket or a dashboard panel. Burn-rate alerting is the most robust way to page on SLOs; the windows and numbers are in <a href="#error-budgets">Error Budgets</a>.</p>
+
+<h2>Example</h2>
+<p><strong>Prometheus rules</strong>: one symptom that pages, one that becomes a ticket. Every alert carries a <code>severity</code> label for routing and a <code>runbook_url</code>.</p>
+<pre><code>groups:
+  - name: checkout
+    rules:
+      - alert: CheckoutHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{service="checkout", code=~"5.."}[5m]))
+            / sum(rate(http_requests_total{service="checkout"}[5m])) &gt; 0.02
+        for: 5m
+        labels:
+          severity: page
+          team: payments
+        annotations:
+          summary: "Checkout 5xx ratio is {{ $value | humanizePercentage }}"
+          runbook_url: https://runbooks.example.com/checkout-errors
+          dashboard: https://grafana.example.com/d/checkout
+
+      - alert: CheckoutHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_request_duration_seconds_bucket{service="checkout"}[5m]))
+          ) &gt; 0.8
+        for: 15m
+        labels:
+          severity: ticket
+          team: payments
+        annotations:
+          summary: "p99 above 800ms for 15m"
+          runbook_url: https://runbooks.example.com/checkout-latency</code></pre>
+<p><strong>Alertmanager</strong>: group per service, route by severity, and mute tickets while a page is firing for the same service. Secrets are read from files, never written inline. The <code>ticket-queue</code> webhook points at a small bridge, like the Go one below, that posts to Slack and opens tickets.</p>
+<pre><code>route:
+  receiver: ticket-queue            # fallback when nothing below matches
+  group_by: [alertname, service]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: [severity="page"]
+      receiver: pagerduty-payments
+    - matchers: [severity="ticket"]
+      receiver: ticket-queue
+
+inhibit_rules:
+  - source_matchers: [severity="page"]
+    target_matchers: [severity="ticket"]
+    equal: [service]                # only within the same service
+
+receivers:
+  - name: pagerduty-payments
+    pagerduty_configs:
+      - routing_key_file: /etc/alertmanager/secrets/pagerduty-payments
+  - name: ticket-queue
+    webhook_configs:
+      - url: http://alert-bridge:9095/alertmanager</code></pre>
+<p><strong>A Go webhook receiver</strong>, for your own integrations (chat bot, auto-ticketing). Alertmanager POSTs JSON in its version 4 webhook format:</p>
+<pre><code>package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
+)
+
+// The subset of Alertmanager's webhook payload (version "4") we use.
+type Notification struct {
+	Version     string            &#96;json:"version"&#96;
+	Status      string            &#96;json:"status"&#96; // "firing" or "resolved"
+	Receiver    string            &#96;json:"receiver"&#96;
+	GroupLabels map[string]string &#96;json:"groupLabels"&#96;
+	Alerts      []Alert           &#96;json:"alerts"&#96;
+}
+
+type Alert struct {
+	Status      string            &#96;json:"status"&#96;
+	Labels      map[string]string &#96;json:"labels"&#96;
+	Annotations map[string]string &#96;json:"annotations"&#96;
+	StartsAt    time.Time         &#96;json:"startsAt"&#96;
+	Fingerprint string            &#96;json:"fingerprint"&#96;
+}
+
+// Alertmanager retries failed webhooks, so the same alert can arrive more
+// than once: key any side effect (ticket, chat message) on the fingerprint.
+func webhook(w http.ResponseWriter, r *http.Request) {
+	var n Notification
+	if err := json.NewDecoder(r.Body).Decode(&amp;n); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	for _, a := range n.Alerts {
+		msg := fmt.Sprintf("[%s] %s: %s (since %s) runbook: %s",
+			a.Status, a.Labels["alertname"], a.Annotations["summary"],
+			a.StartsAt.Format(time.RFC3339), a.Annotations["runbook_url"])
+		slog.Info("alert", "receiver", n.Receiver, "fingerprint", a.Fingerprint, "text", msg)
+	}
+	w.WriteHeader(http.StatusOK) // anything else makes Alertmanager retry
+}
+
+func main() {
+	http.HandleFunc("POST /alertmanager", webhook)
+	http.ListenAndServe(":9095", nil)
+}</code></pre>
+<p>Real output when the test posts a firing alert:</p>
+<pre><code>time=2026-11-08T12:26:44.883Z level=INFO msg=alert receiver=ticket-queue fingerprint=3b1f0c9a7d2e4f11 text="[firing] CheckoutHighLatency: p99 above 800ms for 15m (since 2026-11-08T14:05:00Z) runbook: https://runbooks.example.com/checkout-latency"</code></pre>
+
+<p><strong>Real-world scenario.</strong> A team had 60 alerts, mostly on causes: CPU, memory, pod restarts, queue depth on every queue. On-call received about 30 pages a week, and fewer than one in ten needed action. When the database primary failed over at 02:10, 140 notifications arrived within two minutes and the one that mattered was buried. They replaced most of the alerts with two symptom alerts per service (error ratio and latency, later burn-rate alerts on their SLOs), moved cause alerts to dashboards or tickets, grouped by <code>service</code>, and added an inhibit rule so a "database down" alert mutes downstream alerts. Pages dropped to a few a week, and each one now links a runbook.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Paging on causes.</strong> "CPU &gt; 80%" pages at 03:00 while users are fine, and stays quiet during a real outage caused by something else.</li>
+  <li><strong>No <code>for:</code>, or a huge one.</strong> Zero <code>for:</code> pages on every blip. Thirty minutes means users suffer for half an hour first. For flapping alerts, Prometheus also has <code>keep_firing_for</code>, which keeps an alert firing for a while after the condition clears.</li>
+  <li><strong>Alerting on ratios at low traffic.</strong> One failure in 3 requests at 04:00 is "33% errors". Add a minimum-traffic condition, or use burn-rate alerts over longer windows.</li>
+  <li><strong>Missing data never alerts.</strong> If the target stops being scraped, <code>rate(...) &gt; x</code> returns nothing, and nothing fires. Add <code>up == 0</code> or <code>absent()</code> alerts, and an external heartbeat ("dead man's switch") that pages if Alertmanager itself goes quiet.</li>
+  <li><strong>No runbook, no owner.</strong> Every page needs a team label, a dashboard link and a runbook: what it means, how to check, how to mitigate.</li>
+  <li><strong>Never deleting alerts.</strong> Review pages after each on-call shift. An alert that fired and needed no action should be fixed, downgraded or deleted.</li>
+  <li><strong>Webhook receivers that aren't idempotent.</strong> Alertmanager retries on non-2xx responses, and runs in HA pairs, so duplicates happen. Deduplicate on the alert fingerprint.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Page on symptoms users feel; put causes on dashboards or in tickets.</li>
+  <li>Every page must be urgent, actionable and user-visible, with a runbook link.</li>
+  <li>Alertmanager's grouping, inhibition and silences turn an alert storm into one useful notification.</li>
+  <li>With SLOs in place, multi-window burn-rate alerts are the best default for paging.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#monitoring">Monitoring</a> · <a href="#slos">SLOs</a> · <a href="#error-budgets">Error Budgets</a> · <a href="#on-call">On-Call</a> · <a href="#production-incidents">Production Incidents</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
+`;
+
