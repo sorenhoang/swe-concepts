@@ -1018,3 +1018,234 @@ func main() {
 <p><strong>Related:</strong> <a href="#metrics">Metrics</a> · <a href="#distributed-tracing">Distributed Tracing</a> · <a href="#observability">Observability</a> · <a href="#monitoring">Monitoring</a> · <a href="#secrets-management">Secrets Management</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
 `;
 
+CONTENT["metrics"] = `
+<p class="tldr"><strong>TL;DR</strong>: A metric is a number measured over time: requests per second, error ratio, p99 latency, queue depth. Each one is cheap to collect and store because it's aggregated (a counter, not a line per request), so it's what dashboards and alerts are built on. Logs are the diary; metrics are the car's dashboard gauges.</p>
+
+<h2>The problem it solves</h2>
+<p>To know whether a service is healthy right now, and how that compares with yesterday, you need numbers you can graph and alert on. Logs can't do it cheaply: counting errors per minute by scanning millions of log lines is slow and expensive. A metric keeps a running total in memory, and the monitoring system samples it every few seconds. One counter costs the same at 10 or 10,000 requests per second.</p>
+<p>Done badly, metrics fail in two ways: they <strong>mislead</strong> (an average that hides slow requests), or they <strong>explode</strong> (a label with millions of values that takes down the metrics database).</p>
+
+<h2>How it works</h2>
+<p>In the Prometheus model, which most tools now follow, your service keeps metrics in memory and exposes them as text on <code>/metrics</code>. Prometheus scrapes that endpoint on an interval (15 s is common) and stores each value as a sample in a <strong>time series</strong>. A series is identified by a metric name plus a set of labels:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="A time series is a metric name, a set of labels and a value. Left chart: a counter climbs, drops to zero when the process restarts, and climbs again. Right chart: rate() of the same counter is a steady per-second line with a spike, and the restart is handled.">
+  <rect class="box accent" x="20" y="14" width="210" height="44" rx="6"/>
+  <text x="125" y="41" text-anchor="middle" class="title">http_requests_total</text>
+  <rect class="box" x="240" y="14" width="380" height="44" rx="6"/>
+  <text x="430" y="41" text-anchor="middle">{route="/orders/{id}", method="GET", code="500"}</text>
+  <rect class="box ok" x="630" y="14" width="130" height="44" rx="6"/>
+  <text x="695" y="41" text-anchor="middle" class="title">1027</text>
+  <text x="125" y="76" text-anchor="middle" class="small">metric name: what</text>
+  <text x="430" y="76" text-anchor="middle" class="small">labels: which slice; each unique set is its own series</text>
+  <text x="695" y="76" text-anchor="middle" class="small">value at scrape time</text>
+
+  <text x="220" y="116" text-anchor="middle" class="title">counter: raw value</text>
+  <path class="line" d="M60 130 V250 H380"/>
+  <path class="line accent" d="M60 240 L120 215 L180 190 L230 168 L230 245 L280 225 L330 200 L380 176"/>
+  <text x="240" y="150" class="small">restart: back to 0</text>
+  <text x="220" y="268" text-anchor="middle" class="small">time →</text>
+
+  <text x="580" y="116" text-anchor="middle" class="title">rate(...[5m]): per second</text>
+  <path class="line" d="M420 130 V250 H740"/>
+  <path class="line ok" d="M420 202 L500 200 L580 203 L625 199 L645 160 L675 158 L695 200 L740 201"/>
+  <text x="660" y="148" text-anchor="middle" class="small">traffic spike</text>
+  <text x="520" y="222" text-anchor="middle" class="small">restart is invisible here</text>
+  <text x="580" y="268" text-anchor="middle" class="small">time →</text>
+  <text x="390" y="292" text-anchor="middle" class="small">Raw counters are meaningless on a graph; you almost always look at their rate.</text>
+</svg>
+<figcaption>Counters only go up and reset to zero when the process restarts. <code>rate()</code> turns them into "per second", detects resets, and averages over the window you choose.</figcaption>
+</figure>
+
+<h3>The four metric types</h3>
+<table>
+  <tr><th>Type</th><th>What it is</th><th>Examples</th><th>Query with</th><th>Aggregate across instances?</th></tr>
+  <tr><td>Counter</td><td>monotonically increasing total; resets on restart</td><td>requests, errors, bytes sent</td><td><code>rate()</code>, <code>increase()</code></td><td>yes: <code>sum(rate(...))</code></td></tr>
+  <tr><td>Gauge</td><td>current value; goes up and down</td><td>in-flight requests, queue depth, memory, temperature</td><td>the value, <code>avg_over_time()</code>, <code>max()</code></td><td>yes (sum, max, avg)</td></tr>
+  <tr><td>Histogram</td><td>counts of observations per bucket (<code>le</code> = "less than or equal"), plus <code>_sum</code> and <code>_count</code></td><td>request latency, response size</td><td><code>histogram_quantile()</code> over <code>rate(..._bucket)</code></td><td>yes: sum buckets, then compute the quantile</td></tr>
+  <tr><td>Summary</td><td>quantiles computed inside the process, plus <code>_sum</code> and <code>_count</code></td><td>latency in a single process</td><td>read the quantile series directly</td><td><strong>no</strong>: you can't average p99s</td></tr>
+</table>
+<p>Prefer histograms over summaries in services that run more than one instance. The price of a histogram is that quantiles are estimates: <code>histogram_quantile</code> interpolates linearly inside a bucket, so put bucket bounds near the values you care about, such as your latency SLO. Go's <code>prometheus.DefBuckets</code> are 5 ms to 10 s.</p>
+
+<h3>Why averages lie</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 214" role="img" aria-label="1,000 requests: 950 take about 40 ms, 20 take 150 ms, 30 take 2 seconds. The median is 40 ms and the average is 101 ms, both well under the 300 ms target, but the p99 is 2,000 ms.">
+  <text x="390" y="20" text-anchor="middle" class="small">1,000 requests: 950 take ~40 ms, 20 take ~150 ms, 30 take ~2 s (scale: 0 to 2,000 ms)</text>
+  <path class="line accent dashed" d="M240 36 V178"/>
+  <text x="240" y="194" text-anchor="middle" class="small">SLO 300 ms</text>
+  <path class="line" d="M150 36 V178"/>
+
+  <text x="140" y="62" text-anchor="end">p50 (median)</text>
+  <rect class="box ok" x="150" y="46" width="12" height="24" rx="2"/>
+  <text x="250" y="62" class="small">40 ms</text>
+
+  <text x="140" y="104" text-anchor="end">average</text>
+  <rect class="box ok" x="150" y="88" width="30" height="24" rx="2"/>
+  <text x="250" y="104" class="small">101 ms: the dashboard says all is well</text>
+
+  <text x="140" y="146" text-anchor="end">p99</text>
+  <rect class="box bad" x="150" y="130" width="600" height="24" rx="2"/>
+  <text x="495" y="146" text-anchor="middle" class="small">2,000 ms: 1 in every 100 requests waits at least this long</text>
+</svg>
+<figcaption>An average mixes the fast majority with the slow few and describes nobody. Percentiles (p50, p95, p99) describe what real users actually wait. See <a href="#p99-latency">p99 Latency</a>.</figcaption>
+</figure>
+
+<h3>Labels and cardinality</h3>
+<p>Every unique combination of label values is a separate series, held in memory and stored on disk. The count multiplies:</p>
+<ul>
+  <li><code>route</code> (20) × <code>method</code> (4) × <code>code</code> (8) = 640 series per instance; × 50 pods = 32,000. Fine.</li>
+  <li>Add <code>user_id</code> with 100,000 users and the same metric can grow to 3.2 billion series. Prometheus runs out of memory long before that.</li>
+</ul>
+<p>Good labels have a small, bounded set of values: route <em>pattern</em>, method, status code, region, a handful of tenants. Never user IDs, emails, raw URLs, request IDs or error messages; those belong in <a href="#logging">logs</a> and <a href="#distributed-tracing">traces</a>.</p>
+
+<h2>Example</h2>
+<p><strong>Instrumenting a Go HTTP service with <code>client_golang</code></strong>: a counter, a histogram and a gauge, labelled by route pattern.</p>
+<pre><code>package main
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+type Metrics struct {
+	requests *prometheus.CounterVec
+	duration *prometheus.HistogramVec
+	inFlight prometheus.Gauge
+}
+
+func NewMetrics(reg prometheus.Registerer) *Metrics {
+	f := promauto.With(reg)
+	return &amp;Metrics{
+		// Counter: only goes up. Query it with rate().
+		requests: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "HTTP requests by route, method and status code.",
+		}, []string{"route", "method", "code"}),
+		// Histogram: counts per latency bucket, so p50/p99 can be computed
+		// later, across every instance. Bounds sit around the SLO (300 ms).
+		duration: f.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "HTTP request latency.",
+			Buckets: []float64{0.05, 0.1, 0.3, 0.5, 1, 2.5},
+		}, []string{"route"}),
+		// Gauge: a value that goes up and down.
+		inFlight: f.NewGauge(prometheus.GaugeOpts{
+			Name: "http_requests_in_flight",
+			Help: "Requests currently being served.",
+		}),
+	}
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// Instrument wraps one route. The label is the route PATTERN ("/orders/{id}"),
+// never the raw URL: one series per route, not one per order ID.
+func (m *Metrics) Instrument(route string, next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.inFlight.Inc()
+		defer m.inFlight.Dec()
+		start := time.Now()
+		sw := &amp;statusWriter{ResponseWriter: w, code: http.StatusOK}
+		next(sw, r)
+		m.duration.WithLabelValues(route).Observe(time.Since(start).Seconds())
+		m.requests.WithLabelValues(route, r.Method, strconv.Itoa(sw.code)).Inc()
+	})
+}
+
+func getOrder(w http.ResponseWriter, r *http.Request) {
+	if r.PathValue("id") == "slow" {
+		time.Sleep(400 * time.Millisecond) // pretend a cold cache
+	}
+	if r.PathValue("id") == "missing" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Write([]byte(&#96;{"id":"&#96; + r.PathValue("id") + &#96;"}&#96;))
+}
+
+func main() {
+	reg := prometheus.NewRegistry() // only our metrics; add collectors.NewGoCollector() for runtime ones
+	m := NewMetrics(reg)
+	mux := http.NewServeMux()
+	mux.Handle("GET /orders/{id}", m.Instrument("/orders/{id}", getOrder))
+	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	http.ListenAndServe(":8080", mux)
+}</code></pre>
+
+<p>After 9 requests (7 fast, one 404, one slow at ~400 ms), <code>/metrics</code> returns this real output. Buckets are cumulative: <code>le="0.5"</code> counts everything up to 0.5 s, including the 8 fast ones.</p>
+<pre><code># HELP http_request_duration_seconds HTTP request latency.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{route="/orders/{id}",le="0.05"} 8
+http_request_duration_seconds_bucket{route="/orders/{id}",le="0.1"} 8
+http_request_duration_seconds_bucket{route="/orders/{id}",le="0.3"} 8
+http_request_duration_seconds_bucket{route="/orders/{id}",le="0.5"} 9
+http_request_duration_seconds_bucket{route="/orders/{id}",le="1"} 9
+http_request_duration_seconds_bucket{route="/orders/{id}",le="2.5"} 9
+http_request_duration_seconds_bucket{route="/orders/{id}",le="+Inf"} 9
+http_request_duration_seconds_sum{route="/orders/{id}"} 0.400452333
+http_request_duration_seconds_count{route="/orders/{id}"} 9
+# HELP http_requests_in_flight Requests currently being served.
+# TYPE http_requests_in_flight gauge
+http_requests_in_flight 0
+# HELP http_requests_total HTTP requests by route, method and status code.
+# TYPE http_requests_total counter
+http_requests_total{code="200",method="GET",route="/orders/{id}"} 8
+http_requests_total{code="404",method="GET",route="/orders/{id}"} 1</code></pre>
+
+<p><strong>PromQL basics</strong> against those metrics:</p>
+<pre><code># Requests per second, per route (rate first, then sum)
+sum by (route) (rate(http_requests_total[5m]))
+
+# Error ratio: share of requests that returned 5xx
+sum(rate(http_requests_total{code=~"5.."}[5m]))
+  / sum(rate(http_requests_total[5m]))
+
+# p99 latency per route, across all instances
+histogram_quantile(0.99,
+  sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))
+
+# Share of requests slower than 300 ms (uses the le="0.3" bucket)
+1 - sum(rate(http_request_duration_seconds_bucket{le="0.3"}[5m]))
+      / sum(rate(http_request_duration_seconds_count[5m]))
+
+# Average latency, for comparison (it hides the slow tail)
+sum(rate(http_request_duration_seconds_sum[5m]))
+  / sum(rate(http_request_duration_seconds_count[5m]))</code></pre>
+
+<p><strong>Real-world scenario.</strong> It's 14:05. The "average latency" panel is flat at 80 ms and nobody notices anything. Support says some customers see order pages hang. The p99 query above, split by route, tells a different story: <code>/orders/{id}</code> p99 went from 250 ms to 1.8 s at 13:58, while p50 stayed at 35 ms. About 2% of requests (those missing the cache after a cache node restart) are slow; the average barely moves because 98% are still fast. The team replaces the average panel with p50/p95/p99 and alerts on the share of requests over 300 ms, which is a ratio of two counters and aggregates cleanly.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Unbounded labels.</strong> The most common way to break a metrics system: <code>r.URL.Path</code> instead of the route pattern, user IDs, error strings. Bound every label; when in doubt, leave it out.</li>
+  <li><strong>Averaging percentiles.</strong> <code>avg(p99 of each pod)</code> is not the fleet's p99. Sum histogram buckets across pods first, then call <code>histogram_quantile</code>.</li>
+  <li><strong><code>sum</code> before <code>rate</code>.</strong> Always <code>rate</code> then <code>sum</code>: <code>sum(rate(x[5m]))</code>. Summing raw counters first hides the resets that <code>rate</code> needs to see. And never <code>rate</code> a gauge.</li>
+  <li><strong>Range too short.</strong> <code>rate(x[30s])</code> with a 15 s scrape has only one or two samples and returns gaps or noise. Use a window of several scrape intervals; 4× is a common rule of thumb.</li>
+  <li><strong>Missing series aren't zero.</strong> A labelled counter appears only after its first <code>Inc()</code>. If <code>code="500"</code> has never happened, an error-ratio alert returns no data instead of 0 and silently never fires. Pre-create important series with <code>WithLabelValues(...)</code>.</li>
+  <li><strong>Buckets that miss your target.</strong> With buckets at 0.25 s and 1 s, you can't tell whether p99 is 300 ms or 900 ms. Put a bound at your SLO threshold.</li>
+  <li><strong>Units and names.</strong> Follow the conventions: base units (<code>_seconds</code>, <code>_bytes</code>), <code>_total</code> on counters. Mixing milliseconds and seconds across services makes every dashboard a trap.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Counter for things that happen, gauge for current levels, histogram for latency and sizes; avoid summaries across many instances.</li>
+  <li>Each label combination is a series: keep labels bounded, never per user or per request.</li>
+  <li>Look at <code>rate()</code> of counters, and at percentiles, not averages, for latency.</li>
+  <li><code>histogram_quantile(0.99, sum by (le) (rate(..._bucket[5m])))</code> is the pattern to memorize.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#monitoring">Monitoring</a> · <a href="#logging">Logging</a> · <a href="#slis">SLIs</a> · <a href="#p99-latency">p99 Latency</a> · <a href="#alerts">Alerts</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
+`;
+
