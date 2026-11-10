@@ -1492,3 +1492,252 @@ POST /charge    span=6dbd5c0af22fefa5 parent=5682939d16e55a99 status=Unset</code
 <p><strong>Related:</strong> <a href="#observability">Observability</a> · <a href="#logging">Logging</a> · <a href="#metrics">Metrics</a> · <a href="#tail-latency">Tail Latency</a> · <a href="#retries">Retries</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
 `;
 
+CONTENT["observability"] = `
+<p class="tldr"><strong>TL;DR</strong>: Observability is how well you can work out what's happening inside a system from the data it emits, including problems <em>nobody predicted</em>. <a href="#monitoring">Monitoring</a> tells you <em>that</em> something you anticipated is wrong; observability lets you ask new questions, like "is it only big carts with the new pricing flag?", without shipping new code. A car's warning lights are monitoring. A mechanic's diagnostic port, which can read any sensor, is observability.</p>
+
+<h2>The problem it solves</h2>
+<p>The term comes from control theory: a system is observable if you can infer its internal state from its outputs. In software, the outputs are the telemetry you emit.</p>
+<p>Dashboards and alerts cover <strong>known unknowns</strong>: failure modes you've seen before, so you graph and alert on them. Modern systems mostly fail in new ways, though. One tenant, one build, one feature flag, one region, one combination of all four. These are <strong>unknown unknowns</strong>, and they're often invisible in aggregates:</p>
+<ul>
+  <li>Error rate is 4%, but every host, every pod and every CPU graph looks normal.</li>
+  <li>p99 doubled, but only for requests that touch one shard through one dependency.</li>
+  <li>A customer says "it's slow for us", and no dashboard has a <code>tenant</code> dimension.</li>
+</ul>
+<p>Without observability you guess, add a log line, redeploy, wait, and guess again. With it, you slice the data you already have until the odd group shows up.</p>
+
+<h2>How it works</h2>
+<p>Code emits rich telemetry: <a href="#metrics">metrics</a>, structured <a href="#logging">logs</a> and <a href="#distributed-tracing">traces</a>, all sharing context such as <code>trace_id</code>, <code>service</code> and <code>version</code>. Today this usually goes through <strong>OpenTelemetry</strong> (OTel), a vendor-neutral set of APIs, SDKs, a wire protocol (<strong>OTLP</strong>) and the <strong>Collector</strong>. The Collector is a standalone process that receives telemetry, processes it, and exports it to one or more backends.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="A Go service with the OpenTelemetry SDK sends OTLP to the OpenTelemetry Collector. Inside the collector, receivers feed processors, which feed exporters. Exporters send metrics, logs and traces to separate backends, which a query UI such as Grafana reads together.">
+  <defs><marker id="arr-ob-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="70" width="140" height="110" rx="8"/>
+  <text x="90" y="94" text-anchor="middle" class="title">checkout (Go)</text>
+  <text x="90" y="118" text-anchor="middle" class="small">OTel SDK: spans,</text>
+  <text x="90" y="133" text-anchor="middle" class="small">metrics, logs</text>
+  <text x="90" y="157" text-anchor="middle" class="small">shared trace_id,</text>
+  <text x="90" y="171" text-anchor="middle" class="small">service, version</text>
+  <path class="line accent" d="M160 125 H218" marker-end="url(#arr-ob-1)"/>
+  <text x="189" y="117" text-anchor="middle" class="small">OTLP</text>
+  <text x="20" y="204" class="small">OTLP ports: gRPC 4317,</text>
+  <text x="20" y="218" class="small">HTTP 4318</text>
+
+  <rect class="box muted" x="220" y="40" width="330" height="190" rx="10"/>
+  <text x="385" y="62" text-anchor="middle" class="title">OpenTelemetry Collector</text>
+  <rect class="box accent" x="230" y="80" width="94" height="110" rx="6"/>
+  <text x="277" y="102" text-anchor="middle" class="title">receivers</text>
+  <text x="277" y="126" text-anchor="middle" class="small">otlp</text>
+  <text x="277" y="142" text-anchor="middle" class="small">prometheus</text>
+  <text x="277" y="158" text-anchor="middle" class="small">filelog</text>
+  <rect class="box accent" x="338" y="80" width="94" height="110" rx="6"/>
+  <text x="385" y="102" text-anchor="middle" class="title">processors</text>
+  <text x="385" y="126" text-anchor="middle" class="small">memory_limiter</text>
+  <text x="385" y="142" text-anchor="middle" class="small">batch</text>
+  <text x="385" y="158" text-anchor="middle" class="small">attributes</text>
+  <text x="385" y="174" text-anchor="middle" class="small">tail sampling</text>
+  <rect class="box accent" x="446" y="80" width="94" height="110" rx="6"/>
+  <text x="493" y="102" text-anchor="middle" class="title">exporters</text>
+  <text x="493" y="126" text-anchor="middle" class="small">otlp</text>
+  <text x="493" y="142" text-anchor="middle" class="small">otlphttp</text>
+  <text x="493" y="158" text-anchor="middle" class="small">remote write</text>
+  <path class="line" d="M324 135 H336" marker-end="url(#arr-ob-1)"/>
+  <path class="line" d="M432 135 H444" marker-end="url(#arr-ob-1)"/>
+  <text x="385" y="214" text-anchor="middle" class="small">one pipeline per signal: traces, metrics, logs</text>
+
+  <rect class="box ok" x="600" y="30" width="160" height="50" rx="8"/>
+  <text x="680" y="51" text-anchor="middle" class="title">metrics</text>
+  <text x="680" y="68" text-anchor="middle" class="small">Prometheus, Mimir</text>
+  <rect class="box ok" x="600" y="100" width="160" height="50" rx="8"/>
+  <text x="680" y="121" text-anchor="middle" class="title">logs</text>
+  <text x="680" y="138" text-anchor="middle" class="small">Loki, Elasticsearch</text>
+  <rect class="box ok" x="600" y="170" width="160" height="50" rx="8"/>
+  <text x="680" y="191" text-anchor="middle" class="title">traces</text>
+  <text x="680" y="208" text-anchor="middle" class="small">Tempo, Jaeger</text>
+  <path class="line" d="M550 110 L598 58" marker-end="url(#arr-ob-1)"/>
+  <path class="line" d="M550 128 H598" marker-end="url(#arr-ob-1)"/>
+  <path class="line" d="M550 146 L598 192" marker-end="url(#arr-ob-1)"/>
+
+  <rect class="box" x="220" y="250" width="540" height="40" rx="8"/>
+  <text x="490" y="275" text-anchor="middle">Grafana or a vendor UI: query and jump between signals by trace_id</text>
+  <path class="line dashed" d="M680 220 V248" marker-end="url(#arr-ob-1)"/>
+</svg>
+<figcaption>Instrument once with OpenTelemetry, send everything through a Collector, and choose (or change) backends in Collector config instead of in application code.</figcaption>
+</figure>
+
+<p>Two properties make telemetry observable rather than just monitored:</p>
+<ul>
+  <li><strong>High cardinality.</strong> Fields with many distinct values (<code>user_id</code>, <code>tenant</code>, <code>build</code>, <code>cart_items</code>) are what let you find "only these requests". Metrics can't hold them cheaply (see <a href="#metrics">Metrics</a>), so they live in events, logs and spans.</li>
+  <li><strong>High dimensionality and correlation.</strong> Many fields on each event, and a shared <code>trace_id</code>, so you can go from a graph to an example trace to its logs.</li>
+</ul>
+
+<h3>An investigation, step by step</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 262" role="img" aria-label="Five investigation steps: a symptom alert shows checkout errors at 4 percent; slicing by dimensions; comparing groups shows flag new_pricing true has 38 percent errors versus 0.3 percent; an exemplar trace shows a slow pricing span; logs for that trace_id show payment timeout. A bar chart shows error rate 38 percent for new_pricing true and 0.3 percent for false.">
+  <defs><marker id="arr-ob-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box bad" x="20" y="20" width="130" height="70" rx="8"/>
+  <text x="85" y="42" text-anchor="middle" class="title">1 symptom</text>
+  <text x="85" y="62" text-anchor="middle" class="small">SLO alert: checkout</text>
+  <text x="85" y="77" text-anchor="middle" class="small">errors at 4%</text>
+  <rect class="box" x="170" y="20" width="130" height="70" rx="8"/>
+  <text x="235" y="42" text-anchor="middle" class="title">2 slice</text>
+  <text x="235" y="62" text-anchor="middle" class="small">group by build,</text>
+  <text x="235" y="77" text-anchor="middle" class="small">region, tenant, flag</text>
+  <rect class="box accent" x="320" y="20" width="130" height="70" rx="8"/>
+  <text x="385" y="42" text-anchor="middle" class="title">3 compare</text>
+  <text x="385" y="62" text-anchor="middle" class="small">new_pricing=true:</text>
+  <text x="385" y="77" text-anchor="middle" class="small">38% vs 0.3%</text>
+  <rect class="box" x="470" y="20" width="130" height="70" rx="8"/>
+  <text x="535" y="42" text-anchor="middle" class="title">4 trace</text>
+  <text x="535" y="62" text-anchor="middle" class="small">open an exemplar:</text>
+  <text x="535" y="77" text-anchor="middle" class="small">34 DB calls in pricing</text>
+  <rect class="box" x="620" y="20" width="140" height="70" rx="8"/>
+  <text x="690" y="42" text-anchor="middle" class="title">5 logs</text>
+  <text x="690" y="62" text-anchor="middle" class="small">same trace_id:</text>
+  <text x="690" y="77" text-anchor="middle" class="small">"payment timeout"</text>
+  <path class="line" d="M150 55 H168" marker-end="url(#arr-ob-2)"/>
+  <path class="line" d="M300 55 H318" marker-end="url(#arr-ob-2)"/>
+  <path class="line" d="M450 55 H468" marker-end="url(#arr-ob-2)"/>
+  <path class="line" d="M600 55 H618" marker-end="url(#arr-ob-2)"/>
+
+  <text x="20" y="130" class="title">Step 3: checkout error rate grouped by flag.new_pricing</text>
+  <text x="150" y="166" text-anchor="end" class="small">new_pricing=true</text>
+  <rect class="box bad" x="160" y="152" width="456" height="22" rx="3"/>
+  <text x="624" y="167" class="small">38%</text>
+  <text x="150" y="202" text-anchor="end" class="small">new_pricing=false</text>
+  <rect class="box ok" x="160" y="188" width="4" height="22" rx="1"/>
+  <text x="172" y="203" class="small">0.3%</text>
+  <path class="line" d="M160 140 V222"/>
+  <text x="160" y="246" class="small">The flag is on for 10% of traffic: 10% × 38% ≈ 3.8% overall. No host-level graph would show this.</text>
+</svg>
+<figcaption>Start from a user-facing symptom, then slice by dimensions until one group stands out. Traces and logs explain <em>why</em> that group is different.</figcaption>
+</figure>
+
+<h2>Signals compared</h2>
+<table>
+  <tr><th>Signal</th><th>Best at</th><th>Weak at</th><th>High-cardinality fields</th></tr>
+  <tr><td><a href="#metrics">Metrics</a></td><td>cheap trends, dashboards, alerting; years of retention</td><td>"which requests?"; aggregated before you ask</td><td>no: each label combination is a new time series</td></tr>
+  <tr><td><a href="#logging">Logs</a></td><td>details of one event, error messages, audit trails</td><td>cost at volume; unstructured logs are hard to query</td><td>yes, if structured (JSON)</td></tr>
+  <tr><td><a href="#distributed-tracing">Traces</a></td><td>where time goes across services; causality</td><td>sampled, so rare paths may be missing</td><td>yes, as span attributes</td></tr>
+  <tr><td>Wide events</td><td>one rich record per request with dozens of fields; arbitrary group-by</td><td>needs a columnar store built for it; storage cost</td><td>yes, that's the point</td></tr>
+  <tr><td>Profiles</td><td>which function burns CPU or memory</td><td>not per-request; newer tooling</td><td>limited</td></tr>
+</table>
+<p><strong>The debate, briefly.</strong> The classic framing is "three pillars": metrics, logs, traces. Critics, notably Charity Majors of Honeycomb, argue that three separately stored pillars are just three bills, and that observability really comes from <strong>wide, structured events</strong> you can slice in any direction, with metrics derived from them. In practice most teams run all three, linked by <code>trace_id</code>, and add wide events or richer spans where debugging hurts most. OpenTelemetry supports either approach. It is also adding profiles as a further signal.</p>
+
+<h2>Example</h2>
+<p><strong>Wide events in Go</strong>: handlers add whatever they learn to the request's event, and middleware writes one structured line per request with <code>log/slog</code>. (In a traced service the same fields go on the root span as attributes.)</p>
+<pre><code>package main
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"os"
+	"time"
+)
+
+// One wide event per request: handlers add fields as they learn things,
+// the middleware emits everything as a single structured log line.
+type eventKey struct{}
+
+type event struct{ attrs []slog.Attr }
+
+// Add attaches fields to the current request's event. Safe to call
+// from any handler or helper that has the request context.
+func Add(ctx context.Context, attrs ...slog.Attr) {
+	if ev, ok := ctx.Value(eventKey{}).(*event); ok {
+		ev.attrs = append(ev.attrs, attrs...)
+	}
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func WideEvents(log *slog.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		ev := &amp;event{}
+		sw := &amp;statusWriter{ResponseWriter: w, status: http.StatusOK}
+		r = r.WithContext(context.WithValue(r.Context(), eventKey{}, ev))
+		next.ServeHTTP(sw, r) // the mux sets r.Pattern on this request
+
+		attrs := append([]slog.Attr{
+			slog.String("method", r.Method),
+			slog.String("route", r.Pattern), // "POST /checkout", not the raw URL
+			slog.Int("status", sw.status),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+			slog.String("build", os.Getenv("BUILD_SHA")),
+		}, ev.attrs...)
+		log.LogAttrs(r.Context(), slog.LevelInfo, "request", attrs...)
+	})
+}
+
+func checkout(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	Add(ctx,
+		slog.String("user_id", "u_8412"),
+		slog.String("tenant", "acme"),
+		slog.Int("cart_items", 31),
+		slog.Bool("flag.new_pricing", true),
+	)
+	// ... call pricing, payments ...
+	Add(ctx, slog.String("payment_provider", "psp-b"), slog.Int("db_queries", 34))
+	http.Error(w, "payment timeout", http.StatusGatewayTimeout)
+}
+
+func main() {
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /checkout", checkout)
+	http.ListenAndServe(":8080", WideEvents(log, mux))
+}</code></pre>
+<p>The real output for one request (from an <code>httptest</code> run):</p>
+<pre><code>{"time":"2026-11-08T12:26:31.673237Z","level":"INFO","msg":"request","method":"POST","route":"POST /checkout","status":504,"duration_ms":0,"build":"9f3c2e1","user_id":"u_8412","tenant":"acme","cart_items":31,"flag.new_pricing":true,"payment_provider":"psp-b","db_queries":34}</code></pre>
+<p>A Collector config that receives OTLP and fans out to three backends:</p>
+<pre><code>receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+processors:
+  memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 20 }
+  batch: {}
+exporters:
+  otlp/tempo: { endpoint: "tempo:4317", tls: { insecure: true } }
+  otlphttp/loki: { endpoint: "http://loki:3100/otlp" }
+  prometheusremotewrite: { endpoint: "http://prometheus:9090/api/v1/write" }  # contrib build
+service:
+  pipelines:  # memory_limiter goes first, so overload is refused early
+    traces:  { receivers: [otlp], processors: [memory_limiter, batch], exporters: [otlp/tempo] }
+    logs:    { receivers: [otlp], processors: [memory_limiter, batch], exporters: [otlphttp/loki] }
+    metrics: { receivers: [otlp], processors: [memory_limiter, batch], exporters: [prometheusremotewrite] }</code></pre>
+
+<p><strong>Real-world scenario.</strong> At 14:05 the checkout SLO alert fires: errors went from 0.3% to 4%. Host dashboards are flat: CPU 40%, memory normal, no pod restarts. The on-call engineer groups the request events by <code>build</code> (nothing), <code>region</code> (nothing), then <code>flag.new_pricing</code>: requests with the flag on fail 38% of the time. Narrowing further, only carts with more than 25 items fail. An exemplar trace shows the pricing call making 34 sequential database queries (an <a href="#n-1-queries">N+1</a>), which pushes payment authorisation past its timeout. Turning the flag off restores the error rate within a minute. No new code or logging was needed to find it, because the fields were already on every event.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Buying a tool isn't observability.</strong> A vendor with poorly instrumented code gives you pretty graphs of the wrong thing. The value is in the fields your code emits.</li>
+  <li><strong>High cardinality in the wrong place.</strong> <code>user_id</code> as a Prometheus label can melt your metrics backend. Put it on spans and events, not on metric labels.</li>
+  <li><strong>Signals that can't be joined.</strong> Logs without <code>trace_id</code>, and services that disagree on whether the field is <code>service</code>, <code>svc</code> or <code>app</code>. Use OTel semantic conventions (<code>service.name</code>, <code>http.route</code>) and propagate context everywhere.</li>
+  <li><strong>Cost runs away.</strong> Debug-level logs at full volume and 100% trace sampling get very expensive. Sample traces (keeping errors and slow ones), drop noisy fields in the Collector, and set retention per signal.</li>
+  <li><strong>No Collector, hard-wired vendor SDKs.</strong> Switching vendors then means changing every service. Exporting OTLP to a Collector keeps that a config change.</li>
+  <li><strong>Missing deploy and flag context.</strong> Most incidents start with a change. If events don't carry <code>build</code> and flag state, you can't slice by the most likely cause.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Monitoring answers questions you planned for; observability lets you ask new ones of data you already have.</li>
+  <li>The power comes from high-cardinality, high-dimensional, correlated telemetry, not from any one tool.</li>
+  <li>OpenTelemetry plus a Collector: instrument once, route to any backend.</li>
+  <li>Investigate symptom first, then slice, compare, trace, and read logs.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#monitoring">Monitoring</a> · <a href="#metrics">Metrics</a> · <a href="#logging">Logging</a> · <a href="#distributed-tracing">Distributed Tracing</a> · <a href="#slis">SLIs</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
+`;
+
