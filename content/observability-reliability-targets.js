@@ -2668,3 +2668,344 @@ remaining budget: 35%</code></pre>
 <p><strong>Related:</strong> <a href="#slos">SLOs</a> · <a href="#slis">SLIs</a> · <a href="#alerts">Alerts</a> · <a href="#postmortems">Postmortems</a> · <a href="#canary-releases">Canary Releases</a> · <a href="#real-world-observability-stack">Real-World Observability Stack</a></p>
 `;
 
+CONTENT["real-world-observability-stack"] = `
+<p class="tldr"><strong>TL;DR</strong>: In production, the concepts in this group form one loop. Health checks and probes keep traffic on working instances. Metrics feed SLIs, SLIs are judged against SLOs, the SLO defines an error budget, and burn-rate alerts page a human only when that budget is at risk. Then dashboards narrow the problem, traces find the failing hop, and logs explain the exact failure. This page wires all of it into one Go service and walks through one incident from deploy to rollback.</p>
+
+<h2>Why combine them at all?</h2>
+<p>Each tool answers one kind of question and is weak at the others. Metrics are cheap and great for "how many, how fast", but can't tell you what happened to one request. Logs tell the story of one request but are expensive to aggregate. Traces show where time went across services but are usually sampled. Probes keep traffic correct but know nothing about users. An SLO knows what users feel but not why. Wired together, with a shared <code>trace_id</code> and shared labels, each one hands you over to the next. Without that wiring you get three tools, three logins and an on-call engineer copying timestamps between tabs.</p>
+
+<h2>How it works: the full stack</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 386" role="img" aria-label="Architecture: a Go app in a Kubernetes pod writes JSON logs to stdout, sends traces over OTLP and exposes metrics and health endpoints. The kubelet probes healthz and readyz. The OpenTelemetry Collector forwards logs to Loki and traces to Tempo. Prometheus scrapes metrics and evaluates SLI and burn-rate rules, sending alerts to Alertmanager, which pages the on-call engineer. The engineer investigates in Grafana, which queries Prometheus, Loki and Tempo.">
+  <defs><marker id="arr-ros-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="10" y="50" width="190" height="180" rx="10"/>
+  <text x="105" y="74" text-anchor="middle" class="title">checkout pod (Go)</text>
+  <text x="105" y="98" text-anchor="middle" class="small">OTel SDK: spans → OTLP</text>
+  <text x="105" y="118" text-anchor="middle" class="small">slog JSON → stdout</text>
+  <text x="105" y="138" text-anchor="middle" class="small">with trace_id on each line</text>
+  <text x="105" y="166" text-anchor="middle" class="small">/metrics: request histogram</text>
+  <text x="105" y="194" text-anchor="middle" class="small">/healthz (liveness)</text>
+  <text x="105" y="212" text-anchor="middle" class="small">/readyz (readiness)</text>
+  <rect class="box" x="10" y="290" width="190" height="56" rx="10"/>
+  <text x="105" y="313" text-anchor="middle" class="title">kubelet</text>
+  <text x="105" y="332" text-anchor="middle" class="small">probes; ready pods get traffic</text>
+  <path class="line dashed" d="M105 288 V232" marker-end="url(#arr-ros-1)"/>
+
+  <rect class="box" x="260" y="50" width="160" height="110" rx="10"/>
+  <text x="340" y="76" text-anchor="middle" class="title">OTel Collector</text>
+  <text x="340" y="100" text-anchor="middle" class="small">receive, batch,</text>
+  <text x="340" y="116" text-anchor="middle" class="small">tail-sample, enrich</text>
+  <text x="340" y="132" text-anchor="middle" class="small">(k8s pod, namespace)</text>
+  <path class="line" d="M200 90 H258" marker-end="url(#arr-ros-1)"/>
+  <text x="229" y="84" text-anchor="middle" class="small">traces</text>
+  <path class="line" d="M200 130 H258" marker-end="url(#arr-ros-1)"/>
+  <text x="229" y="124" text-anchor="middle" class="small">logs</text>
+
+  <rect class="box" x="480" y="40" width="150" height="50" rx="10"/>
+  <text x="555" y="62" text-anchor="middle" class="title">Loki</text>
+  <text x="555" y="79" text-anchor="middle" class="small">logs</text>
+  <rect class="box" x="480" y="110" width="150" height="50" rx="10"/>
+  <text x="555" y="132" text-anchor="middle" class="title">Tempo</text>
+  <text x="555" y="149" text-anchor="middle" class="small">traces</text>
+  <path class="line" d="M420 80 L478 68" marker-end="url(#arr-ros-1)"/>
+  <path class="line" d="M420 130 L478 135" marker-end="url(#arr-ros-1)"/>
+
+  <rect class="box accent" x="480" y="190" width="150" height="80" rx="10"/>
+  <text x="555" y="213" text-anchor="middle" class="title">Prometheus</text>
+  <text x="555" y="234" text-anchor="middle" class="small">SLI recording rules</text>
+  <text x="555" y="251" text-anchor="middle" class="small">burn-rate alert rules</text>
+  <path class="line dashed" d="M478 206 H202" marker-end="url(#arr-ros-1)"/>
+  <text x="340" y="198" text-anchor="middle" class="small">scrape /metrics (pull)</text>
+
+  <rect class="box" x="480" y="310" width="150" height="56" rx="10"/>
+  <text x="555" y="333" text-anchor="middle" class="title">Alertmanager</text>
+  <text x="555" y="352" text-anchor="middle" class="small">route, group, inhibit</text>
+  <path class="line" d="M555 270 V308" marker-end="url(#arr-ros-1)"/>
+  <text x="561" y="293" class="small">firing alerts</text>
+
+  <rect class="box ok" x="670" y="40" width="100" height="130" rx="10"/>
+  <text x="720" y="64" text-anchor="middle" class="title">Grafana</text>
+  <text x="720" y="88" text-anchor="middle" class="small">SLO + RED</text>
+  <text x="720" y="104" text-anchor="middle" class="small">dashboards,</text>
+  <text x="720" y="120" text-anchor="middle" class="small">explore logs</text>
+  <text x="720" y="136" text-anchor="middle" class="small">and traces</text>
+  <path class="line" d="M632 65 H668" marker-end="url(#arr-ros-1)"/>
+  <path class="line" d="M632 135 H668" marker-end="url(#arr-ros-1)"/>
+  <path class="line" d="M632 220 L668 160" marker-end="url(#arr-ros-1)"/>
+
+  <rect class="box bad" x="670" y="310" width="100" height="56" rx="10"/>
+  <text x="720" y="333" text-anchor="middle" class="title">Pager</text>
+  <text x="720" y="352" text-anchor="middle" class="small">on-call phone</text>
+  <path class="line" d="M630 338 H668" marker-end="url(#arr-ros-1)"/>
+  <path class="line accent dashed" d="M720 308 V172" marker-end="url(#arr-ros-1)"/>
+  <text x="714" y="250" text-anchor="end" class="small">investigate</text>
+</svg>
+<figcaption>A common open-source layout (Grafana with Prometheus, Loki and Tempo). Vendors such as Datadog, Honeycomb or Grafana Cloud replace the right-hand side; the app side, with OTel SDK, <code>/metrics</code> or OTLP metrics, JSON logs and health endpoints, stays the same.</figcaption>
+</figure>
+
+<p>Each sibling page owns one box. In the order data flows:</p>
+<ol>
+  <li><strong>Traffic correctness</strong>: <a href="#health-checks">health checks</a> and <a href="#liveness-readiness-probes">liveness &amp; readiness probes</a> decide which pods receive requests and which get restarted.</li>
+  <li><strong>Signals</strong>: <a href="#metrics">metrics</a> (counts and histograms), <a href="#logging">logs</a> (one JSON line per event) and <a href="#distributed-tracing">traces</a> (spans with a shared trace ID), all leaving the app through standard interfaces.</li>
+  <li><strong>Judgement</strong>: <a href="#slis">SLIs</a> computed from metrics, held against <a href="#slos">SLOs</a>, which define an <a href="#error-budgets">error budget</a>.</li>
+  <li><strong>Notification</strong>: burn-rate <a href="#alerts">alerts</a>, routed by Alertmanager to the right on-call person.</li>
+  <li><strong>Investigation</strong>: <a href="#monitoring">dashboards</a> for the known questions, and the <a href="#observability">observability</a> workflow (metrics → traces → logs) for the unknown ones.</li>
+</ol>
+
+<h3>Which tool answers which question</h3>
+<table>
+  <tr><th>Question</th><th>Answered by</th><th>Signal</th></tr>
+  <tr><td>Is this process alive? Should it get traffic?</td><td><code>/healthz</code>, <code>/readyz</code>, kubelet probes</td><td>probes</td></tr>
+  <tr><td>Are users getting what they need right now?</td><td>SLI and SLO dashboard</td><td>metrics</td></tr>
+  <tr><td>Is it bad enough to wake someone up?</td><td>burn-rate alert → Alertmanager → pager</td><td>metrics</td></tr>
+  <tr><td>Which route, version, region or pod is affected?</td><td>RED / golden-signal dashboard, split by label</td><td>metrics</td></tr>
+  <tr><td>Which hop in the request is slow or failing?</td><td>trace search, span waterfall</td><td>traces</td></tr>
+  <tr><td>What exactly went wrong in this request?</td><td>log search by <code>trace_id</code></td><td>logs</td></tr>
+  <tr><td>Can we keep shipping this week?</td><td>error budget remaining + policy</td><td>metrics</td></tr>
+</table>
+
+<h3>One incident, end to end</h3>
+<p>The checkout service has a 99.9% availability SLO over 30 days and the workbook's burn-rate alerts. The numbers follow from those: 20% errors is a burn rate of 200, and the 1-hour error ratio passes 1.44% after about 4.3 minutes (1.44 ÷ 20 × 60).</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 372" role="img" aria-label="Incident timeline. 14:00 deploy, probes pass. 14:01 20 percent of checkouts fail. 14:05 burn-rate alert condition true. 14:06 Alertmanager pages on-call. 14:08 dashboards show only the checkout route and only the new version. 14:10 a trace shows the charge card span failing at 500 milliseconds. 14:11 logs for that trace show context deadline exceeded. 14:13 rollback, errors back to baseline by 14:15.">
+  <path class="line" d="M80 24 V352"/>
+  <ellipse class="box ok" cx="80" cy="36" rx="6" ry="6"/>
+  <text x="66" y="40" text-anchor="end" class="title">14:00</text>
+  <text x="100" y="40">Deploy v2.3.1 (rolling update). Probes pass: pods are alive and ready.</text>
+  <rect class="box ok" x="640" y="22" width="130" height="26" rx="13"/>
+  <text x="705" y="40" text-anchor="middle" class="small">probes</text>
+  <ellipse class="box bad" cx="80" cy="78" rx="6" ry="6"/>
+  <text x="66" y="82" text-anchor="end" class="title">14:01</text>
+  <text x="100" y="82">20% of checkouts start failing with 502. Burn rate 200.</text>
+  <rect class="box bad" x="640" y="64" width="130" height="26" rx="13"/>
+  <text x="705" y="82" text-anchor="middle" class="small">metrics → SLI</text>
+  <ellipse class="box bad" cx="80" cy="120" rx="6" ry="6"/>
+  <text x="66" y="124" text-anchor="end" class="title">14:05</text>
+  <text x="100" y="124">1 h and 5 min error ratios both above 14.4 × 0.1%: alert fires.</text>
+  <rect class="box bad" x="640" y="106" width="130" height="26" rx="13"/>
+  <text x="705" y="124" text-anchor="middle" class="small">burn-rate alert</text>
+  <ellipse class="box accent" cx="80" cy="162" rx="6" ry="6"/>
+  <text x="66" y="166" text-anchor="end" class="title">14:06</text>
+  <text x="100" y="166">Alertmanager routes severity=page to the checkout on-call.</text>
+  <rect class="box muted" x="640" y="148" width="130" height="26" rx="13"/>
+  <text x="705" y="166" text-anchor="middle" class="small">Alertmanager</text>
+  <ellipse class="box accent" cx="80" cy="204" rx="6" ry="6"/>
+  <text x="66" y="208" text-anchor="end" class="title">14:08</text>
+  <text x="100" y="208">SLO panel: 3% of the budget gone. RED panel: only /checkout, only v2.3.1.</text>
+  <rect class="box muted" x="640" y="190" width="130" height="26" rx="13"/>
+  <text x="705" y="208" text-anchor="middle" class="small">dashboards</text>
+  <ellipse class="box accent" cx="80" cy="246" rx="6" ry="6"/>
+  <text x="66" y="250" text-anchor="end" class="title">14:10</text>
+  <text x="100" y="250">Trace search: the &quot;charge card&quot; span fails at exactly 500 ms.</text>
+  <rect class="box muted" x="640" y="232" width="130" height="26" rx="13"/>
+  <text x="705" y="250" text-anchor="middle" class="small">traces</text>
+  <ellipse class="box accent" cx="80" cy="288" rx="6" ry="6"/>
+  <text x="66" y="292" text-anchor="end" class="title">14:11</text>
+  <text x="100" y="292">Logs for that trace_id: context deadline exceeded, timeout 500ms.</text>
+  <rect class="box muted" x="640" y="274" width="130" height="26" rx="13"/>
+  <text x="705" y="292" text-anchor="middle" class="small">logs</text>
+  <ellipse class="box ok" cx="80" cy="330" rx="6" ry="6"/>
+  <text x="66" y="334" text-anchor="end" class="title">14:13</text>
+  <text x="100" y="334">Rollback to v2.3.0. Errors back to baseline by 14:15.</text>
+  <rect class="box ok" x="640" y="316" width="130" height="26" rx="13"/>
+  <text x="705" y="334" text-anchor="middle" class="small">rollback</text>
+</svg>
+<figcaption>Every step hands over to the next through something shared: the SLI's labels (route, version), then a trace ID, then the same trace ID in the logs. Note that the probes stayed green the whole time: they protect traffic, not correctness.</figcaption>
+</figure>
+<p>Cost: 14 minutes at burn rate 200 is 200 × 14 ÷ 60 ÷ 720 ≈ 6.5% of the month's budget. That's under the 20% postmortem threshold in the workbook's example policy, so the team does a short review instead. Its action item isn't "check payments in <code>/readyz</code>" (that would pull every pod out of rotation at once whenever the provider has a bad minute). It's a <a href="#canary-releases">canary</a> that sends 5% of traffic to the new version and rolls back automatically when the canary's SLI drops.</p>
+
+<h3>What to set up first</h3>
+<table>
+  <tr><th>Stage</th><th>Set up</th><th>Leave for later</th></tr>
+  <tr><td>One service, one or two engineers</td><td><code>/healthz</code> + <code>/readyz</code>; JSON logs to stdout; an external uptime check; request rate, errors and latency (from the platform or a histogram); one alert on user-facing errors</td><td>tracing, SLO tooling, a self-hosted stack</td></tr>
+  <tr><td>A small team, a few services</td><td>Prometheus + Grafana or a vendor; latency histograms per route; one availability and one latency SLO per user-facing service; burn-rate paging; an on-call rotation with runbooks; request IDs in logs</td><td>tail sampling, custom collector pipelines</td></tr>
+  <tr><td>Many services, several teams</td><td>OTel SDK everywhere plus a collector; traces with sampling; <code>trace_id</code> in every log line; SLOs per user journey; a signed error budget policy; alert routing per team</td><td>&ndash;</td></tr>
+  <tr><td>Large organisation</td><td>a platform team owning the pipeline; cardinality and cost budgets per team; regular SLO reviews; tail-based sampling that keeps errors and slow traces</td><td>&ndash;</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>One Go service, instrumented end to end</strong>: a server span per request (continuing the caller's <code>traceparent</code>), a child span for the payment call, a Prometheus histogram labelled by route and status code, slog lines carrying <code>trace_id</code> and <code>span_id</code>, and separate liveness and readiness endpoints.</p>
+<pre><code>package main
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"os"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
+)
+
+var (
+	tracer = otel.Tracer("checkout")
+	ready  atomic.Bool
+
+	// Metrics -&gt; SLIs: good = code &lt; 500 and duration under the SLO's 0.3 s bucket.
+	reqDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "HTTP request latency by route and status code.",
+		Buckets: []float64{0.05, 0.1, 0.3, 1, 3},
+	}, []string{"route", "code"})
+)
+
+// traceHandler stamps trace_id and span_id on every log line written with a
+// context, so a log search can jump to the trace and back.
+type traceHandler struct{ slog.Handler }
+
+func (h traceHandler) Handle(ctx context.Context, r slog.Record) error {
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		r.AddAttrs(
+			slog.String("trace_id", sc.TraceID().String()),
+			slog.String("span_id", sc.SpanID().String()),
+		)
+	}
+	return h.Handler.Handle(ctx, r)
+}
+func (h traceHandler) WithAttrs(a []slog.Attr) slog.Handler {
+	return traceHandler{h.Handler.WithAttrs(a)}
+}
+func (h traceHandler) WithGroup(n string) slog.Handler { return traceHandler{h.Handler.WithGroup(n)} }
+
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.code = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+// instrument gives every request one server span, one histogram sample and
+// one log line, all sharing the same trace ID.
+func instrument(route string, next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Continue the caller's trace if it sent a W3C traceparent header.
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := tracer.Start(ctx, r.Method+" "+route, trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+
+		start := time.Now()
+		rec := &amp;statusRecorder{ResponseWriter: w, code: http.StatusOK}
+		next(rec, r.WithContext(ctx))
+		elapsed := time.Since(start)
+
+		span.SetAttributes(attribute.Int("http.response.status_code", rec.code))
+		if rec.code &gt;= 500 {
+			span.SetStatus(codes.Error, http.StatusText(rec.code))
+		}
+		reqDuration.WithLabelValues(route, strconv.Itoa(rec.code)).Observe(elapsed.Seconds())
+		slog.InfoContext(ctx, "request", "method", r.Method, "route", route,
+			"status", rec.code, "duration_ms", elapsed.Milliseconds())
+	})
+}
+
+// charge calls the payment provider. Replaced in tests.
+var charge = func(ctx context.Context) error { return nil }
+
+func checkout(w http.ResponseWriter, r *http.Request) {
+	ctx, span := tracer.Start(r.Context(), "charge card")
+	defer span.End()
+	if err := charge(ctx); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "charge failed")
+		slog.ErrorContext(ctx, "charge failed", "provider", "acme-pay", "err", err)
+		http.Error(w, "payment failed", http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("POST /checkout", instrument("/checkout", checkout))
+	mux.Handle("GET /metrics", promhttp.Handler()) // scraped by Prometheus
+	// Liveness: the process can serve HTTP. No dependency checks here.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	// Readiness: send me traffic. False while starting and while draining.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	return mux
+}
+
+func main() {
+	slog.SetDefault(slog.New(traceHandler{slog.NewJSONHandler(os.Stdout, nil)}))
+
+	// Spans go to the OpenTelemetry Collector. Endpoint and service name come
+	// from OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_SERVICE_NAME.
+	ctx := context.Background()
+	exp, err := otlptracehttp.New(ctx)
+	if err != nil {
+		slog.Error("otlp exporter", "err", err)
+		os.Exit(1)
+	}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exp))
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	ready.Store(true) // after warm-up; set false again when draining on SIGTERM
+	srv := &amp;http.Server{Addr: ":8080", Handler: newMux(), ReadHeaderTimeout: 5 * time.Second}
+	if err := srv.ListenAndServe(); err != nil {
+		slog.Error("listen", "err", err)
+	}
+	_ = tp.Shutdown(ctx) // flush the last spans
+}</code></pre>
+<p>Real output from an <code>httptest</code> run: readiness before and after warm-up, one request that arrives with a <code>traceparent</code> header, and one where the payment call fails. Note that the first request keeps the caller's trace ID, and the error line carries the child span's ID while sharing the request's trace ID:</p>
+<pre><code>GET /readyz -&gt; 503
+GET /readyz -&gt; 200
+GET /healthz -&gt; 200
+{"time":"2026-11-08T12:35:36.098847Z","level":"INFO","msg":"request","method":"POST","route":"/checkout","status":201,"duration_ms":0,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"1b61aad348821874"}
+{"time":"2026-11-08T12:35:36.09897Z","level":"ERROR","msg":"charge failed","provider":"acme-pay","err":"upstream timeout after 2s","trace_id":"25cc8acd63525219bb9e5d926c117153","span_id":"427c2e3f86c748e2"}
+{"time":"2026-11-08T12:35:36.098984Z","level":"INFO","msg":"request","method":"POST","route":"/checkout","status":502,"duration_ms":0,"trace_id":"25cc8acd63525219bb9e5d926c117153","span_id":"d397dbfaa1316b7e"}</code></pre>
+<p>And the scrape that feeds the SLI (trimmed to the 0.3 s bucket the latency SLO uses, plus the totals):</p>
+<pre><code># HELP http_request_duration_seconds HTTP request latency by route and status code.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{code="201",route="/checkout",le="0.3"} 1
+http_request_duration_seconds_sum{code="201",route="/checkout"} 2.625e-06
+http_request_duration_seconds_count{code="201",route="/checkout"} 1
+http_request_duration_seconds_bucket{code="502",route="/checkout",le="0.3"} 1
+http_request_duration_seconds_sum{code="502",route="/checkout"} 1.5166e-05
+http_request_duration_seconds_count{code="502",route="/checkout"} 1</code></pre>
+<p>From here the sibling pages take over: <a href="#slis">SLIs</a> turns these series into good/valid ratios, <a href="#error-budgets">Error Budgets</a> turns the ratios into burn-rate alerts, and the trace and log lines above are what the on-call engineer searches at 14:10 and 14:11.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Green probes, red users.</strong> Probes answer "should this pod get traffic?", not "does checkout work?". The incident above passed every probe. User-facing correctness is the SLI's job.</li>
+  <li><strong>Signals that can't be joined.</strong> Logs with a request ID, traces with a trace ID and metrics with neither means manual timestamp matching. Put <code>trace_id</code> in every log line and keep label names (<code>service</code>, <code>route</code>, <code>version</code>) the same across all three.</li>
+  <li><strong>Head sampling drops the evidence.</strong> Keeping 1% of traces at the SDK keeps 1% of the failing ones too. Sample in the collector after the trace completes (tail sampling) and keep all errors and slow traces.</li>
+  <li><strong>Alerting on causes.</strong> CPU at 90% or one pod restarting pages people for things users don't feel. Page on SLO burn; send causes to dashboards and tickets.</li>
+  <li><strong>Cardinality and cost creep.</strong> A <code>user_id</code> label on a histogram, or DEBUG logs left on, can cost more than the service itself. Give each team a budget and look at the bill monthly.</li>
+  <li><strong>Measuring only inside the app.</strong> Requests that fail at the load balancer, or never arrive, don't show up in the app's own metrics. Add the load balancer's metrics or a synthetic check to the SLI.</li>
+  <li><strong>Building the whole stack on day one.</strong> A three-person team doesn't need a self-hosted Loki, Tempo and Mimir. Start with the first row of the table above and add pieces as real questions go unanswered.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Probes keep traffic correct; SLIs and SLOs say whether users are OK; error budgets and burn-rate alerts decide when to page.</li>
+  <li>Investigate in one direction: SLO → dashboard split by label → trace → logs for that trace.</li>
+  <li>Shared identifiers (trace ID, consistent labels) are what turn three tools into one system.</li>
+  <li>Instrument with open standards (OTel, Prometheus format, JSON logs) so the back end can change without touching the app.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#observability">Observability</a> · <a href="#slos">SLOs</a> · <a href="#error-budgets">Error Budgets</a> · <a href="#alerts">Alerts</a> · <a href="#distributed-tracing">Distributed Tracing</a> · <a href="#on-call">On-Call</a></p>
+`;
+
