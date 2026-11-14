@@ -1226,3 +1226,422 @@ curl -X POST "https://api.fastly.com/service/$SERVICE_ID/purge/product-42" &#92;
 
 <p><strong>Related:</strong> <a href="#caching">Caching</a> · <a href="#edge-caching">Edge Caching</a> · <a href="#cdn">CDN</a> · <a href="#race-conditions">Race Conditions</a> · <a href="#event-driven-architecture">Event-Driven Architecture</a> · <a href="#real-world-caching-stack">Real-World Caching Stack</a></p>
 `;
+CONTENT["real-world-caching-stack"] = `
+<p class="tldr"><strong>TL;DR</strong>: A real site doesn't have one cache. It has a chain of them: the browser, the CDN edge, an origin shield, the reverse proxy, a small in-process cache in each app pod, Redis, and finally the database. Each layer catches what the one before it missed. Most of the engineering is choosing what each layer may keep and for how long, and how a change in the database reaches every layer. This page wires one e-commerce product endpoint through all of them and walks through a deploy and a flash sale.</p>
+
+<h2>Why combine them at all?</h2>
+<p>Each layer is good at something different. The browser is free and instant but holds data for one user, and you can't purge it. The <a href="#cdn">CDN</a> is close to every user and absorbs floods, but it's shared, so it must never see personal data. Redis is shared by all your pods and easy to invalidate, but every read is still a network hop. An in-process cache is the fastest of all but every pod has its own copy, so it can only hold data that may be a second or two stale. No single layer gives you speed, low origin load and fresh data at once. The chain does, if every layer follows the same rules: the database is the truth, everything else is a copy with a lifetime and a way to be invalidated.</p>
+<p>The risk is the opposite problem. Five layers with five TTLs and no plan for invalidation give you a site where a price change shows up "sometime in the next 20 minutes", and nobody can say which layer is still serving the old one.</p>
+
+<h2>How it works: one request through the stack</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 348" role="img" aria-label="Seven cache layers in order: browser, CDN edge, origin shield, reverse proxy, app in-process LRU, Redis, database, each with a typical cost. Below, four requests stop at different layers: a repeat visit for a fingerprinted script stops in the browser, a new visitor stops at the edge, a request just after a purge passes the edge, shield, proxy and in-process cache and is answered by Redis, and the first read after a price change goes all the way to the database.">
+  <defs><marker id="arr-rcs-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="10" y="40" width="92" height="96" rx="10"/>
+  <text x="56" y="62" text-anchor="middle" class="title">Browser</text>
+  <text x="56" y="84" text-anchor="middle" class="small">HTTP cache</text>
+  <text x="56" y="101" text-anchor="middle" class="small">per device</text>
+  <text x="56" y="118" text-anchor="middle" class="small">hit: 0 ms</text>
+  <path class="line" d="M102 88 H120" marker-end="url(#arr-rcs-1)"/>
+  <rect class="box accent" x="122" y="40" width="92" height="96" rx="10"/>
+  <text x="168" y="62" text-anchor="middle" class="title">CDN edge</text>
+  <text x="168" y="84" text-anchor="middle" class="small">nearest PoP</text>
+  <text x="168" y="101" text-anchor="middle" class="small">shared by many</text>
+  <text x="168" y="118" text-anchor="middle" class="small">~10–30 ms</text>
+  <path class="line" d="M214 88 H232" marker-end="url(#arr-rcs-1)"/>
+  <rect class="box accent" x="234" y="40" width="92" height="96" rx="10"/>
+  <text x="280" y="62" text-anchor="middle" class="title">Shield</text>
+  <text x="280" y="84" text-anchor="middle" class="small">one PoP near</text>
+  <text x="280" y="101" text-anchor="middle" class="small">the origin</text>
+  <text x="280" y="118" text-anchor="middle" class="small">+10–80 ms</text>
+  <path class="line" d="M326 88 H344" marker-end="url(#arr-rcs-1)"/>
+  <rect class="box" x="346" y="40" width="92" height="96" rx="10"/>
+  <text x="392" y="62" text-anchor="middle" class="title">Proxy</text>
+  <text x="392" y="84" text-anchor="middle" class="small">nginx / LB</text>
+  <text x="392" y="101" text-anchor="middle" class="small">micro-cache</text>
+  <text x="392" y="118" text-anchor="middle" class="small">+1 ms</text>
+  <path class="line" d="M438 88 H456" marker-end="url(#arr-rcs-1)"/>
+  <rect class="box" x="458" y="40" width="92" height="96" rx="10"/>
+  <text x="504" y="62" text-anchor="middle" class="title">App LRU</text>
+  <text x="504" y="84" text-anchor="middle" class="small">in-process</text>
+  <text x="504" y="101" text-anchor="middle" class="small">per pod</text>
+  <text x="504" y="118" text-anchor="middle" class="small">~1 µs</text>
+  <path class="line" d="M550 88 H568" marker-end="url(#arr-rcs-1)"/>
+  <rect class="box" x="570" y="40" width="92" height="96" rx="10"/>
+  <text x="616" y="62" text-anchor="middle" class="title">Redis</text>
+  <text x="616" y="84" text-anchor="middle" class="small">shared by pods</text>
+  <text x="616" y="101" text-anchor="middle" class="small">network hop</text>
+  <text x="616" y="118" text-anchor="middle" class="small">~0.5–1 ms</text>
+  <path class="line" d="M662 88 H680" marker-end="url(#arr-rcs-1)"/>
+  <rect class="box ok" x="682" y="40" width="92" height="96" rx="10"/>
+  <text x="728" y="62" text-anchor="middle" class="title">Database</text>
+  <text x="728" y="84" text-anchor="middle" class="small">source of</text>
+  <text x="728" y="101" text-anchor="middle" class="small">truth</text>
+  <text x="728" y="118" text-anchor="middle" class="small">~2–50 ms</text>
+  <text x="390" y="22" text-anchor="middle" class="small">client side · edge network · your region (shield ideally near origin) · inside the service</text>
+  <text x="20" y="172">Repeat visit, app.3f9a1c.js: browser hit, no request sent at all · user waits 0 ms</text>
+  <ellipse class="box ok" cx="56" cy="188" rx="7" ry="7"/>
+  <text x="68" y="192" class="small">hit</text>
+  <text x="20" y="216">New visitor, product page: edge hit · user waits ~20 ms</text>
+  <path class="line accent" d="M56 232 H168"/>
+  <ellipse class="box muted" cx="56" cy="232" rx="5" ry="5"/>
+  <ellipse class="box ok" cx="168" cy="232" rx="7" ry="7"/>
+  <text x="180" y="236" class="small">hit</text>
+  <text x="20" y="260">Just after a purge: edge, shield, proxy and LRU miss; Redis has it · user waits ~100 ms</text>
+  <path class="line accent" d="M56 276 H616"/>
+  <ellipse class="box muted" cx="56" cy="276" rx="5" ry="5"/>
+  <ellipse class="box muted" cx="168" cy="276" rx="5" ry="5"/>
+  <ellipse class="box muted" cx="280" cy="276" rx="5" ry="5"/>
+  <ellipse class="box muted" cx="392" cy="276" rx="5" ry="5"/>
+  <ellipse class="box muted" cx="504" cy="276" rx="5" ry="5"/>
+  <ellipse class="box ok" cx="616" cy="276" rx="7" ry="7"/>
+  <text x="628" y="280" class="small">hit</text>
+  <text x="20" y="304">First read after a price change: Redis key deleted, DB query · user waits ~130 ms</text>
+  <path class="line accent" d="M56 320 H728"/>
+  <ellipse class="box muted" cx="56" cy="320" rx="5" ry="5"/>
+  <ellipse class="box muted" cx="168" cy="320" rx="5" ry="5"/>
+  <ellipse class="box muted" cx="280" cy="320" rx="5" ry="5"/>
+  <ellipse class="box muted" cx="392" cy="320" rx="5" ry="5"/>
+  <ellipse class="box muted" cx="504" cy="320" rx="5" ry="5"/>
+  <ellipse class="box muted" cx="616" cy="320" rx="5" ry="5"/>
+  <ellipse class="box ok" cx="728" cy="320" rx="7" ry="7"/>
+  <text x="716" y="314" text-anchor="end" class="small">answer</text>
+</svg>
+<figcaption>Every request goes left to right until some layer has a fresh copy. The costs are rough orders of magnitude for a user far from your region; measure your own. A hit at a layer means none of the layers to its right do any work.</figcaption>
+</figure>
+
+<p>Each sibling page owns one part of this picture:</p>
+<ol>
+  <li><strong>Where caches live and how they fill</strong>: <a href="#caching">Caching</a> covers cache-aside, eviction, hit-ratio math, stampedes and hot keys.</li>
+  <li><strong>The edge network</strong>: <a href="#cdn">CDN</a> covers PoPs, how users reach the nearest one, origin shield and tiered caching.</li>
+  <li><strong>What a shared HTTP cache may store</strong>: <a href="#edge-caching">Edge Caching</a> covers <code>Cache-Control</code>, <code>Vary</code>, <code>ETag</code> and 304s.</li>
+  <li><strong>Keeping copies honest</strong>: <a href="#cache-invalidation">Cache Invalidation</a> covers delete-on-write, versioned keys, purges and the races between them.</li>
+</ol>
+
+<h3>What to cache where: an e-commerce site</h3>
+<table>
+  <tr><th>Content</th><th>Browser</th><th>CDN edge</th><th>Redis / in-process</th><th>How a change gets out</th></tr>
+  <tr><td>JS, CSS, images with a hash in the name</td><td><code>public, max-age=31536000, immutable</code></td><td>same, 1 year</td><td>&ndash;</td><td>new file name; never purge</td></tr>
+  <tr><td>HTML pages (home, category)</td><td><code>no-cache</code> + <code>ETag</code> (always revalidate)</td><td>60 s + <code>stale-while-revalidate</code></td><td>rendered fragments, minutes</td><td>purge on deploy or edit</td></tr>
+  <tr><td>Product details (name, text, images)</td><td><code>no-cache</code> + <code>ETag</code></td><td>5 min + SWR + <code>stale-if-error</code></td><td>Redis 10 min</td><td>delete Redis key + purge tag <code>product-42</code></td></tr>
+  <tr><td>Price and stock shown on the page</td><td><code>no-cache</code></td><td>1&ndash;5 s, or not at all</td><td>Redis, deleted on write; in-process 1 s</td><td>short TTL; checkout always re-reads the DB</td></tr>
+  <tr><td>Search and category listings</td><td><code>no-cache</code></td><td>60 s, normalized query in the key</td><td>Redis 1&ndash;5 min</td><td>TTL; tolerate a minute of staleness</td></tr>
+  <tr><td>Cart</td><td><code>private, no-store</code></td><td><strong>never</strong></td><td>Redis as the store, not as a cache</td><td>it <em>is</em> the data</td></tr>
+  <tr><td>User profile, orders</td><td><code>private, no-cache</code></td><td><strong>never</strong></td><td>Redis per user, short TTL</td><td>delete on update</td></tr>
+  <tr><td>Checkout, payment, errors (5xx)</td><td><code>no-store</code></td><td>never</td><td>never</td><td>&ndash;</td></tr>
+</table>
+<p>The rule of thumb: the more people share a response and the less it changes, the further left it can be cached. Anything tied to a logged-in user stops at the browser (<code>private</code>) or isn't cached at all.</p>
+
+<h3>A deploy, step by step</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 326" role="img" aria-label="Deploy timeline. Build emits fingerprinted asset names. Upload new assets first and keep the old ones. Deploy new HTML with no-cache and a new ETag. Purge HTML at the CDN; assets need no purge. Next view: the browser revalidates HTML and gets new asset links, which miss once per edge then hit for a year. Old tabs still load the old script, which still exists. After a week, delete assets nothing references.">
+  <path class="line" d="M90 24 V306"/>
+  <ellipse class="box accent" cx="90" cy="38" rx="6" ry="6"/>
+  <text x="76" y="42" text-anchor="end" class="title">build</text>
+  <text x="106" y="42">Bundler emits app.3f9a1c.js and app.8d41e0.css: hash in the name.</text>
+  <rect class="box muted" x="640" y="24" width="130" height="26" rx="13"/>
+  <text x="705" y="42" text-anchor="middle" class="small">fingerprint</text>
+  <ellipse class="box accent" cx="90" cy="80" rx="6" ry="6"/>
+  <text x="76" y="84" text-anchor="end" class="title">upload</text>
+  <text x="106" y="84">Upload new assets first. The old app.9b2e77.js stays where it is.</text>
+  <rect class="box muted" x="640" y="66" width="130" height="26" rx="13"/>
+  <text x="705" y="84" text-anchor="middle" class="small">origin / bucket</text>
+  <ellipse class="box accent" cx="90" cy="122" rx="6" ry="6"/>
+  <text x="76" y="126" text-anchor="end" class="title">deploy</text>
+  <text x="106" y="126">New HTML goes live with Cache-Control: no-cache and a new ETag.</text>
+  <rect class="box accent" x="640" y="108" width="130" height="26" rx="13"/>
+  <text x="705" y="126" text-anchor="middle" class="small">HTML only</text>
+  <ellipse class="box accent" cx="90" cy="164" rx="6" ry="6"/>
+  <text x="76" y="168" text-anchor="end" class="title">purge</text>
+  <text x="106" y="168">Purge the HTML URLs at the CDN. Assets need no purge.</text>
+  <rect class="box accent" x="640" y="150" width="130" height="26" rx="13"/>
+  <text x="705" y="168" text-anchor="middle" class="small">CDN</text>
+  <ellipse class="box ok" cx="90" cy="206" rx="6" ry="6"/>
+  <text x="76" y="210" text-anchor="end" class="title">browse</text>
+  <text x="106" y="210">Browser revalidates HTML, gets new links; each asset misses once.</text>
+  <rect class="box ok" x="640" y="192" width="130" height="26" rx="13"/>
+  <text x="705" y="210" text-anchor="middle" class="small">1 year of hits</text>
+  <ellipse class="box ok" cx="90" cy="248" rx="6" ry="6"/>
+  <text x="76" y="252" text-anchor="end" class="title">old tab</text>
+  <text x="106" y="252">A tab opened before the deploy still loads app.9b2e77.js. It exists.</text>
+  <rect class="box ok" x="640" y="234" width="130" height="26" rx="13"/>
+  <text x="705" y="252" text-anchor="middle" class="small">no 404s</text>
+  <ellipse class="box accent" cx="90" cy="290" rx="6" ry="6"/>
+  <text x="76" y="294" text-anchor="end" class="title">cleanup</text>
+  <text x="106" y="294">A week later, delete assets that no live HTML references.</text>
+  <rect class="box muted" x="640" y="276" width="130" height="26" rx="13"/>
+  <text x="705" y="294" text-anchor="middle" class="small">storage</text>
+</svg>
+<figcaption>Fingerprinted names make assets safe to cache forever, because a new version is a new URL. Only the small HTML file needs revalidation or a purge. Order matters: assets before HTML, and old assets kept, or some users load HTML that points at files that don't exist yet or anymore.</figcaption>
+</figure>
+
+<h2>A flash sale, with numbers</h2>
+<p>Say a sale on product 42 starts at 12:00. The product page and its stock widget together get 100,000 requests per second, spread over 100 edge PoPs. Add-to-cart, a POST that can't be cached, gets 5,000 per second. There are 40 app pods. At 12:00:00 an admin job sets the sale price, which deletes <code>product:42</code> in Redis and purges the tag <code>product-42</code> at the CDN, at the worst possible moment.</p>
+<ul>
+  <li><strong>The edge.</strong> The page has <code>max-age=300, stale-while-revalidate=60</code> for the CDN, and the stock widget a 1 s TTL. The shield collapses refetches, so the origin sees about one request per URL per refresh: around 2 per second instead of 100,000. If the CDN supports a soft purge (mark stale instead of delete), users keep getting the old page for the second it takes to refetch, instead of all waiting on the origin.</li>
+  <li><strong>The stampede.</strong> With the Redis key gone, every add-to-cart request misses. At 5,000 per second and a 20 ms query, about 100 identical queries would be in flight at once. With <code>singleflight</code> each pod sends one, so at most 40, and then Redis is warm again. Better still: the job that changed the price writes the new value back right after the delete, so the first reader doesn't pay.</li>
+  <li><strong>The hot key.</strong> Once warm, all 5,000 reads per second go to the one Redis shard that holds <code>product:42</code>. A 1-second in-process cache in each pod cuts that to 40 reads per second (one per pod per second), at the cost of up to 1 s of extra staleness.</li>
+  <li><strong>What the DB does instead.</strong> It takes the ~500 order writes per second, which is the work only it can do. Checkout reads the price from the DB inside the order transaction; a cached price is for display, never for charging.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Log-scale bar chart, requests per second with and without each cache layer during the flash sale. Origin requests for the page and stock widget: 100,000 without the CDN, 2 with edge, shield and stale-while-revalidate. Redis reads of product 42: 5,000 without an in-process cache, 40 with a one-second cache per pod. Identical database queries in flight at the refill: about 100 without singleflight, at most 40 with it.">
+  <text x="20" y="44" class="title">Origin requests/s</text>
+  <text x="20" y="62" class="small">page + stock widget</text>
+  <rect class="box bad" x="300" y="28" width="450" height="22" rx="3"/>
+  <rect class="box ok" x="300" y="56" width="27" height="22" rx="3"/>
+  <text x="742" y="43" text-anchor="end" class="small">100,000 without CDN</text>
+  <text x="335" y="71" class="small">2 with edge + shield + SWR</text>
+  <text x="20" y="122" class="title">Redis reads/s</text>
+  <text x="20" y="140" class="small">of product:42 (hot key)</text>
+  <rect class="box bad" x="300" y="106" width="332" height="22" rx="3"/>
+  <rect class="box ok" x="300" y="134" width="144" height="22" rx="3"/>
+  <text x="624" y="121" text-anchor="end" class="small">5,000 without LRU</text>
+  <text x="452" y="149" class="small">40 with 1 s LRU per pod</text>
+  <text x="20" y="200" class="title">Identical DB queries</text>
+  <text x="20" y="218" class="small">in flight at the refill</text>
+  <rect class="box bad" x="300" y="184" width="180" height="22" rx="3"/>
+  <rect class="box ok" x="300" y="212" width="144" height="22" rx="3"/>
+  <text x="488" y="199" class="small">~100 without singleflight</text>
+  <text x="452" y="227" class="small">≤ 40 with singleflight</text>
+  <path class="line" d="M300 262 H750"/>
+  <path class="line" d="M300 262 V268"/>
+  <text x="300" y="282" text-anchor="middle" class="small">1</text>
+  <path class="line" d="M390 262 V268"/>
+  <text x="390" y="282" text-anchor="middle" class="small">10</text>
+  <path class="line" d="M480 262 V268"/>
+  <text x="480" y="282" text-anchor="middle" class="small">100</text>
+  <path class="line" d="M570 262 V268"/>
+  <text x="570" y="282" text-anchor="middle" class="small">1k</text>
+  <path class="line" d="M660 262 V268"/>
+  <text x="660" y="282" text-anchor="middle" class="small">10k</text>
+  <path class="line" d="M750 262 V268"/>
+  <text x="750" y="282" text-anchor="middle" class="small">100k</text>
+  <text x="20" y="282" class="small">per second, log scale</text>
+</svg>
+<figcaption>Log scale. Each layer removes load for the one behind it: the edge for the origin, the in-process cache for Redis, <code>singleflight</code> for the database.</figcaption>
+</figure>
+
+<h3>How to measure it</h3>
+<p>A cache you don't measure is a guess. Track the hit ratio per layer, plus origin load and the latency of misses, as <a href="#metrics">metrics</a> on the same dashboard.</p>
+<table>
+  <tr><th>Layer</th><th>How you see hits and misses</th><th>Watch</th></tr>
+  <tr><td>Browser</td><td>Real-user monitoring: the Resource Timing API (a <code>transferSize</code> of 0 usually means it came from the browser cache)</td><td>repeat-visit load time</td></tr>
+  <tr><td>CDN edge and shield</td><td>CDN logs and analytics; response headers such as <code>CF-Cache-Status</code> on Cloudflare (<code>HIT</code>, <code>MISS</code>, <code>EXPIRED</code>, <code>STALE</code>, <code>UPDATING</code>, &hellip;) or the standard <code>Cache-Status</code> header (RFC 9211), plus <code>Age</code></td><td>hit ratio by bytes and by requests, origin requests per second</td></tr>
+  <tr><td>Reverse proxy</td><td>nginx <code>$upstream_cache_status</code> in the access log</td><td>hit ratio per route</td></tr>
+  <tr><td>App in-process and Redis</td><td>your own counter, e.g. <code>cache_requests_total{layer, result}</code></td><td>hit ratio, Redis latency, evictions, memory</td></tr>
+  <tr><td>Database</td><td>queries per second, slow-query log</td><td>reads that should have been cache hits</td></tr>
+</table>
+<pre><code># hit ratio per layer, over 5 minutes
+sum by (layer) (rate(cache_requests_total{result="hit"}[5m]))
+  /
+sum by (layer) (rate(cache_requests_total[5m]))</code></pre>
+<p>Read the ratios together. An edge hit ratio of 95% sounds good, but if the 5% that misses is your heaviest page, the origin still does most of the work. That's why byte hit ratio and origin requests per second matter as much as the request hit ratio.</p>
+
+<h2>Example</h2>
+<p><strong>One product endpoint, cached at every layer.</strong> The handler tells browsers to always revalidate (<code>Cache-Control: no-cache</code>) and tells the CDN to keep it for 5 minutes with <a href="#edge-caching">stale-while-revalidate and stale-if-error</a>, through <code>CDN-Cache-Control</code> (RFC 9213; Cloudflare, for example, uses it for its own cache and passes <code>Cache-Control</code> on to the browser). It sets an <code>ETag</code> from the product's version and a tag for purging. Behind it, Redis cache-aside with <code>singleflight</code> and a jittered TTL. The update path writes the DB, deletes the Redis key and purges the CDN tag, in that order (see <a href="#cache-invalidation">Cache Invalidation</a> for why delete beats set).</p>
+<pre><code>package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand/v2"
+	"net/http"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
+)
+
+type Product struct {
+	ID         string &#96;json:"id"&#96;
+	Name       string &#96;json:"name"&#96;
+	PriceCents int64  &#96;json:"price_cents"&#96;
+	Version    int64  &#96;json:"version"&#96; // bumped on every write; feeds the ETag
+}
+
+var errNotFound = errors.New("not found")
+
+// DB (in db.go) stands in for Postgres: Product(ctx, id) and SetPrice(ctx, id, cents),
+// which bumps Version. It counts Queries.
+
+type Server struct {
+	db    *DB
+	rdb   *redis.Client
+	group singleflight.Group
+	ttl   time.Duration
+	purge func(ctx context.Context, tag string) error // CDN purge-by-tag API call
+}
+
+func cacheKey(id string) string { return "product:" + id }
+
+// load is cache-aside: Redis first; on a miss, one DB query per key per pod
+// (singleflight), then fill Redis with a jittered TTL.
+func (s *Server) load(ctx context.Context, id string) (Product, string, error) {
+	key := cacheKey(id)
+	b, err := s.rdb.Get(ctx, key).Bytes()
+	if err == nil {
+		var p Product
+		if json.Unmarshal(b, &amp;p) == nil {
+			return p, "redis", nil
+		}
+	} else if !errors.Is(err, redis.Nil) {
+		slog.Warn("redis get failed, reading db", "key", key, "err", err)
+	}
+
+	v, err, _ := s.group.Do(key, func() (any, error) {
+		// Detach from the first caller's cancellation: the others share this result.
+		ctx := context.WithoutCancel(ctx)
+		p, err := s.db.Product(ctx, id)
+		if err != nil {
+			return Product{}, err
+		}
+		b, _ := json.Marshal(p)
+		ttl := s.ttl + rand.N(s.ttl/10) // jitter so hot keys don't expire together
+		if err := s.rdb.Set(ctx, key, b, ttl).Err(); err != nil {
+			slog.Warn("redis set failed", "key", key, "err", err)
+		}
+		return p, nil
+	})
+	if err != nil {
+		return Product{}, "", err
+	}
+	return v.(Product), "db", nil
+}
+
+func (s *Server) getProduct(w http.ResponseWriter, r *http.Request) {
+	p, src, err := s.load(r.Context(), r.PathValue("id"))
+	h := w.Header()
+	switch {
+	case errors.Is(err, errNotFound):
+		h.Set("Cache-Control", "public, max-age=30") // short negative cache
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	case err != nil:
+		h.Set("Cache-Control", "no-store") // never cache a 5xx
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	etag := fmt.Sprintf(&#96;"p%s-v%d"&#96;, p.ID, p.Version)
+	// Browsers revalidate every time (cheap 304s); the CDN keeps it 5 min and
+	// serves stale while it refetches, or for a day if the origin is down.
+	h.Set("Cache-Control", "no-cache")
+	h.Set("CDN-Cache-Control", "max-age=300, stale-while-revalidate=60, stale-if-error=86400")
+	h.Set("Surrogate-Key", "product-"+p.ID) // tag for purge; Cloudflare calls it Cache-Tag
+	h.Set("ETag", etag)
+	h.Set("X-Served-From", src)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	h.Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(p)
+}
+
+func (s *Server) setPrice(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		PriceCents int64 &#96;json:"price_cents"&#96;
+	}
+	if err := json.NewDecoder(r.Body).Decode(&amp;in); err != nil || in.PriceCents &lt;= 0 {
+		http.Error(w, "bad price", http.StatusBadRequest)
+		return
+	}
+	id := r.PathValue("id")
+	p, err := s.db.SetPrice(r.Context(), id, in.PriceCents) // 1. source of truth first
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	// 2. delete (not set) the Redis key; the next read refills it.
+	if err := s.rdb.Del(r.Context(), cacheKey(id)).Err(); err != nil {
+		slog.Error("redis del failed; TTL will expire it", "id", id, "err", err)
+	}
+	// 3. purge every CDN object tagged with this product.
+	if err := s.purge(r.Context(), "product-"+id); err != nil {
+		slog.Error("cdn purge failed; edge serves old price until max-age", "id", id, "err", err)
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(p)
+}
+
+func (s *Server) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /products/{id}", s.getProduct)
+	mux.HandleFunc("POST /products/{id}/price", s.setPrice)
+	return mux
+}
+
+func main() {
+	s := &amp;Server{
+		db:    &amp;DB{rows: map[string]Product{"42": {ID: "42", Name: "Trail shoe", PriceCents: 12900, Version: 1}}},
+		rdb:   redis.NewClient(&amp;redis.Options{Addr: "localhost:6379"}),
+		ttl:   10 * time.Minute,
+		purge: func(ctx context.Context, tag string) error { return nil },
+	}
+	http.ListenAndServe(":8080", s.routes())
+}</code></pre>
+<p>Real output from an <code>httptest</code> run against <code>miniredis</code>: 100 concurrent requests on a cold cache, a normal read, a conditional read, a price change, and a read with the old <code>ETag</code>:</p>
+<pre><code>100 concurrent cold requests: db queries=1, served from map[db:100]
+redis TTL product:42 = 10m47s
+
+GET /products/42
+200 OK
+Cache-Control: no-cache
+CDN-Cache-Control: max-age=300, stale-while-revalidate=60, stale-if-error=86400
+Surrogate-Key: product-42
+ETag: "p42-v1"
+X-Served-From: redis
+body: "{&#92;"id&#92;":&#92;"42&#92;",&#92;"name&#92;":&#92;"Trail shoe&#92;",&#92;"price_cents&#92;":12900,&#92;"version&#92;":1}"
+
+GET /products/42  (If-None-Match: "p42-v1")
+304 Not Modified
+Cache-Control: no-cache
+CDN-Cache-Control: max-age=300, stale-while-revalidate=60, stale-if-error=86400
+Surrogate-Key: product-42
+ETag: "p42-v1"
+X-Served-From: redis
+body: ""
+CDN purge tag: product-42
+
+POST /products/42/price
+200 OK
+Cache-Control: no-store
+body: "{&#92;"id&#92;":&#92;"42&#92;",&#92;"name&#92;":&#92;"Trail shoe&#92;",&#92;"price_cents&#92;":9900,&#92;"version&#92;":2}"
+redis has product:42 after update: false
+
+GET /products/42  (If-None-Match: "p42-v1")
+200 OK
+Cache-Control: no-cache
+CDN-Cache-Control: max-age=300, stale-while-revalidate=60, stale-if-error=86400
+Surrogate-Key: product-42
+ETag: "p42-v2"
+X-Served-From: db
+body: "{&#92;"id&#92;":&#92;"42&#92;",&#92;"name&#92;":&#92;"Trail shoe&#92;",&#92;"price_cents&#92;":9900,&#92;"version&#92;":2}"
+db queries total: 2</code></pre>
+<p>Things to notice: 100 cold requests cost 1 query. The 304 has no body but still carries the caching headers, so the CDN and browser refresh their copy's lifetime. After the update the old <code>ETag</code> no longer matches, so the client gets the new price with <code>v2</code>. The 304 still read Redis: conditional requests save bandwidth and rendering, not the lookup. In production, the CDN answers most of those itself.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Caching errors.</strong> A 500 or an empty result cached for 5 minutes at the edge turns a 2-second blip into a 5-minute outage. Send <code>no-store</code> on 5xx, cache 404s briefly at most, and check what your CDN does by default with error codes.</li>
+  <li><strong>A personalized page leaking.</strong> A product page that shows "Hi, Alex" or a member price, cached at the edge with <code>public</code>, is now shown to everyone. Keep shared responses free of user data and load the personal parts with a separate <code>private</code> request. Watch for a <code>Set-Cookie</code> on a cacheable response, too.</li>
+  <li><strong>Stale prices.</strong> TTLs stack. With 1 s in-process, 10 min Redis, 5 min at the shield and 5 min at the edge, a failed invalidation can leave an old price up for about 20 minutes. Invalidate every layer you can on write, keep layers that can't be invalidated (browser, in-process) short, and never charge from a cache.</li>
+  <li><strong>Invalidating at peak.</strong> A purge or key delete in the middle of the sale sends the full load to the origin at once. Prefer soft purges, refill the key right after the write, and schedule big content changes off-peak when you can.</li>
+  <li><strong>Too many layers.</strong> Every layer adds a TTL, a failure mode and a place to look when data is wrong. A small site with a CDN in front of static assets and Redis behind the app often needs nothing else. Add a layer when a metric says the one behind it is struggling.</li>
+  <li><strong>A fragmented cache key.</strong> <code>?utm_source=…</code>, random query order or a <code>Vary: User-Agent</code> splits one page into thousands of cache entries and the hit ratio drops. Normalize the key at the edge and vary only on what changes the response.</li>
+  <li><strong>Treating the cache as the database.</strong> If Redis is flushed and the DB can't take the full read load, the cache has become a dependency that must never fail. Know your cold-cache load, warm caches before sending traffic, and protect the DB with <a href="#rate-limiting">rate limits</a> or <a href="#backpressure">backpressure</a>.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Shared, rarely changing content goes as far left as possible: fingerprinted assets for a year, public pages at the edge with stale-while-revalidate.</li>
+  <li>Personal data stops at the browser (<code>private</code>) or isn't cached; prices are cached for display only.</li>
+  <li>On every write: update the DB, delete the Redis key, purge the CDN tag. Keep layers you can't purge on short TTLs.</li>
+  <li>Measure the hit ratio and the load behind each layer; that's how you know a layer earns its place.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#caching">Caching</a> · <a href="#cdn">CDN</a> · <a href="#edge-caching">Edge Caching</a> · <a href="#cache-invalidation">Cache Invalidation</a> · <a href="#real-world-traffic-stack">Real-World Traffic Stack</a> · <a href="#metrics">Metrics</a></p>
+`;
+
