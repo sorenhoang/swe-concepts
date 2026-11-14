@@ -325,3 +325,373 @@ stored value: {"id":"42","name":"Desk lamp","price_cents":2999}</code></pre>
 
 <p><strong>Related:</strong> <a href="#cdn">CDN</a> · <a href="#edge-caching">Edge Caching</a> · <a href="#cache-invalidation">Cache Invalidation</a> · <a href="#latency">Latency</a> · <a href="#reverse-proxies">Reverse Proxies</a> · <a href="#real-world-caching-stack">Real-World Caching Stack</a></p>
 `;
+CONTENT["cdn"] = `
+<p class="tldr"><strong>TL;DR</strong>: A CDN (Content Delivery Network) is a worldwide network of cache servers, grouped in <strong>Points of Presence (PoPs)</strong>, that keeps copies of your content close to your users. A nearby edge answers most requests, so pages load faster, and your origin only sees the misses. It's a chain of local warehouses in front of one central factory.</p>
+
+<h2>The problem it solves</h2>
+<p>Say your app runs in one cloud region. A user far from that region pays for the physical distance on <em>every</em> round trip: the TCP handshake, the TLS handshake, then each request for HTML, JS, CSS and images. Light in fiber covers roughly 200 km per millisecond, so a path of 20,000 km costs about 100 ms one way, or 200 ms per round trip, before any server does any work. Real network paths are longer than a straight line, so it's usually worse.</p>
+<p>At the same time your origin serves the same <code>logo.png</code> and <code>app.js</code> millions of times. That's wasted CPU and bandwidth, and bandwidth leaving a cloud (<strong>egress</strong>) is billed per GB. A traffic spike (a launch, a viral post, a DDoS) can knock the origin over.</p>
+<p>A CDN fixes both: <strong>move the bytes closer to the user</strong>, and <strong>answer repeated requests from cache</strong> so the origin handles a small fraction of the traffic.</p>
+
+<h2>How it works</h2>
+<p>The CDN runs servers in many PoPs around the world. You point a hostname (e.g. <code>cdn.example.com</code>, or your whole domain) at the CDN, and the CDN gets each user to a nearby PoP. That edge server checks its cache:</p>
+<ul>
+  <li><strong>Cache hit</strong>: it has a fresh copy and answers immediately. The origin never sees the request.</li>
+  <li><strong>Cache miss</strong>: it fetches the object from upstream, stores it if it's cacheable, and returns it. Upstream is either your origin or, better, an <strong>origin shield</strong>: one regional cache that all PoPs ask first, so a miss in 50 PoPs becomes one origin fetch instead of 50.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" role="img" aria-label="CDN architecture: users connect to nearby edge PoPs; only cache misses travel to the origin shield, and only shield misses reach the origin.">
+  <defs><marker id="arr-cdn-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="95" y="30" text-anchor="middle" class="title">Users</text>
+  <text x="335" y="30" text-anchor="middle" class="title">Edge PoPs (cache)</text>
+  <text x="550" y="30" text-anchor="middle" class="title">Origin shield</text>
+  <text x="715" y="30" text-anchor="middle" class="title">Origin</text>
+
+  <rect class="box" x="20" y="60" width="150" height="44" rx="8"/><text x="95" y="87" text-anchor="middle">Users, region A</text>
+  <rect class="box" x="20" y="160" width="150" height="44" rx="8"/><text x="95" y="187" text-anchor="middle">Users, region B</text>
+  <rect class="box" x="20" y="260" width="150" height="44" rx="8"/><text x="95" y="287" text-anchor="middle">Users, region C</text>
+
+  <rect class="box accent" x="250" y="60" width="170" height="44" rx="8"/><text x="335" y="87" text-anchor="middle">PoP A</text>
+  <rect class="box accent" x="250" y="160" width="170" height="44" rx="8"/><text x="335" y="187" text-anchor="middle">PoP B</text>
+  <rect class="box accent" x="250" y="260" width="170" height="44" rx="8"/><text x="335" y="287" text-anchor="middle">PoP C</text>
+
+  <rect class="box" x="490" y="157" width="120" height="50" rx="8"/><text x="550" y="179" text-anchor="middle">Regional cache</text><text x="550" y="196" text-anchor="middle" class="small">near the origin</text>
+  <rect class="box ok" x="660" y="157" width="110" height="50" rx="8"/><text x="715" y="179" text-anchor="middle">Your app</text><text x="715" y="196" text-anchor="middle" class="small">one region</text>
+
+  <path class="line ok" d="M170 82 H248" marker-end="url(#arr-cdn-1)"/><text x="209" y="75" text-anchor="middle" class="small">nearby</text>
+  <path class="line ok" d="M170 182 H248" marker-end="url(#arr-cdn-1)"/><text x="209" y="175" text-anchor="middle" class="small">nearby</text>
+  <path class="line ok" d="M170 282 H248" marker-end="url(#arr-cdn-1)"/><text x="209" y="275" text-anchor="middle" class="small">nearby</text>
+
+  <path class="line dashed" d="M420 82 L488 168" marker-end="url(#arr-cdn-1)"/>
+  <path class="line dashed" d="M420 182 H488" marker-end="url(#arr-cdn-1)"/>
+  <path class="line dashed" d="M420 282 L488 196" marker-end="url(#arr-cdn-1)"/>
+  <text x="462" y="118" class="small">miss only</text>
+  <path class="line dashed" d="M610 182 H658" marker-end="url(#arr-cdn-1)"/>
+  <text x="635" y="232" text-anchor="middle" class="small">one fetch for</text>
+  <text x="635" y="246" text-anchor="middle" class="small">many PoP misses</text>
+</svg>
+<figcaption>Solid green = every request (a short hop to a nearby PoP). Dashed = cache misses only. With a high hit ratio and a shield, the origin serves a tiny fraction of the traffic.</figcaption>
+</figure>
+
+<h3>Getting each user to the nearest edge</h3>
+<p>There are two main techniques (the <a href="#dns">DNS</a> page covers the DNS mechanics):</p>
+<ul>
+  <li><strong>GeoDNS</strong>: each PoP has its own IP addresses. The CDN's DNS server looks at where the query came from (the user's resolver, or the client subnet if the resolver sends EDNS Client Subnet) and answers with the IP of a nearby, healthy PoP. Steering changes take effect as DNS TTLs expire.</li>
+  <li><strong>Anycast</strong>: every PoP announces <em>the same</em> IP prefix over BGP. The internet's routing delivers each packet to the closest PoP in network terms. No DNS tricks needed, failover is fast (a PoP stops announcing and traffic flows to the next one), and attack traffic is split across all PoPs.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 262" role="img" aria-label="Left, GeoDNS: the user asks the CDN's DNS for cdn.example.com and receives the address of PoP A, then connects to it. Each PoP has a different IP. Right, anycast: all three PoPs announce the same IP; BGP routing delivers the user's packets to the nearest PoP, and the farther PoPs are not used.">
+  <defs><marker id="arr-cdn-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="195" y="22" text-anchor="middle" class="title">GeoDNS: different IP per PoP</text>
+  <text x="590" y="22" text-anchor="middle" class="title">Anycast: same IP everywhere</text>
+  <path class="line dashed" d="M390 10 V254"/>
+
+  <rect class="box" x="20" y="110" width="90" height="44" rx="8"/><text x="65" y="137" text-anchor="middle">User</text>
+  <rect class="box accent" x="150" y="40" width="120" height="44" rx="8"/><text x="210" y="60" text-anchor="middle">CDN DNS</text><text x="210" y="76" text-anchor="middle" class="small">picks by location</text>
+  <path class="line" d="M80 108 L148 70" marker-end="url(#arr-cdn-2)"/>
+  <text x="20" y="66" class="small">1 cdn.example.com?</text>
+  <path class="line dashed" d="M160 86 L108 116" marker-end="url(#arr-cdn-2)"/>
+  <text x="140" y="112" class="small">2 203.0.113.10</text>
+  <rect class="box ok" x="230" y="130" width="140" height="34" rx="6"/><text x="300" y="152" text-anchor="middle" class="small">PoP A 203.0.113.10</text>
+  <rect class="box muted" x="230" y="174" width="140" height="34" rx="6"/><text x="300" y="196" text-anchor="middle" class="small">PoP B 198.51.100.20</text>
+  <rect class="box muted" x="230" y="218" width="140" height="34" rx="6"/><text x="300" y="240" text-anchor="middle" class="small">PoP C 192.0.2.30</text>
+  <path class="line ok" d="M110 140 L228 146" marker-end="url(#arr-cdn-2)"/>
+  <text x="150" y="168" class="small">3 connect</text>
+
+  <rect class="box" x="420" y="110" width="90" height="44" rx="8"/><text x="465" y="137" text-anchor="middle">User</text>
+  <text x="465" y="176" text-anchor="middle" class="small">connects to</text>
+  <text x="465" y="190" text-anchor="middle" class="small">192.0.2.1</text>
+  <rect class="box ok" x="600" y="50" width="160" height="34" rx="6"/><text x="680" y="72" text-anchor="middle" class="small">PoP A 192.0.2.1 (near)</text>
+  <rect class="box muted" x="600" y="115" width="160" height="34" rx="6"/><text x="680" y="137" text-anchor="middle" class="small">PoP B 192.0.2.1</text>
+  <rect class="box muted" x="600" y="180" width="160" height="34" rx="6"/><text x="680" y="202" text-anchor="middle" class="small">PoP C 192.0.2.1</text>
+  <path class="line ok" d="M510 122 L598 74" marker-end="url(#arr-cdn-2)"/>
+  <text x="606" y="104" class="small">BGP: shortest path</text>
+  <path class="line dashed" d="M510 132 H598"/>
+  <path class="line dashed" d="M510 142 L598 192"/>
+  <text x="680" y="238" text-anchor="middle" class="small">if PoP A withdraws its route,</text>
+  <text x="680" y="252" text-anchor="middle" class="small">packets flow to the next nearest</text>
+</svg>
+<figcaption>GeoDNS steers with the DNS answer, so it's only as fresh as the TTL and as accurate as the resolver's location. Anycast steers with routing, so it's "nearest by network path", which is usually but not always nearest by distance. Many CDNs combine both.</figcaption>
+</figure>
+
+<h3>Why it's faster even on a miss: TLS at the edge</h3>
+<p>The edge terminates TCP and TLS. The handshakes happen over the short user-to-edge path, and the edge talks to the origin over connections it keeps open and warm, often over the CDN's own backbone. A rough model with TLS 1.3 (one round trip for the TLS handshake), a 200 ms round trip from the user to the origin, 20 ms to the edge, and 180 ms from the edge to the origin:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 214" role="img" aria-label="Time to first byte. Direct to origin: TCP handshake 200 ms, TLS 200 ms, request 200 ms, total 600 ms. Through the edge on a miss: 60 ms of handshakes and request near the user plus 180 ms to the origin over a warm connection, total 240 ms. Edge hit: 60 ms.">
+  <text x="390" y="20" text-anchor="middle" class="small">scale: 0 to 600 ms · RTT user↔origin 200 ms, user↔edge 20 ms, edge↔origin 180 ms</text>
+  <text x="170" y="62" text-anchor="end">Direct to origin</text>
+  <rect class="box muted" x="180" y="44" width="160" height="28" rx="3"/><text x="260" y="63" text-anchor="middle" class="small">TCP 200</text>
+  <rect class="box muted" x="340" y="44" width="160" height="28" rx="3"/><text x="420" y="63" text-anchor="middle" class="small">TLS 200</text>
+  <rect class="box bad" x="500" y="44" width="160" height="28" rx="3"/><text x="580" y="63" text-anchor="middle" class="small">request 200</text>
+  <text x="668" y="63" class="small">600 ms</text>
+
+  <text x="170" y="112" text-anchor="end">Edge, cache miss</text>
+  <rect class="box accent" x="180" y="94" width="48" height="28" rx="3"/>
+  <rect class="box muted" x="228" y="94" width="144" height="28" rx="3"/><text x="300" y="113" text-anchor="middle" class="small">edge → origin 180</text>
+  <text x="380" y="113" class="small">240 ms</text>
+
+  <text x="170" y="162" text-anchor="end">Edge, cache hit</text>
+  <rect class="box ok" x="180" y="144" width="48" height="28" rx="3"/>
+  <text x="236" y="163" class="small">60 ms</text>
+  <path class="line" d="M180 184 H660"/>
+  <path class="line" d="M180 179 V189 M340 179 V189 M500 179 V189 M660 179 V189"/>
+  <text x="180" y="204" text-anchor="middle" class="small">0</text><text x="340" y="204" text-anchor="middle" class="small">200</text><text x="500" y="204" text-anchor="middle" class="small">400</text><text x="660" y="204" text-anchor="middle" class="small">600</text>
+</svg>
+<figcaption>The two short bars are TCP + TLS + request near the user (3 × 20 ms). A model, not a benchmark: it ignores server time, and TLS 1.2 or a cold edge-to-origin connection adds round trips. Even uncacheable API calls gain from terminating TLS nearby.</figcaption>
+</figure>
+
+<h3>Pull, push and shields</h3>
+<table>
+  <tr><th>Model</th><th>How content gets to the edge</th><th>Good for</th><th>Watch out for</th></tr>
+  <tr><td><strong>Origin pull</strong> (the default)</td><td>The edge fetches from your origin on the first miss and caches it per your headers</td><td>Websites, APIs, anything that changes; zero upload step</td><td>The first user per PoP pays for the miss; a purge sends every PoP back to the origin</td></tr>
+  <tr><td><strong>Push / storage origin</strong></td><td>You upload files ahead of time to the CDN's storage (or an object store like S3 that the CDN reads from)</td><td>Large static files: video, installers, game patches</td><td>You manage uploads and deletes; it's really "pull from a bucket" on most CDNs</td></tr>
+  <tr><td><strong>Origin shield / tiered cache</strong></td><td>PoPs pull from a regional mid-tier cache, which pulls from the origin</td><td>Many PoPs, a long tail of objects, a fragile origin</td><td>One more hop on a miss; usually priced per request (CloudFront Origin Shield, Cloudflare Tiered Cache, Fastly shielding)</td></tr>
+  <tr><td><strong>Multi-CDN</strong></td><td>DNS or a steering service splits traffic between two or more CDNs</td><td>Very large sites that need to survive one CDN's outage, or want price leverage</td><td>Two configs, two purge APIs, two sets of certificates; you're limited to features both support</td></tr>
+</table>
+
+<h3>What to put on a CDN</h3>
+<ul>
+  <li><strong>Always</strong>: static assets with fingerprinted names (<code>app.3f9a1c.js</code>), images, fonts, video, downloads. Cache them for a year.</li>
+  <li><strong>Usually</strong>: HTML and public API reads that are the same for everyone, with a short edge TTL (seconds to minutes). Some CDNs don't cache these by default; Cloudflare, for example, doesn't cache HTML or JSON until you add a cache rule.</li>
+  <li><strong>Pass through</strong>: anything personalized (<code>/me</code>, cart, account pages) and all writes. They still get the TLS and routing benefits, just no caching.</li>
+</ul>
+<p>The headers that drive all of this (<code>Cache-Control</code>, <code>s-maxage</code>, <code>Vary</code>, <code>ETag</code>) are covered in <a href="#edge-caching">Edge Caching</a>.</p>
+
+<h3>Hit ratio and cost</h3>
+<p>Two different ratios matter:</p>
+<ul>
+  <li><strong>Request hit ratio</strong> = edge hits / all requests. Drives latency and origin request load.</li>
+  <li><strong>Byte hit ratio</strong> = bytes served from cache / all bytes served. Drives origin egress cost. A site can have a 90% request hit ratio and a much lower byte hit ratio if its big video files miss.</li>
+</ul>
+<p>Worked example: you serve 50 TB a month. With a 95% byte hit ratio, the origin sends only 2.5 TB; the CDN delivers the other 47.5 TB, usually at a lower per-GB rate than raw cloud egress. Some pairings make the origin leg free: AWS doesn't charge for data transfer from AWS origins (S3, EC2, load balancers) to CloudFront. Drop to an 80% byte hit ratio and the origin sends 10 TB, four times as much, so the hit ratio is the number to watch on the CDN dashboard (see <a href="#metrics">Metrics</a>).</p>
+
+<h3>DDoS absorption</h3>
+<p>A CDN puts a very large, spread-out network in front of your origin. Volumetric floods land on the PoPs (with anycast, split across all of them), cached content keeps being served, and only cache misses that pass the CDN's filters reach your servers. That only works if attackers can't go around it: lock the origin so it accepts traffic only from the CDN. Details in <a href="#ddos-protection">DDoS Protection</a> and <a href="#waf">WAF</a>.</p>
+
+<h2>Example</h2>
+<p><strong>A two-tier CDN in about 100 lines of Go.</strong> Each <code>Cache</code> is one tier (an edge PoP or the shield). It keys on path + query, honours <code>s-maxage</code>/<code>max-age</code> and <code>private</code>/<code>no-store</code>, collapses concurrent misses with <code>singleflight</code> (CDNs call this <em>request collapsing</em>), and adds an <code>X-Cache</code> header like CloudFront's.</p>
+<pre><code>package cdn
+
+import (
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"golang.org/x/sync/singleflight"
+)
+
+type entry struct {
+	body    []byte
+	ctype   string
+	cc      string // passed downstream so the next tier can cache too
+	expires time.Time
+}
+
+// Cache is one caching tier: an edge PoP or an origin shield.
+// upstream is the next tier (the shield) or the origin itself.
+type Cache struct {
+	Name     string
+	upstream string
+
+	mu    sync.Mutex
+	store map[string]entry
+	group singleflight.Group
+
+	Hits, Misses atomic.Int64
+}
+
+func NewCache(name, upstream string) *Cache {
+	return &amp;Cache{Name: name, upstream: upstream, store: map[string]entry{}}
+}
+
+func (c *Cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.RequestURI() // cache key: path + query string
+	c.mu.Lock()
+	e, ok := c.store[key]
+	c.mu.Unlock()
+
+	status := "HIT"
+	if !ok || time.Now().After(e.expires) {
+		status = "MISS"
+		// Request collapsing: 100 concurrent misses for one key = 1 upstream fetch.
+		v, err, _ := c.group.Do(key, func() (any, error) { return c.fetch(key) })
+		if err != nil {
+			http.Error(w, "upstream unavailable", http.StatusBadGateway)
+			return
+		}
+		e = v.(entry)
+		c.Misses.Add(1)
+	} else {
+		c.Hits.Add(1)
+	}
+	w.Header().Set("Content-Type", e.ctype)
+	w.Header().Set("Cache-Control", e.cc)
+	w.Header().Set("X-Cache", status+" from "+c.Name)
+	w.Write(e.body)
+}
+
+func (c *Cache) fetch(key string) (entry, error) {
+	resp, err := http.Get(c.upstream + key)
+	if err != nil {
+		return entry{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return entry{}, err
+	}
+	cc := resp.Header.Get("Cache-Control")
+	ttl := sharedTTL(cc)
+	e := entry{body: body, ctype: resp.Header.Get("Content-Type"), cc: cc, expires: time.Now().Add(ttl)}
+	if resp.StatusCode == http.StatusOK &amp;&amp; ttl &gt; 0 {
+		c.mu.Lock()
+		c.store[key] = e
+		c.mu.Unlock()
+	}
+	return e, nil
+}
+
+// sharedTTL is a tiny subset of RFC 9111: s-maxage wins over max-age
+// for a shared cache; private and no-store mean "don't store".
+func sharedTTL(cc string) time.Duration {
+	var maxAge, sMaxAge time.Duration = -1, -1
+	for _, d := range strings.Split(cc, ",") {
+		d = strings.TrimSpace(strings.ToLower(d))
+		name, val, _ := strings.Cut(d, "=")
+		n, _ := strconv.Atoi(val)
+		switch name {
+		case "private", "no-store", "no-cache":
+			return 0
+		case "max-age":
+			maxAge = time.Duration(n) * time.Second
+		case "s-maxage":
+			sMaxAge = time.Duration(n) * time.Second
+		}
+	}
+	if sMaxAge &gt;= 0 {
+		return sMaxAge
+	}
+	return max(maxAge, 0)
+}</code></pre>
+
+<p>The test puts three edges in front of an <code>httptest</code> origin, sends 990 requests round-robin (one in 33 is the personalized <code>/me</code>), and runs once without and once with a shield:</p>
+<pre><code>package cdn
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+)
+
+func newOrigin(asset, me *atomic.Int64) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/me" {
+			me.Add(1)
+			w.Header().Set("Cache-Control", "private, no-store")
+		} else {
+			asset.Add(1)
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		}
+		fmt.Fprint(w, "body of "+r.URL.Path)
+	}))
+}
+
+// 3 edge PoPs, 300 requests each for the same JS file, plus 30 for /me.
+func run(t *testing.T, withShield bool) {
+	var assetHits, meHits atomic.Int64
+	origin := newOrigin(&amp;assetHits, &amp;meHits)
+	defer origin.Close()
+
+	next := origin.URL
+	if withShield {
+		shield := httptest.NewServer(NewCache("shield", origin.URL))
+		defer shield.Close()
+		next = shield.URL
+	}
+	var edges []*Cache
+	for _, name := range []string{"edge-a", "edge-b", "edge-c"} {
+		edges = append(edges, NewCache(name, next))
+	}
+	for i := range 990 {
+		path := "/assets/app.3f9a1c.js"
+		if i%33 == 0 {
+			path = "/me"
+		}
+		rec := httptest.NewRecorder()
+		edges[i%3].ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if i &lt; 6 {
+			t.Logf("req %d %-22s X-Cache: %s", i, path, rec.Header().Get("X-Cache"))
+		}
+		io.Copy(io.Discard, rec.Body)
+	}
+	var hits, total int64
+	for _, e := range edges {
+		hits += e.Hits.Load()
+		total += e.Hits.Load() + e.Misses.Load()
+	}
+	t.Logf("shield=%v edge hit ratio=%.1f%% origin fetches: app.js=%d /me=%d",
+		withShield, 100*float64(hits)/float64(total), assetHits.Load(), meHits.Load())
+}
+
+func TestNoShield(t *testing.T)   { run(t, false) }
+func TestWithShield(t *testing.T) { run(t, true) }</code></pre>
+<p>Real output of <code>go test -v</code>:</p>
+<pre><code>req 0 /me                    X-Cache: MISS from edge-a
+req 1 /assets/app.3f9a1c.js  X-Cache: MISS from edge-b
+req 2 /assets/app.3f9a1c.js  X-Cache: MISS from edge-c
+req 3 /assets/app.3f9a1c.js  X-Cache: MISS from edge-a
+req 4 /assets/app.3f9a1c.js  X-Cache: HIT from edge-b
+req 5 /assets/app.3f9a1c.js  X-Cache: HIT from edge-c
+shield=false edge hit ratio=96.7% origin fetches: app.js=3 /me=30
+--- PASS: TestNoShield (0.01s)
+req 0 /me                    X-Cache: MISS from edge-a
+req 1 /assets/app.3f9a1c.js  X-Cache: MISS from edge-b
+req 2 /assets/app.3f9a1c.js  X-Cache: MISS from edge-c
+req 3 /assets/app.3f9a1c.js  X-Cache: MISS from edge-a
+req 4 /assets/app.3f9a1c.js  X-Cache: HIT from edge-b
+req 5 /assets/app.3f9a1c.js  X-Cache: HIT from edge-c
+shield=true edge hit ratio=96.7% origin fetches: app.js=1 /me=30
+--- PASS: TestWithShield (0.01s)</code></pre>
+<p>Each edge misses once on <code>app.js</code>, then hits forever. Without a shield the origin fetches it 3 times (once per PoP); with a shield, once. With 3 PoPs that's a small saving, with 300 PoPs and a purge at peak it's the difference between 300 origin requests per object and 1. <code>/me</code> is <code>private, no-store</code>, so all 30 requests correctly go to the origin.</p>
+
+<p><strong>Checking a real CDN.</strong> Each CDN has its own debug header. CloudFront sends <code>X-Cache: Hit from cloudfront</code> (or <code>Miss</code>, <code>RefreshHit</code>); Cloudflare sends <code>cf-cache-status</code> with values such as <code>HIT</code>, <code>MISS</code>, <code>EXPIRED</code>, <code>BYPASS</code> and <code>DYNAMIC</code> (not eligible for caching at all). The standard <code>Age</code> header says how many seconds the copy has been cached:</p>
+<pre><code>curl -sI https://cdn.example.com/assets/app.3f9a1c.js | grep -iE 'x-cache|cf-cache-status|^age'</code></pre>
+
+<p><strong>Purging</strong> a file that must change <em>now</em> (better: fingerprint it, see <a href="#cache-invalidation">Cache Invalidation</a>). On CloudFront the first 1,000 invalidation paths per month are free; <code>/*</code> counts as one path but empties the whole distribution:</p>
+<pre><code>aws cloudfront create-invalidation &#92;
+    --distribution-id E1ABCDEF234567 &#92;
+    --paths "/index.html" "/robots.txt"</code></pre>
+
+<p><strong>Real-world scenario.</strong> A campaign sends 50× normal traffic to your landing page at 10:00. Without a CDN, every request hits two app servers and they fall over by 10:02. With HTML cached at the edge for 60 seconds, assets cached for a year and a shield in front of the origin, the origin sees roughly one request per page per minute, from the shield. Users everywhere get the page from a nearby PoP, and the app servers' CPU graph barely moves.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Caching private data is the worst CDN bug.</strong> A response that depends on the user (cookies, <code>Authorization</code>) marked cacheable can be served to every other user. Default authenticated routes to <code>private, no-store</code>; see the Steam incident in <a href="#edge-caching">Edge Caching</a>.</li>
+  <li><strong>Origin still reachable directly.</strong> If the origin accepts traffic from anywhere, attackers and bots skip the CDN, its cache and its DDoS protection. Allow only the CDN's IP ranges or require a secret header or mTLS from the CDN.</li>
+  <li><strong>Stale content after deploys.</strong> Long TTLs on un-fingerprinted files (<code>/app.js</code>) mean users keep the old version. Fingerprint filenames instead of purging after every deploy.</li>
+  <li><strong>Cache key mistakes.</strong> Tracking params like <code>?utm_source=…</code> in the key split one object into thousands and kill the hit ratio. Strip them in the CDN's cache-key settings.</li>
+  <li><strong>Purge everything = thundering herd.</strong> <code>/*</code> at peak sends every PoP back to the origin at once. Purge narrowly, and put a shield in front.</li>
+  <li><strong>Low hit ratio, high bill.</strong> A CDN in front of mostly uncacheable traffic is an extra hop you pay for per request. Measure request and byte hit ratios before and after.</li>
+  <li><strong>Another layer to debug.</strong> "Why am I seeing the old version?" now has browser, CDN, shield and app caches as suspects. Learn your CDN's debug headers early.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>A CDN serves content from PoPs near users: lower latency for them, less load and egress for your origin.</li>
+  <li>Users reach the nearest edge through GeoDNS or anycast; TLS terminates there, which helps even uncacheable requests.</li>
+  <li>Origin pull is the default; an origin shield turns N PoP misses into one origin fetch.</li>
+  <li>Watch the request and byte hit ratios, and lock the origin so only the CDN can reach it.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#caching">Caching</a> · <a href="#edge-caching">Edge Caching</a> · <a href="#cache-invalidation">Cache Invalidation</a> · <a href="#dns">DNS</a> · <a href="#ddos-protection">DDoS Protection</a> · <a href="#real-world-caching-stack">Real-World Caching Stack</a></p>
+`;
