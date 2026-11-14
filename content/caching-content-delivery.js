@@ -977,3 +977,252 @@ func TestConditional(t *testing.T) {
 
 <p><strong>Related:</strong> <a href="#cdn">CDN</a> · <a href="#caching">Caching</a> · <a href="#cache-invalidation">Cache Invalidation</a> · <a href="#reverse-proxies">Reverse Proxies</a> · <a href="#real-world-caching-stack">Real-World Caching Stack</a></p>
 `;
+CONTENT["cache-invalidation"] = `
+<p class="tldr"><strong>TL;DR</strong>: Cache invalidation is making sure cached copies stop being served once the real data changes. Caching is easy; knowing <em>when</em> a copy is wrong, and removing it everywhere without races, is the hard part. The usual tools are expiry by time (TTL), deleting on write, putting a version in the key, broadcasting change events, and purging the CDN. It's taking down every copy of an old poster, including the ones someone is putting back up as you walk past.</p>
+
+<h2>The problem it solves</h2>
+<p>The line usually attributed to Phil Karlton says there are only two hard things in computer science: cache invalidation and naming things. It is hard for concrete reasons:</p>
+<ul>
+  <li><strong>Copies are everywhere.</strong> One product price can be cached in each pod's memory, in Redis, in a reverse proxy, at many CDN edges and in thousands of browsers (see <a href="#caching">Caching</a>). An update has to reach all of them, or wait for them to expire.</li>
+  <li><strong>The cache doesn't see writes.</strong> In cache-aside, the database changes and nobody tells the cache unless your code does, on every write path, including scripts, migrations and admin tools.</li>
+  <li><strong>Concurrency.</strong> A reader that loaded an old value a millisecond before an update can write it into the cache a millisecond after the invalidation. The cache is now wrong with no write left to fix it.</li>
+</ul>
+<p>The cost of getting it wrong depends on the data: a stale avatar is harmless; a stale price, stock level or permission is a bug, a support ticket or a security issue.</p>
+
+<h2>How it works</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 340" role="img" aria-label="Mind map of cache invalidation strategies: time (TTL expiry, jitter), write path (delete on write, write-through), key design (versioned keys, fingerprinted assets, generations), events (change data capture, pub/sub broadcast), CDN (purge by URL, purge by tag, soft purge), and race fixes (delayed double delete, leases).">
+  <ellipse class="box accent" cx="390" cy="170" rx="95" ry="32"/><text x="390" y="175" text-anchor="middle" class="title">Cache invalidation</text>
+  <path class="line" d="M330 148 L210 72"/><path class="line" d="M450 148 L570 72"/>
+  <path class="line" d="M295 170 H190"/><path class="line" d="M485 170 H590"/>
+  <path class="line" d="M330 194 L260 256"/><path class="line" d="M450 194 L520 256"/>
+
+  <rect class="box" x="40" y="20" width="170" height="64" rx="8"/><text x="125" y="42" text-anchor="middle" class="title">Time</text>
+  <text x="125" y="60" text-anchor="middle" class="small">TTL expiry: bounded staleness</text><text x="125" y="74" text-anchor="middle" class="small">jitter against mass expiry</text>
+  <rect class="box" x="570" y="20" width="170" height="64" rx="8"/><text x="655" y="42" text-anchor="middle" class="title">Write path</text>
+  <text x="655" y="60" text-anchor="middle" class="small">update DB, then delete key</text><text x="655" y="74" text-anchor="middle" class="small">or write-through update</text>
+  <rect class="box" x="20" y="138" width="170" height="64" rx="8"/><text x="105" y="160" text-anchor="middle" class="title">Key design</text>
+  <text x="105" y="178" text-anchor="middle" class="small">versioned / generation keys</text><text x="105" y="192" text-anchor="middle" class="small">fingerprinted asset names</text>
+  <rect class="box" x="590" y="138" width="170" height="64" rx="8"/><text x="675" y="160" text-anchor="middle" class="title">Events</text>
+  <text x="675" y="178" text-anchor="middle" class="small">CDC from WAL / binlog</text><text x="675" y="192" text-anchor="middle" class="small">pub/sub to every node</text>
+  <rect class="box" x="90" y="256" width="170" height="64" rx="8"/><text x="175" y="278" text-anchor="middle" class="title">CDN</text>
+  <text x="175" y="296" text-anchor="middle" class="small">purge by URL or by tag</text><text x="175" y="310" text-anchor="middle" class="small">soft purge: mark stale</text>
+  <rect class="box bad" x="520" y="256" width="170" height="64" rx="8"/><text x="605" y="278" text-anchor="middle" class="title">Race fixes</text>
+  <text x="605" y="296" text-anchor="middle" class="small">delayed double delete</text><text x="605" y="310" text-anchor="middle" class="small">leases (tokens on miss)</text>
+</svg>
+<figcaption>Real systems combine several: a TTL on everything as a safety net, delete-on-write for correctness, versioned names for static files, events to reach caches you can't call directly, and a purge for the CDN.</figcaption>
+</figure>
+
+<h3>The strategies</h3>
+<ol>
+  <li><strong>TTL expiry.</strong> Every entry dies after a fixed time. No coordination, and staleness is bounded by the TTL. Alone it means "wrong for up to N minutes". Always set one anyway: it is the safety net when every other mechanism fails.</li>
+  <li><strong>Delete on write.</strong> After the database commit, delete the key; the next read reloads it. This is what cache-aside does.</li>
+  <li><strong>Write-through update.</strong> After the commit, write the new value into the cache. The next read is a hit, but two concurrent writers can leave the older value in the cache (shown below).</li>
+  <li><strong>Versioned keys.</strong> Put a version in the key, and a change makes a new key instead of fixing the old one. Three forms: a schema version (<code>product:v2:42</code>), a row version (<code>product:42:rev17</code>), or a <em>generation</em> counter per group (<code>category:lamps:g8:page:1</code>; one <code>INCR</code> abandons every page of the category). Old entries are never read again and age out by TTL or eviction.</li>
+  <li><strong>Fingerprinted assets.</strong> The same idea for files: <code>app.3f9a1c.js</code> contains a hash of its content, so it can be cached for a year with <code>immutable</code>. A deploy produces a new name; only the HTML that references it must stay fresh (see <a href="#edge-caching">Edge Caching</a>).</li>
+  <li><strong>Event-driven invalidation.</strong> Changes are published as events and a consumer deletes the affected keys everywhere: every region, every pod's local cache, the CDN. The most reliable source is the database's own change log (CDC), because it also sees writes that bypass your code.</li>
+  <li><strong>CDN purge.</strong> Ask the CDN to drop content by URL, by prefix, or by <strong>tag</strong>: the origin labels responses (<code>Surrogate-Key</code> on Fastly, <code>Cache-Tag</code> on Cloudflare) and one call purges every URL with that tag, such as all pages showing product 42. A <strong>soft purge</strong> marks objects stale instead of removing them, so the edge can still serve the old copy while it fetches the new one, or if the origin is down.</li>
+</ol>
+
+<h3>The race that breaks naive invalidation</h3>
+<p>Delete-on-write is not airtight. The classic failure needs only one slow reader:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 350" role="img" aria-label="Sequence diagram. A reader misses the cache and reads price 1000 from the database, then pauses. A writer updates the price to 1500 and deletes the cache key. The reader resumes and sets the cache to the old price 1000. The cache now disagrees with the database until the TTL expires or a second delete runs.">
+  <defs><marker id="arr-ci-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="50" y="10" width="120" height="34" rx="6"/><text x="110" y="32" text-anchor="middle" class="title">Reader</text>
+  <rect class="box ok" x="240" y="10" width="120" height="34" rx="6"/><text x="300" y="32" text-anchor="middle" class="title">Cache</text>
+  <rect class="box muted" x="430" y="10" width="120" height="34" rx="6"/><text x="490" y="32" text-anchor="middle" class="title">Database</text>
+  <rect class="box" x="620" y="10" width="120" height="34" rx="6"/><text x="680" y="32" text-anchor="middle" class="title">Writer</text>
+  <path class="line dashed" d="M110 44 V340"/><path class="line dashed" d="M300 44 V340"/><path class="line dashed" d="M490 44 V340"/><path class="line dashed" d="M680 44 V340"/>
+
+  <path class="line" d="M110 72 H298" marker-end="url(#arr-ci-1)"/><text x="205" y="66" text-anchor="middle" class="small">1 GET → miss</text>
+  <path class="line" d="M110 100 H488" marker-end="url(#arr-ci-1)"/><text x="395" y="94" text-anchor="middle" class="small">2 SELECT</text>
+  <path class="line dashed" d="M490 126 H112" marker-end="url(#arr-ci-1)"/><text x="395" y="120" text-anchor="middle" class="small">3 price = 1000</text>
+  <rect class="box muted" x="20" y="146" width="180" height="40" rx="6"/><text x="110" y="163" text-anchor="middle" class="small">reader pauses:</text><text x="110" y="177" text-anchor="middle" class="small">GC, slow network, CPU</text>
+  <path class="line" d="M680 160 H492" marker-end="url(#arr-ci-1)"/><text x="585" y="154" text-anchor="middle" class="small">4 UPDATE 1500</text>
+  <path class="line" d="M680 196 H302" marker-end="url(#arr-ci-1)"/><text x="585" y="190" text-anchor="middle" class="small">5 DEL key</text>
+  <path class="line bad" d="M110 232 H298" marker-end="url(#arr-ci-1)"/><text x="205" y="226" text-anchor="middle" class="small">6 SET 1000 (old!)</text>
+  <rect class="box bad" x="220" y="246" width="360" height="40" rx="6"/><text x="400" y="263" text-anchor="middle" class="small">cache = 1000, database = 1500</text><text x="400" y="278" text-anchor="middle" class="small">every reader gets the old price until the TTL ends</text>
+  <path class="line accent dashed" d="M680 318 H302" marker-end="url(#arr-ci-1)"/><text x="500" y="300" class="small">7 fix: second DEL ~500 ms later,</text><text x="500" y="312" class="small">or a lease rejects step 6</text>
+</svg>
+<figcaption>The window is small (the read must start before the update and finish after the delete), but at thousands of reads per second on a hot key it happens. The fixes are a delayed second delete, a lease, or a short TTL to bound the damage.</figcaption>
+</figure>
+
+<p><strong>Why delete beats set-on-write.</strong> If writers <em>set</em> the new value, two concurrent updates can reach the cache in the opposite order from the database, and the older value wins with nothing left to correct it. A delete carries no value, so the order of two deletes doesn't matter: the next read loads whatever the database has <em>now</em>. Facebook's memcache paper gives the same reason: they delete instead of update "because deletes are idempotent", which also makes them safe to retry.</p>
+
+<p><strong>Delayed double delete.</strong> Delete right after the commit, then delete again after a delay longer than a typical read-and-fill (a few hundred milliseconds). The second delete removes a stale value that a slow reader put back. It narrows the race; it doesn't close it, because a reader can pause longer than the delay.</p>
+
+<p><strong>Leases.</strong> "Scaling Memcache at Facebook" (NSDI 2013) describes leases, which solve both stale sets and stampedes:</p>
+<ul>
+  <li>On a miss, the cache gives the client a 64-bit lease token bound to that key. The later <code>SET</code> must present the token.</li>
+  <li>A delete for that key invalidates the token, so the slow reader's <code>SET</code> in step 6 is <strong>rejected</strong>.</li>
+  <li>The cache hands out a token at most once every 10 seconds per key (their default). Other clients that miss in that window are told to wait briefly and retry, by which time the value is usually there.</li>
+  <li>On a set of keys prone to thundering herds, they report the peak database query rate dropping from 17K/s to 1.3K/s.</li>
+</ul>
+<p>Redis has no built-in leases. You can approximate one with a token stored next to the key and a Lua script that only sets if the token still matches, or bound the problem with short TTLs.</p>
+
+<h3>Event-driven invalidation</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Change data capture pipeline: the app commits an update to Postgres, a CDC connector such as Debezium reads the write-ahead log and publishes a change event to a Kafka topic, and an invalidator service maps the changed row to cache keys and tags, then deletes the keys in Redis in each region and purges the CDN by tag.">
+  <defs><marker id="arr-ci-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="40" width="110" height="44" rx="8"/><text x="75" y="67" text-anchor="middle" class="title">App</text>
+  <rect class="box muted" x="160" y="40" width="110" height="44" rx="8"/><text x="215" y="67" text-anchor="middle" class="title">Postgres</text>
+  <rect class="box" x="300" y="40" width="110" height="44" rx="8"/><text x="355" y="67" text-anchor="middle" class="title">CDC</text>
+  <rect class="box" x="440" y="40" width="110" height="44" rx="8"/><text x="495" y="67" text-anchor="middle" class="title">Kafka</text>
+  <rect class="box accent" x="580" y="40" width="120" height="44" rx="8"/><text x="640" y="59" text-anchor="middle" class="title">Invalidator</text><text x="640" y="76" text-anchor="middle" class="small">row → keys + tags</text>
+  <path class="line" d="M130 62 H158" marker-end="url(#arr-ci-2)"/><path class="line" d="M270 62 H298" marker-end="url(#arr-ci-2)"/>
+  <path class="line" d="M410 62 H438" marker-end="url(#arr-ci-2)"/><path class="line" d="M550 62 H578" marker-end="url(#arr-ci-2)"/>
+  <text x="75" y="104" text-anchor="middle" class="small">UPDATE commits</text>
+  <text x="215" y="104" text-anchor="middle" class="small">writes the WAL</text>
+  <text x="355" y="104" text-anchor="middle" class="small">e.g. Debezium</text>
+  <text x="495" y="104" text-anchor="middle" class="small">product-changes</text>
+
+  <rect class="box ok" x="330" y="160" width="130" height="44" rx="8"/><text x="395" y="180" text-anchor="middle" class="title">Redis</text><text x="395" y="195" text-anchor="middle" class="small">region 1: DEL</text>
+  <rect class="box ok" x="480" y="160" width="130" height="44" rx="8"/><text x="545" y="180" text-anchor="middle" class="title">Redis</text><text x="545" y="195" text-anchor="middle" class="small">region 2: DEL</text>
+  <rect class="box ok" x="630" y="160" width="130" height="44" rx="8"/><text x="695" y="180" text-anchor="middle" class="title">CDN</text><text x="695" y="195" text-anchor="middle" class="small">purge tag product-42</text>
+  <path class="line accent" d="M620 84 L410 158" marker-end="url(#arr-ci-2)"/>
+  <path class="line accent" d="M630 84 L560 158" marker-end="url(#arr-ci-2)"/>
+  <path class="line accent" d="M660 84 L690 158" marker-end="url(#arr-ci-2)"/>
+  <text x="20" y="168" class="small">Sees every committed change,</text>
+  <text x="20" y="184" class="small">including scripts and admin tools.</text>
+  <text x="20" y="200" class="small">At-least-once delivery is fine:</text>
+  <text x="20" y="216" class="small">deletes are idempotent.</text>
+  <text x="390" y="238" text-anchor="middle" class="small">Adds seconds of lag, so pair it with delete-on-write where read-your-write matters.</text>
+</svg>
+<figcaption>Event-driven invalidation reaches caches the writer can't call directly: other regions, local caches in every pod (via pub/sub), the CDN. Facebook's version, <code>mcsqueal</code>, runs on every database, reads the committed SQL statements, extracts the keys to delete and broadcasts the deletes to the cache clusters in that region.</figcaption>
+</figure>
+
+<h3>Comparing the strategies</h3>
+<table>
+  <tr><th>Strategy</th><th>Staleness after a write</th><th>Complexity</th><th>Use for</th><th>Watch out for</th></tr>
+  <tr><td>TTL only</td><td>up to the TTL</td><td>none</td><td>data where "a few minutes old" is fine; a safety net on everything</td><td>long TTLs on data that matters</td></tr>
+  <tr><td>Delete on write</td><td>~0, except the race above</td><td>low; every write path must do it</td><td>the default for cache-aside</td><td>a forgotten write path; a failed delete</td></tr>
+  <tr><td>Write-through update</td><td>~0, but writers can race</td><td>low</td><td>read-after-write data with one writer per key</td><td>concurrent writers leave the older value</td></tr>
+  <tr><td>Versioned / generation keys</td><td>0: old keys are never read</td><td>low; the version must be known at read time</td><td>schema changes, groups of keys, list pages</td><td>orphaned keys use memory until evicted</td></tr>
+  <tr><td>Fingerprinted file names</td><td>0 for the file; the HTML must be fresh</td><td>build tool does it</td><td>JS, CSS, images</td><td>caching the HTML that points to them</td></tr>
+  <tr><td>Event-driven (CDC, pub/sub)</td><td>event lag: usually seconds</td><td>high: connector, topic, consumer</td><td>many regions, many caches, many writers</td><td>a stuck consumer silently stops invalidation</td></tr>
+  <tr><td>CDN purge (URL, tag, soft)</td><td>propagation time of the purge</td><td>medium; needs tagging</td><td>HTML and API responses at the edge</td><td>purge rate limits; purging everything on each deploy</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>Update the database, then delete the key</strong>, with a delayed second delete, a generation counter for a group of keys, and fingerprinted file names:</p>
+<pre><code>package inval
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+type Catalog struct {
+	db  *sql.DB
+	rdb *redis.Client
+}
+
+func productKey(id string) string { return "product:" + id }
+
+// UpdatePrice: write the source of truth FIRST, then delete the cached copy.
+// The next read misses and loads the new row (cache-aside).
+func (c *Catalog) UpdatePrice(ctx context.Context, id string, cents int) error {
+	_, err := c.db.ExecContext(ctx,
+		"UPDATE products SET price_cents = $1, updated_at = now() WHERE id = $2", cents, id)
+	if err != nil {
+		return err // DB failed: cache still matches DB, nothing to undo
+	}
+	if err := c.rdb.Del(ctx, productKey(id)).Err(); err != nil {
+		// DB is updated but the cache is stale. The TTL is the safety net;
+		// an outbox/CDC consumer can retry the delete (see below).
+		slog.Warn("cache delete failed", "key", productKey(id), "err", err)
+	}
+	// Delayed double delete: removes a stale value that a slow reader may
+	// have written back between our UPDATE and our first DEL.
+	time.AfterFunc(500*time.Millisecond, func() {
+		c.rdb.Del(context.Background(), productKey(id))
+	})
+	return nil
+}
+
+// Generation (namespace) keys: bump one counter and every key built from the
+// old generation becomes unreachable. Old entries just age out by TTL.
+func CategoryKey(ctx context.Context, rdb *redis.Client, category, page string) (string, error) {
+	gen, err := rdb.Get(ctx, "gen:category:"+category).Int64()
+	if err != nil &amp;&amp; err != redis.Nil {
+		return "", err
+	}
+	return fmt.Sprintf("category:%s:g%d:page:%s", category, gen, page), nil
+}
+
+func InvalidateCategory(ctx context.Context, rdb *redis.Client, category string) error {
+	return rdb.Incr(ctx, "gen:category:"+category).Err()
+}
+
+// Fingerprinted asset names: the content hash is in the URL, so a new deploy
+// is a new URL and the old one never needs purging.
+func Fingerprint(name string, content []byte) string {
+	sum := sha256.Sum256(content)
+	ext := filepath.Ext(name)
+	return strings.TrimSuffix(name, ext) + "." + hex.EncodeToString(sum[:])[:8] + ext
+}</code></pre>
+<p>Real output from tests of the generation key and the fingerprint (the hash changes because the content changed):</p>
+<pre><code>before: category:lamps:g0:page:1
+after:  category:lamps:g1:page:1 exists: false
+app.fc787e30.js
+app.a23d0f93.js</code></pre>
+<p>A test also replays the races step by step against a test Redis, with a map standing in for the database. Real output:</p>
+<pre><code>set-on-write, two writers:
+  A: UPDATE price=1200                         db=1200 cache=(empty)
+  B: UPDATE price=1500                         db=1500 cache=(empty)
+  B: SET cache=1500                            db=1500 cache=1500
+  A (delayed): SET cache=1200  -&gt; stale        db=1500 cache=1200
+delete-on-write, same two writers:
+  A, B: UPDATE then DEL (any order)            db=1500 cache=(empty)
+delete-on-write, slow reader:
+  R: cache miss, reads db=1000                 db=1000 cache=(empty)
+  W: UPDATE price=1500                         db=1500 cache=(empty)
+  W: DEL                                       db=1500 cache=(empty)
+  R (delayed): SET cache=1000  -&gt; stale        db=1500 cache=1000
+  W: second DEL after 500 ms                   db=1500 cache=(empty)</code></pre>
+
+<p><strong>Purging the CDN by tag.</strong> The origin labels each product page with the products it shows. After the update commits, one call purges them all (Fastly shown; Cloudflare's equivalent is the <code>Cache-Tag</code> header and its purge API with <code>"tags"</code>):</p>
+<pre><code># Origin response for /products/42 and for every list page that shows it:
+#   Surrogate-Key: product-42 category-lamps
+
+# After the price update commits: mark everything tagged product-42 stale.
+curl -X POST "https://api.fastly.com/service/$SERVICE_ID/purge/product-42" &#92;
+  -H "Fastly-Key: $FASTLY_API_TOKEN" &#92;
+  -H "Fastly-Soft-Purge: 1"</code></pre>
+
+<p><strong>Real-world scenario: two prices on one screen.</strong> At 14:05 a merchandiser cuts a lamp from 29.99 to 19.99. The API deletes <code>product:42</code> in Redis, so the cart and checkout show 19.99 straight away. But the product page HTML is cached at the CDN for 10 minutes, and category pages in each pod's local cache for 60 seconds. Until 14:15, customers see 29.99 on the product page and 19.99 at checkout, and some complain. The fix: tag product and category pages with <code>product-42</code>, and have the invalidator (fed by CDC) soft-purge that tag and publish the change so every pod drops its local copy. The pages now update within seconds, and the 10-minute TTL remains only as a safety net.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Deleting before the commit.</strong> Delete-then-update lets a reader refill the cache with the old row before the update lands. Always commit first, then delete. If the delete must be guaranteed, write an outbox row in the same transaction or rely on CDC.</li>
+  <li><strong>Invalidating inside the transaction.</strong> If the transaction then rolls back, you deleted for nothing (harmless). If you <em>set</em> the new value and it rolls back, the cache now holds data that never existed.</li>
+  <li><strong>Forgetting a write path.</strong> Admin panels, batch jobs, migrations and manual SQL don't run your invalidation code. That is the strongest argument for CDC and for always having a TTL.</li>
+  <li><strong>Not knowing which keys depend on a row.</strong> A product appears in its own key, in category lists, in search results and in recommendations. Keep the mapping explicit (tags, generation keys) or you will invalidate some copies and miss others.</li>
+  <li><strong>Purging everything on each deploy.</strong> It empties every edge at once and sends a stampede to the origin. Use fingerprinted assets and targeted purges.</li>
+  <li><strong>Assuming the delete worked.</strong> Redis can time out. Log it, retry it, and count failures as a <a href="#metrics">metric</a>; the TTL caps the damage.</li>
+  <li><strong>Local caches in every pod.</strong> Deleting from Redis doesn't touch in-process copies. Broadcast invalidations (Redis pub/sub, Kafka) or keep local TTLs to a few seconds.</li>
+</ul>
+
+<div class="callout warn"><strong>Rule of thumb</strong>: commit to the database, then delete (don't set) the cache key, and always keep a TTL as the backstop for every failure you didn't think of.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Invalidation is hard because copies are everywhere, caches don't see writes, and readers race writers.</li>
+  <li>Delete after commit beats set-on-write: deletes are idempotent and order-independent.</li>
+  <li>A slow reader can still put an old value back: delayed double delete narrows the window, leases close it, TTLs bound it.</li>
+  <li>Make change cheap by design: versioned keys, fingerprinted files, tags for CDN purges, CDC to catch every write.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#caching">Caching</a> · <a href="#edge-caching">Edge Caching</a> · <a href="#cdn">CDN</a> · <a href="#race-conditions">Race Conditions</a> · <a href="#event-driven-architecture">Event-Driven Architecture</a> · <a href="#real-world-caching-stack">Real-World Caching Stack</a></p>
+`;
