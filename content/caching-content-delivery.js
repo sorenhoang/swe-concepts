@@ -695,3 +695,285 @@ shield=true edge hit ratio=96.7% origin fetches: app.js=1 /me=30
 
 <p><strong>Related:</strong> <a href="#caching">Caching</a> · <a href="#edge-caching">Edge Caching</a> · <a href="#cache-invalidation">Cache Invalidation</a> · <a href="#dns">DNS</a> · <a href="#ddos-protection">DDoS Protection</a> · <a href="#real-world-caching-stack">Real-World Caching Stack</a></p>
 `;
+CONTENT["edge-caching"] = `
+<p class="tldr"><strong>TL;DR</strong>: Edge caching is the set of rules a CDN edge, or any shared HTTP cache, follows to decide whether it may store a response, which requests it can reuse it for, and for how long. Your origin sets those rules with headers: <code>Cache-Control</code>, <code>Vary</code>, <code>ETag</code>. Think of the headers as the label on a food container: who may eat it, and the "best before" date.</p>
+
+<h2>The problem it solves</h2>
+<p>A <a href="#cdn">CDN</a> sits between millions of users and your origin, but it doesn't know your application. It can't tell that <code>/products/42</code> is the same for everyone while <code>/account</code> is different per user, or that a price may be 30 seconds old but never 30 minutes. Without clear instructions it either caches too little (every request goes to the origin and the CDN is an expensive proxy) or too much (stale prices, or worse, one user's page served to another).</p>
+<p>HTTP caching, defined in <strong>RFC 9111</strong>, is that instruction language. One set of headers controls browsers, CDNs and reverse proxies at once, so learning it once pays off in every layer.</p>
+
+<h2>How it works</h2>
+<p>For each request, a shared cache runs roughly this decision:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 376" role="img" aria-label="Shared cache decision flow: build the cache key from method, host, path, query and the headers named in Vary. If nothing is stored, fetch from the origin and store it if allowed. If a stored copy is fresh, serve it as a hit. If it's stale but inside the stale-while-revalidate window, serve it and refresh in the background. Otherwise send a conditional request: 304 means reuse the copy, 200 means replace it, and an origin error inside stale-if-error means serve the stale copy.">
+  <defs><marker id="arr-ec-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="10" y="20" width="120" height="44" rx="8"/><text x="70" y="40" text-anchor="middle" class="title">GET request</text><text x="70" y="56" text-anchor="middle" class="small">arrives at edge</text>
+  <rect class="box" x="160" y="20" width="260" height="44" rx="8"/><text x="290" y="40" text-anchor="middle">cache key = host + path + query</text><text x="290" y="56" text-anchor="middle" class="small">+ request headers named in Vary</text>
+  <rect class="box accent" x="450" y="20" width="140" height="44" rx="22"/><text x="520" y="47" text-anchor="middle">stored copy?</text>
+  <rect class="box" x="630" y="20" width="140" height="44" rx="8"/><text x="700" y="40" text-anchor="middle" class="small">fetch from origin,</text><text x="700" y="56" text-anchor="middle" class="small">store if allowed</text>
+  <path class="line" d="M130 42 H158" marker-end="url(#arr-ec-1)"/>
+  <path class="line" d="M420 42 H448" marker-end="url(#arr-ec-1)"/>
+  <path class="line" d="M590 42 H628" marker-end="url(#arr-ec-1)"/><text x="609" y="34" text-anchor="middle" class="small">no</text>
+
+  <rect class="box accent" x="450" y="110" width="140" height="44" rx="22"/><text x="520" y="130" text-anchor="middle">fresh?</text><text x="520" y="146" text-anchor="middle" class="small">Age &lt; s-maxage</text>
+  <path class="line" d="M520 64 V108" marker-end="url(#arr-ec-1)"/><text x="530" y="91" class="small">yes</text>
+  <rect class="box ok" x="230" y="110" width="170" height="44" rx="8"/><text x="315" y="130" text-anchor="middle" class="title">HIT</text><text x="315" y="146" text-anchor="middle" class="small">serve stored copy</text>
+  <path class="line ok" d="M450 132 H402" marker-end="url(#arr-ec-1)"/><text x="426" y="124" text-anchor="middle" class="small">yes</text>
+
+  <rect class="box accent" x="450" y="200" width="140" height="44" rx="22"/><text x="520" y="220" text-anchor="middle">in SWR window?</text><text x="520" y="236" text-anchor="middle" class="small">stale-while-revalidate</text>
+  <path class="line" d="M520 154 V198" marker-end="url(#arr-ec-1)"/><text x="530" y="181" class="small">no</text>
+  <rect class="box ok" x="180" y="200" width="220" height="44" rx="8"/><text x="290" y="220" text-anchor="middle">serve stale copy now,</text><text x="290" y="236" text-anchor="middle" class="small">refresh from origin in background</text>
+  <path class="line ok" d="M450 222 H402" marker-end="url(#arr-ec-1)"/><text x="426" y="214" text-anchor="middle" class="small">yes</text>
+
+  <rect class="box" x="430" y="290" width="180" height="44" rx="8"/><text x="520" y="310" text-anchor="middle">revalidate with origin</text><text x="520" y="326" text-anchor="middle" class="small">If-None-Match: "etag"</text>
+  <path class="line" d="M520 244 V288" marker-end="url(#arr-ec-1)"/><text x="530" y="271" class="small">no</text>
+  <rect class="box ok" x="640" y="250" width="130" height="34" rx="6"/><text x="705" y="271" text-anchor="middle" class="small">304: reuse, reset age</text>
+  <rect class="box" x="640" y="295" width="130" height="34" rx="6"/><text x="705" y="316" text-anchor="middle" class="small">200: replace copy</text>
+  <rect class="box bad" x="640" y="340" width="130" height="34" rx="6"/><text x="705" y="361" text-anchor="middle" class="small">5xx: stale-if-error</text>
+  <path class="line" d="M610 304 L638 270" marker-end="url(#arr-ec-1)"/>
+  <path class="line" d="M610 312 H638" marker-end="url(#arr-ec-1)"/>
+  <path class="line" d="M610 320 L638 354" marker-end="url(#arr-ec-1)"/>
+  <text x="20" y="300" class="small">"fresh" uses s-maxage, else max-age,</text>
+  <text x="20" y="316" class="small">else Expires, else a heuristic guess.</text>
+  <text x="20" y="340" class="small">private / no-store responses</text>
+  <text x="20" y="356" class="small">never enter a shared cache.</text>
+</svg>
+<figcaption>Every box is driven by a header your origin sent. The cache key and <code>Vary</code> decide <em>which</em> stored copy matches; <code>Cache-Control</code> decides <em>whether</em> it may be used; <code>ETag</code> makes refreshing cheap.</figcaption>
+</figure>
+
+<h3>The directives that matter</h3>
+<table>
+  <tr><th>Directive (response)</th><th>Applies to</th><th>Meaning (RFC 9111 / 5861 / 8246)</th><th>Typical use</th></tr>
+  <tr><td><code>public</code></td><td>all caches</td><td>Any cache may store it, even for a request with <code>Authorization</code></td><td>Public pages and assets</td></tr>
+  <tr><td><code>private</code></td><td>shared caches</td><td>Only the user's own browser may store it; CDNs and proxies must not</td><td>Per-user pages that are fine to keep in the browser</td></tr>
+  <tr><td><code>max-age=N</code></td><td>all caches</td><td>Fresh for N seconds after it was generated</td><td>Browser lifetime</td></tr>
+  <tr><td><code>s-maxage=N</code></td><td>shared caches only</td><td>Overrides <code>max-age</code> and <code>Expires</code> for CDNs and proxies, and implies <code>proxy-revalidate</code> (no serving stale without permission)</td><td>Edge lifetime, different from the browser's</td></tr>
+  <tr><td><code>no-cache</code></td><td>all caches</td><td>May be stored, but must be revalidated with the origin before <em>every</em> reuse</td><td>HTML that must always be current, cheap thanks to 304s</td></tr>
+  <tr><td><code>no-store</code></td><td>all caches</td><td>Don't store it at all</td><td>Sensitive or per-user data</td></tr>
+  <tr><td><code>immutable</code></td><td>browsers mostly</td><td>The body will never change while fresh; don't revalidate even on reload (RFC 8246)</td><td>Fingerprinted assets with a year-long <code>max-age</code></td></tr>
+  <tr><td><code>stale-while-revalidate=N</code></td><td>all caches</td><td>After it goes stale, may be served for N more seconds while the cache revalidates in the background (RFC 5861)</td><td>Hide origin latency on popular objects</td></tr>
+  <tr><td><code>stale-if-error=N</code></td><td>all caches</td><td>If revalidation hits a 500, 502, 503 or 504, may serve the stale copy for up to N seconds (RFC 5861)</td><td>Keep pages up while the origin is down</td></tr>
+</table>
+<p>Two rules that surprise people:</p>
+<ul>
+  <li><strong><code>no-cache</code> doesn't mean "don't cache".</strong> It means "check with me first". <code>no-store</code> is "don't cache". (Some CDNs are stricter than the RFC: Cloudflare, for example, doesn't cache <code>no-cache</code> responses at all.)</li>
+  <li><strong>No headers is not "no caching".</strong> If a response has no <code>Cache-Control</code> or <code>Expires</code> but does have <code>Last-Modified</code>, caches may <em>guess</em> a freshness lifetime. RFC 9111 suggests a typical value of 10% of the time since the last modification. A file last changed 10 days ago could be cached for a day. Always send explicit headers.</li>
+</ul>
+<p>When one header must say different things to the browser and the CDN, use <code>max-age</code> + <code>s-maxage</code>, or the CDN-only header <code>CDN-Cache-Control</code> (RFC 9213), which a CDN that supports it uses instead of <code>Cache-Control</code>. Fastly's older <code>Surrogate-Control</code> serves the same purpose.</p>
+
+<h3>The cache key and <code>Vary</code></h3>
+<p>By default a CDN's key is roughly host + path + query string. <code>Vary</code> adds request headers to it: <code>Vary: Accept-Encoding</code> stores the gzip, brotli and plain copies separately, so a client that can't decode brotli never gets it. Every header in <code>Vary</code> multiplies the number of copies:</p>
+<ul>
+  <li><code>Vary: Accept-Language</code> sounds right, but browsers send hundreds of distinct values (<code>en-US,en;q=0.9</code>, <code>en-GB,en;q=0.8,fr;q=0.5</code>, …), so the hit ratio collapses. Normalize at the edge to a few supported languages first, or put the language in the URL.</li>
+  <li><code>Vary: Cookie</code> or <code>Vary: User-Agent</code> usually means one copy per user or per browser build: effectively uncacheable.</li>
+  <li><code>Vary: *</code> never matches anything, so the response can't be reused without revalidation.</li>
+</ul>
+
+<h3>Conditional requests and <code>Age</code></h3>
+<p>When a copy goes stale, the cache doesn't have to download it again. It asks the origin "has it changed?" with the validators the origin sent before:</p>
+<ul>
+  <li><code>ETag: "5a49888fe81a7cc8"</code> → the cache sends <code>If-None-Match: "5a49888fe81a7cc8"</code>.</li>
+  <li><code>Last-Modified: Thu, 12 Nov 2026 09:30:00 GMT</code> → the cache sends <code>If-Modified-Since</code> with that date. If both are present, <code>If-None-Match</code> wins.</li>
+</ul>
+<p>If nothing changed, the origin answers <code>304 Not Modified</code> with no body: a few hundred bytes instead of the whole object, and the copy is fresh again. A weak ETag (<code>W/"…"</code>) means "semantically the same", for example the same data with different whitespace. Every response a cache serves carries <code>Age</code>: the cache's estimate of how many seconds ago the origin generated or last validated it. <code>Age: 240</code> with <code>s-maxage=300</code> means 60 seconds of freshness left.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 236" role="img" aria-label="Lifetime of the product response. At the edge: fresh from 0 to 300 seconds, served stale while revalidating from 300 to 360, then must revalidate with the origin. A marker at 240 seconds shows Age 240. In the browser: fresh from 0 to 60 seconds, then each use revalidates with the edge, usually getting a 304.">
+  <text x="390" y="20" text-anchor="middle" class="title">public, max-age=60, s-maxage=300, stale-while-revalidate=60</text>
+  <text x="160" y="69" text-anchor="end">CDN edge</text>
+  <rect class="box ok" x="170" y="50" width="420" height="30" rx="4"/><text x="380" y="70" text-anchor="middle" class="small">fresh: HIT, no origin traffic</text>
+  <rect class="box accent" x="590" y="50" width="84" height="30" rx="4"/><text x="632" y="70" text-anchor="middle" class="small">serve stale</text>
+  <rect class="box muted" x="674" y="50" width="96" height="30" rx="4"/><text x="722" y="70" text-anchor="middle" class="small">revalidate</text>
+  <path class="line accent dashed" d="M506 44 V86"/>
+  <text x="506" y="100" text-anchor="middle" class="small">Age: 240</text>
+
+  <text x="160" y="139" text-anchor="end">Browser</text>
+  <rect class="box ok" x="170" y="120" width="84" height="30" rx="4"/><text x="212" y="140" text-anchor="middle" class="small">fresh</text>
+  <rect class="box muted" x="254" y="120" width="516" height="30" rx="4"/><text x="512" y="140" text-anchor="middle" class="small">each use: If-None-Match to the edge → usually a cheap 304</text>
+
+  <path class="line" d="M170 172 H770"/>
+  <path class="line" d="M170 166 V178 M254 166 V178 M590 166 V178 M674 166 V178"/>
+  <text x="170" y="194" text-anchor="middle" class="small">0 s</text>
+  <text x="254" y="194" text-anchor="middle" class="small">60 s</text>
+  <text x="590" y="194" text-anchor="middle" class="small">300 s</text>
+  <text x="674" y="194" text-anchor="middle" class="small">360 s</text>
+  <text x="390" y="224" text-anchor="middle" class="small">With stale-if-error=86400 the edge may keep serving the old copy for a day if the origin returns 5xx.</text>
+</svg>
+<figcaption>One response, two lifetimes. The edge absorbs traffic for five minutes; browsers stay within a minute of the edge. A popular object is requested inside the stale window, gets refreshed in the background, and almost never makes a user wait for the origin.</figcaption>
+</figure>
+
+<h3>Caching dynamic and API responses</h3>
+<p>"Dynamic" doesn't mean "uncacheable". The question is: <strong>is the response identical for everyone who sends this URL, and how stale may it be?</strong></p>
+<ul>
+  <li><strong>Public reads</strong> (<code>GET /products?category=keyboards</code>, a leaderboard, a news feed): <code>s-maxage</code> of a few seconds to a minute. Even <code>s-maxage=1</code> turns 5,000 requests per second for one URL into about one origin request per second per PoP (or per shield).</li>
+  <li><strong>Normalize the key</strong>: sort query parameters, drop <code>utm_*</code> and other tracking parameters, lowercase where it's safe, so equivalent URLs share one copy.</li>
+  <li><strong>Mixed pages</strong>: cache the public shell, and load the personalized parts (name, cart count) from a separate <code>private, no-store</code> API call in the browser.</li>
+  <li><strong>Authorization</strong>: by RFC 9111 a shared cache must not reuse a response to a request with <code>Authorization</code> unless the response says <code>public</code>, <code>s-maxage</code> or <code>must-revalidate</code>. So adding <code>s-maxage</code> to an authenticated endpoint switches that protection off.</li>
+</ul>
+
+<div class="callout warn"><strong>The personalization leak.</strong> On Christmas Day 2015, during a DoS attack that raised Steam's store traffic by 2,000%, Valve changed its caching configuration with a CDN partner. The new config cached pages that belonged to logged-in users, and for a while visitors were served other people's account pages. Valve said about 34,000 users had personal information exposed. The fix is boring: personalized routes send <code>private, no-store</code> from the origin, and the CDN is configured to respect origin headers rather than override them.</div>
+
+<h3>Edge compute (briefly)</h3>
+<p>Most CDNs can run small functions at the edge: Cloudflare Workers, CloudFront Functions and Lambda@Edge, Fastly Compute. Typical caching uses are rewriting the cache key (normalizing query strings or languages), bucketing users for A/B tests into a small number of cacheable variants, verifying a signed token before serving cached content, and redirects. Keep them small: they run on every request and are harder to test than your origin.</p>
+
+<h2>Example</h2>
+<p><strong>A Go origin that speaks HTTP caching.</strong> The product endpoint is public and sets browser and edge lifetimes, stale rules, an <code>ETag</code> and <code>Vary</code>. <code>http.ServeContent</code> from the standard library does the conditional-request logic: it compares <code>If-None-Match</code> with the <code>ETag</code> header you set, falls back to <code>If-Modified-Since</code>, and sends the 304. The <code>/me</code> endpoint is per-user, so it's <code>private, no-store</code>.</p>
+<pre><code>package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"time"
+)
+
+type Product struct {
+	ID        string    &#96;json:"id"&#96;
+	Name      string    &#96;json:"name"&#96;
+	PriceCent int       &#96;json:"price_cents"&#96;
+	UpdatedAt time.Time &#96;json:"updated_at"&#96;
+}
+
+var updated = time.Date(2026, 11, 12, 9, 30, 0, 0, time.UTC)
+
+// Public, identical for every user: browsers keep it 60 s, the CDN 5 min,
+// then the CDN may serve it stale for 60 s while it refetches, or for a day
+// if the origin is returning 5xx.
+func productHandler(w http.ResponseWriter, r *http.Request) {
+	p := Product{ID: "p-42", Name: "Mechanical keyboard", PriceCent: 8900, UpdatedAt: updated}
+	body, _ := json.Marshal(p)
+	sum := sha256.Sum256(body)
+
+	h := w.Header()
+	h.Set("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400")
+	h.Set("ETag", &#96;"&#96;+hex.EncodeToString(sum[:8])+&#96;"&#96;)
+	h.Set("Vary", "Accept-Encoding")
+	h.Set("Content-Type", "application/json")
+	// ServeContent answers If-None-Match / If-Modified-Since with a 304
+	// and sets Last-Modified from p.UpdatedAt.
+	http.ServeContent(w, r, "", p.UpdatedAt, bytes.NewReader(body))
+}
+
+// Depends on who is asking: no shared cache may store it.
+func meHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(&#96;{"user":"from session cookie"}&#96;))
+}
+
+func routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /products/p-42", productHandler)
+	mux.HandleFunc("GET /me", meHandler)
+	return mux
+}
+
+func main() {
+	http.ListenAndServe(":8080", routes())
+}</code></pre>
+
+<p>A test that plays the part of a cache revalidating, with <code>httptest</code>:</p>
+<pre><code>package main
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func show(t *testing.T, url string, hdr map[string]string) string {
+	req, _ := http.NewRequest("GET", url, nil)
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+		t.Logf("&gt; %s: %s", k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	t.Logf("&lt; %s", resp.Status)
+	for _, k := range []string{"Cache-Control", "Etag", "Last-Modified", "Vary", "Content-Length"} {
+		if v := resp.Header.Get(k); v != "" {
+			t.Logf("&lt; %s: %s", k, v)
+		}
+	}
+	t.Logf("&lt; body: %d bytes %s", len(body), body)
+	return resp.Header.Get("ETag")
+}
+
+func TestConditional(t *testing.T) {
+	srv := httptest.NewServer(routes())
+	defer srv.Close()
+	url := srv.URL + "/products/p-42"
+
+	t.Log("--- 1. first request")
+	etag := show(t, url, nil)
+	t.Log("--- 2. revalidate with the ETag")
+	show(t, url, map[string]string{"If-None-Match": etag})
+	t.Log("--- 3. client holds an outdated ETag")
+	show(t, url, map[string]string{"If-None-Match": &#96;"0000000000000000"&#96;})
+	t.Log("--- 4. personalised route")
+	show(t, srv.URL+"/me", nil)
+}</code></pre>
+<p>Real output of <code>go test -v</code> (<code>&gt;</code> = request header sent, <code>&lt;</code> = response):</p>
+<pre><code>--- 1. first request
+&lt; 200 OK
+&lt; Cache-Control: public, max-age=60, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400
+&lt; Etag: "5a49888fe81a7cc8"
+&lt; Last-Modified: Thu, 12 Nov 2026 09:30:00 GMT
+&lt; Vary: Accept-Encoding
+&lt; Content-Length: 97
+&lt; body: 97 bytes {"id":"p-42","name":"Mechanical keyboard","price_cents":8900,"updated_at":"2026-11-12T09:30:00Z"}
+--- 2. revalidate with the ETag
+&gt; If-None-Match: "5a49888fe81a7cc8"
+&lt; 304 Not Modified
+&lt; Cache-Control: public, max-age=60, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400
+&lt; Etag: "5a49888fe81a7cc8"
+&lt; Vary: Accept-Encoding
+&lt; body: 0 bytes 
+--- 3. client holds an outdated ETag
+&gt; If-None-Match: "0000000000000000"
+&lt; 200 OK
+&lt; Cache-Control: public, max-age=60, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400
+&lt; Etag: "5a49888fe81a7cc8"
+&lt; Last-Modified: Thu, 12 Nov 2026 09:30:00 GMT
+&lt; Vary: Accept-Encoding
+&lt; Content-Length: 97
+&lt; body: 97 bytes {"id":"p-42","name":"Mechanical keyboard","price_cents":8900,"updated_at":"2026-11-12T09:30:00Z"}
+--- 4. personalised route
+&lt; 200 OK
+&lt; Cache-Control: private, no-store
+&lt; Content-Length: 30
+&lt; body: 30 bytes {"user":"from session cookie"}</code></pre>
+<p>Request 2 is what the edge sends after 300 seconds: the 304 has no body, and the copy is fresh for another 300 seconds. Request 3 shows the client with an outdated ETag getting the full 200 with the new one. Go writes the header as <code>Etag</code>; header names are case-insensitive.</p>
+
+<p><strong>Real-world scenario.</strong> A shop's product API gets 3,000 requests per second for its top 500 products, served from 40 PoPs behind a shield. With <code>s-maxage=300, stale-while-revalidate=60</code>, the shield refreshes each product about once every 5 minutes: 500 products / 300 s ≈ 2 origin requests per second, and most of those are 304s. At 14:05 the origin's database stalls and returns 503s for four minutes. Because of <code>stale-if-error=86400</code>, users keep seeing product pages (prices up to a few minutes old), while checkout, which is never cached, shows the outage honestly.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Marking per-user responses cacheable.</strong> <code>public</code> or <code>s-maxage</code> on anything that reads a cookie or token can leak data between users. Make <code>private, no-store</code> the default for authenticated routes and opt in to caching per route.</li>
+  <li><strong>Cookies on public responses.</strong> A <code>Set-Cookie</code> on a product page either stops caching (Cloudflare doesn't cache responses with <code>Set-Cookie</code> by default) or, with an override rule, hands one user's session cookie to everyone. Don't set cookies on cacheable responses.</li>
+  <li><strong>Confusing <code>no-cache</code> and <code>no-store</code>.</strong> Use <code>no-store</code> for secrets, <code>no-cache</code> for "always fresh, but 304s are fine".</li>
+  <li><strong>Missing headers.</strong> Caches will guess with heuristic freshness. Send <code>Cache-Control</code> on every response, even if it's <code>no-store</code>.</li>
+  <li><strong>Exploding <code>Vary</code>.</strong> <code>Vary: User-Agent</code>, <code>Cookie</code> or raw <code>Accept-Language</code> gives each user their own copy. Normalize at the edge, then vary on the normalized value.</li>
+  <li><strong>ETags that differ per server.</strong> If each instance computes ETags from something local (inode, mtime on its own disk), revalidation always returns 200. Derive the ETag from the content or from a version number.</li>
+  <li><strong>Caching errors.</strong> A 404 or 500 cached for an hour outlives the bug. Give error responses short TTLs or none.</li>
+  <li><strong>Long TTLs on mutable URLs.</strong> <code>max-age=31536000</code> on <code>/app.js</code> can't be undone in browsers; only purge reaches the CDN. Long TTLs belong on fingerprinted URLs (see <a href="#cache-invalidation">Cache Invalidation</a>).</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li><code>Cache-Control</code> from the origin drives every cache: <code>max-age</code> for browsers, <code>s-maxage</code> for the edge, <code>private</code>/<code>no-store</code> for anything per-user.</li>
+  <li>The cache key (URL + <code>Vary</code>) decides which copy matches; keep it small and normalized.</li>
+  <li><code>ETag</code> + 304 makes revalidation cheap; <code>stale-while-revalidate</code> and <code>stale-if-error</code> hide origin latency and outages.</li>
+  <li>Cache dynamic public data for seconds; never cache personalized responses in a shared cache.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#cdn">CDN</a> · <a href="#caching">Caching</a> · <a href="#cache-invalidation">Cache Invalidation</a> · <a href="#reverse-proxies">Reverse Proxies</a> · <a href="#real-world-caching-stack">Real-World Caching Stack</a></p>
+`;
