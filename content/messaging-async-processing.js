@@ -1298,3 +1298,304 @@ o-4  attempt 1  ok
 
 <p><strong>Related:</strong> <a href="#message-queues">Message Queues</a> · <a href="#retries">Retries</a> · <a href="#exponential-backoff">Exponential Backoff</a> · <a href="#idempotency">Idempotency</a> · <a href="#alerts">Alerts</a> · <a href="#real-world-async-pipeline">Real-World Async Pipeline</a></p>
 `;
+CONTENT["cron-jobs"] = `
+<p class="tldr"><strong>TL;DR</strong>: A cron job runs a task on a clock: "every day at 02:30", "every 15 minutes on weekdays". The syntax is easy. The hard part is everything around it once you run more than one server: every replica fires the same job, runs overlap, ticks get missed during deploys, and daylight saving time skips or repeats hours. Production cron means <strong>one run per tick</strong> (a lock or a single scheduler), <strong>idempotent jobs</strong>, and an <strong>alert when a job doesn't run</strong>.</p>
+
+<h2>The problem it solves</h2>
+<p>A lot of backend work isn't triggered by a request. It's triggered by time:</p>
+<ul>
+  <li>expire abandoned carts and unpaid reservations every 15 minutes</li>
+  <li>send the daily digest email at 08:00 in each user's timezone</li>
+  <li>close the books, build reports, compute invoices at month end</li>
+  <li>clean up sent rows from an outbox, old sessions, temp files</li>
+  <li>reconcile with a payment provider and redrive a <a href="#dead-letter-queues">dead-letter queue</a> each night</li>
+</ul>
+<p>On a single server, a line in <code>crontab</code> does this. In a modern deployment there are three replicas behind a load balancer, pods that restart during deploys, and several timezones. A naive scheduler in each replica sends three digests to every user. A job that runs longer than its interval piles up copies of itself. A deploy at 02:29 means the 02:30 run never happens, and nobody notices for a week.</p>
+
+<h2>How it works</h2>
+<h3>Cron syntax</h3>
+<p>A classic cron expression has five fields, separated by spaces. Each field can be <code>*</code> (any), a number, a list (<code>1,15</code>), a range (<code>9-17</code>) or a step (<code>*/15</code>, <code>0-30/10</code>).</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 210" role="img" aria-label="The cron expression */15 9-17 * * 1-5 split into five fields: minute every 15, hour 9 to 17, any day of month, any month, day of week Monday to Friday. Meaning: every 15 minutes from 09:00 to 17:45 on weekdays.">
+  <rect class="box accent" x="20" y="30" width="130" height="60" rx="8"/><text x="85" y="57" text-anchor="middle" class="title">*/15</text><text x="85" y="77" text-anchor="middle" class="small">minute 0-59</text>
+  <rect class="box accent" x="170" y="30" width="130" height="60" rx="8"/><text x="235" y="57" text-anchor="middle" class="title">9-17</text><text x="235" y="77" text-anchor="middle" class="small">hour 0-23</text>
+  <rect class="box" x="320" y="30" width="130" height="60" rx="8"/><text x="385" y="57" text-anchor="middle" class="title">*</text><text x="385" y="77" text-anchor="middle" class="small">day of month 1-31</text>
+  <rect class="box" x="470" y="30" width="130" height="60" rx="8"/><text x="535" y="57" text-anchor="middle" class="title">*</text><text x="535" y="77" text-anchor="middle" class="small">month 1-12</text>
+  <rect class="box accent" x="620" y="30" width="140" height="60" rx="8"/><text x="690" y="57" text-anchor="middle" class="title">1-5</text><text x="690" y="77" text-anchor="middle" class="small">day of week 0-7</text>
+  <text x="85" y="112" text-anchor="middle" class="small">:00 :15 :30 :45</text>
+  <text x="235" y="112" text-anchor="middle" class="small">09 through 17</text>
+  <text x="385" y="112" text-anchor="middle" class="small">any day</text>
+  <text x="535" y="112" text-anchor="middle" class="small">any month</text>
+  <text x="690" y="112" text-anchor="middle" class="small">Mon-Fri (0 and 7 = Sun)</text>
+  <rect class="box ok" x="120" y="138" width="540" height="56" rx="8"/>
+  <text x="390" y="161" text-anchor="middle">every 15 minutes, 09:00 to 17:45, Monday to Friday</text>
+  <text x="390" y="181" text-anchor="middle" class="small">the last run is 17:45: hour 17 matches, and so does every quarter inside it</text>
+</svg>
+<figcaption>Read each field as a filter. The job runs in every minute where all five match, with one exception for the two day fields (below).</figcaption>
+</figure>
+<p>Details that trip people up (from the <code>crontab(5)</code> man page):</p>
+<ul>
+  <li><strong>Day of month OR day of week.</strong> If <em>both</em> day fields are restricted, the job runs when <em>either</em> matches. <code>30 4 1,15 * 5</code> runs on the 1st, the 15th, <em>and</em> every Friday. It does not mean "Friday the 1st".</li>
+  <li><strong>Steps restart in each hour.</strong> <code>*/35</code> in the minute field means minutes 0 and 35 of every hour, not "every 35 minutes".</li>
+  <li><strong>Macros.</strong> <code>@hourly</code>, <code>@daily</code> (or <code>@midnight</code>), <code>@weekly</code>, <code>@monthly</code>, <code>@yearly</code> (or <code>@annually</code>) replace the five fields. <code>@reboot</code> exists in crontab, but not in Kubernetes.</li>
+  <li><strong>Dialects differ.</strong> Quartz and Spring add a seconds field. AWS EventBridge Scheduler uses six fields with a year, and requires <code>?</code> in one of the day fields. Go's <code>robfig/cron/v3</code> takes 5 fields by default, 6 with <code>cron.WithSeconds()</code>, plus <code>@every 1h30m</code> for fixed intervals. Always check which parser reads your string.</li>
+</ul>
+
+<h3>Timezones and daylight saving time</h3>
+<p>A schedule is evaluated in some timezone, and the default is often "whatever the machine has". <code>robfig/cron</code> uses <code>time.Local</code> unless you pass <code>cron.WithLocation</code> or prefix the spec with <code>CRON_TZ=Europe/Berlin</code>. Kubernetes uses <code>.spec.timeZone</code> and rejects <code>CRON_TZ</code> in the schedule. Google Cloud Scheduler defaults to UTC. When the zone has daylight saving time, wall-clock schedules break twice a year:</p>
+<ul>
+  <li><strong>Spring forward:</strong> one hour is skipped, so a 02:30 job has no 02:30 that night. The cronie man page says those jobs don't run. <code>robfig/cron</code> warns that jobs in the skipped hour "will not be run". EventBridge Scheduler skips that day's run.</li>
+  <li><strong>Fall back:</strong> one hour happens twice (01:00–01:59 in US zones, 02:00–02:59 in central Europe). Cronie runs matching jobs twice. EventBridge runs once, at the second occurrence. Other schedulers differ again.</li>
+</ul>
+<p>The safe default is to schedule in UTC. Use a local zone only when the business rule really is local ("send at 08:00 Berlin time"), and then keep jobs away from 01:00–03:00. Also note that a clock that is a few seconds off on one node shifts its ticks too (see <a href="#clock-skew">Clock Skew</a>).</p>
+
+<h3>Cron at scale: four failure modes</h3>
+<ol>
+  <li><strong>Every replica runs it.</strong> An in-process scheduler in a service with 3 replicas fires 3 times per tick.</li>
+  <li><strong>Runs overlap.</strong> A job scheduled every 5 minutes that sometimes takes 12 starts a second and third copy while the first is still working. They fight over the same rows.</li>
+  <li><strong>Runs are missed.</strong> The process was restarting, the node was down, or the scheduler was paused. Classic cron doesn't catch up. Systemd timers with <code>Persistent=true</code>, K8s <code>startingDeadlineSeconds</code> and Temporal's catchup window each handle it differently.</li>
+  <li><strong>Runs happen twice anyway.</strong> Even managed schedulers say so. The Kubernetes docs: "there are certain circumstances where two Jobs might be created, or no Job might be created", so jobs "should be idempotent". Google Cloud Scheduler is "designed to provide at-least-once delivery". EventBridge Scheduler also promises at-least-once.</li>
+</ol>
+
+<h3>The fixes</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 280" role="img" aria-label="Three pods each fire the cleanup schedule at the same tick and try SET NX on a Redis key named for that tick. pod-a wins and adds one work item to a jobs stream, which workers process. pod-b and pod-c find the key already set and skip.">
+  <defs><marker id="arr-cron-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="40" width="130" height="44" rx="6"/><text x="85" y="60" text-anchor="middle">pod-a</text><text x="85" y="76" text-anchor="middle" class="small">tick 02:30:00</text>
+  <rect class="box" x="20" y="118" width="130" height="44" rx="6"/><text x="85" y="138" text-anchor="middle">pod-b</text><text x="85" y="154" text-anchor="middle" class="small">tick 02:30:00</text>
+  <rect class="box" x="20" y="196" width="130" height="44" rx="6"/><text x="85" y="216" text-anchor="middle">pod-c</text><text x="85" y="232" text-anchor="middle" class="small">tick 02:30:00</text>
+  <rect class="box accent" x="225" y="105" width="185" height="70" rx="8"/><text x="317" y="130" text-anchor="middle" class="title">Redis SET NX EX</text><text x="317" y="148" text-anchor="middle" class="small">key cron:cleanup:&lt;tick&gt;</text><text x="317" y="164" text-anchor="middle" class="small">first writer wins</text>
+  <path class="line" d="M150 62 L223 122" marker-end="url(#arr-cron-2)"/>
+  <path class="line" d="M150 140 H223" marker-end="url(#arr-cron-2)"/>
+  <path class="line" d="M150 218 L223 158" marker-end="url(#arr-cron-2)"/>
+  <rect class="box ok" x="470" y="40" width="140" height="50" rx="6"/><text x="540" y="61" text-anchor="middle" class="title">jobs stream</text><text x="540" y="79" text-anchor="middle" class="small">XADD 1 work item</text>
+  <rect class="box bad" x="470" y="190" width="140" height="50" rx="6"/><text x="540" y="211" text-anchor="middle" class="title">skip</text><text x="540" y="229" text-anchor="middle" class="small">pod-b, pod-c</text>
+  <rect class="box" x="650" y="40" width="115" height="50" rx="6"/><text x="707" y="61" text-anchor="middle" class="title">Workers</text><text x="707" y="79" text-anchor="middle" class="small">process, retry</text>
+  <path class="line ok" d="M410 125 L468 70" marker-end="url(#arr-cron-2)"/><text x="385" y="95" text-anchor="middle" class="small">pod-a: OK</text>
+  <path class="line bad" d="M410 158 L468 210" marker-end="url(#arr-cron-2)"/><text x="452" y="168" text-anchor="middle" class="small">nil</text>
+  <path class="line" d="M610 65 H648" marker-end="url(#arr-cron-2)"/>
+</svg>
+<figcaption>The scheduler decides <em>when</em>, the lock decides <em>who</em>, and the queue holds the <em>work</em>. Naming the key after the tick means a slow replica can't run the same tick again after the lock expires.</figcaption>
+</figure>
+<ul>
+  <li><strong>One scheduler, not N.</strong> Run the schedule outside the replicas: a Kubernetes CronJob, a cloud scheduler, or a single dedicated scheduler process. Or keep it in-process and elect a leader (see <a href="#leader-election">Leader Election</a>), or take a per-tick lock as in the diagram (see <a href="#distributed-locks">Distributed Locks</a>).</li>
+  <li><strong>Cron enqueues, workers work.</strong> The scheduled function should do almost nothing: put "expire carts for slot 02:30" on a queue and return. Workers get retries, a <a href="#dead-letter-queues">DLQ</a>, horizontal scaling and metrics for free (see <a href="#message-queues">Message Queues</a>). A deploy can't kill a 40-minute job halfway, because the job is now 4,000 small messages.</li>
+  <li><strong>A policy for overlap.</strong> Decide what happens when the previous run is still going (next diagram): skip, wait, replace, or allow.</li>
+  <li><strong>Idempotent jobs.</strong> Write each job so running it twice is harmless: "expire carts older than 30 min that are still open", not "expire the next 1,000 carts". Use a unique key per period (<code>invoice:2026-11</code>). See <a href="#idempotency">Idempotency</a>.</li>
+  <li><strong>Alert on silence.</strong> A failed job may log an error; a job that never started logs nothing. Use a <strong>dead man's switch</strong>: the job pings a heartbeat (or updates a "last success" metric) at the end of each run, and an alert fires when there has been no ping for longer than the interval plus a margin. See <a href="#alerts">Alerts</a>.</li>
+</ul>
+
+<h3>When the job is slower than its schedule</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 285" role="img" aria-label="Timeline of a 2.5 second job scheduled every second, ticks at 1 to 5 seconds. Allow: a new run starts every tick and up to three overlap. Forbid or SkipIfStillRunning: runs at 1 and 4, ticks 2, 3 and 5 skipped. Replace: each tick kills the running job, so no run ever finishes. DelayIfStillRunning: runs back to back, and a backlog of waiting runs grows.">
+  <text x="15" y="62" class="title">Allow</text><text x="15" y="78" class="small">K8s default</text>
+  <rect class="box accent" x="267" y="50" width="230" height="8" rx="2"/>
+  <rect class="box accent" x="359" y="61" width="230" height="8" rx="2"/>
+  <rect class="box accent" x="451" y="72" width="230" height="8" rx="2"/>
+  <rect class="box accent" x="543" y="50" width="184" height="8" rx="2"/>
+  <rect class="box accent" x="635" y="61" width="92" height="8" rx="2"/>
+
+  <text x="15" y="117" class="title">Forbid</text><text x="15" y="133" class="small">robfig: SkipIfStillRunning</text>
+  <rect class="box ok" x="267" y="110" width="230" height="14" rx="3"/>
+  <rect class="box ok" x="543" y="110" width="184" height="14" rx="3"/>
+  <text x="359" y="142" text-anchor="middle" class="small">skip</text><text x="451" y="142" text-anchor="middle" class="small">skip</text><text x="635" y="142" text-anchor="middle" class="small">skip</text>
+
+  <text x="15" y="172" class="title">Replace</text><text x="15" y="188" class="small">K8s; Temporal CancelOther</text>
+  <rect class="box bad" x="267" y="165" width="88" height="14" rx="3"/>
+  <rect class="box bad" x="359" y="165" width="88" height="14" rx="3"/>
+  <rect class="box bad" x="451" y="165" width="88" height="14" rx="3"/>
+  <rect class="box bad" x="543" y="165" width="88" height="14" rx="3"/>
+  <rect class="box bad" x="635" y="165" width="92" height="14" rx="3"/>
+  <text x="497" y="197" text-anchor="middle" class="small">each tick kills the run: none ever finishes</text>
+
+  <text x="15" y="222" class="title">Delay</text><text x="15" y="238" class="small">robfig: DelayIfStillRunning</text>
+  <rect class="box" x="267" y="215" width="230" height="14" rx="3"/>
+  <rect class="box" x="497" y="215" width="230" height="14" rx="3"/>
+  <text x="612" y="244" text-anchor="middle" class="small">3 runs still waiting</text>
+
+  <path class="line" d="M175 256 H735"/>
+  <path class="line" d="M175 252 V260 M267 252 V260 M359 252 V260 M451 252 V260 M543 252 V260 M635 252 V260 M727 252 V260"/>
+  <text x="175" y="276" text-anchor="middle" class="small">0s</text><text x="267" y="276" text-anchor="middle" class="small">1s</text><text x="359" y="276" text-anchor="middle" class="small">2s</text><text x="451" y="276" text-anchor="middle" class="small">3s</text><text x="543" y="276" text-anchor="middle" class="small">4s</text><text x="635" y="276" text-anchor="middle" class="small">5s</text><text x="727" y="276" text-anchor="middle" class="small">6s</text>
+</svg>
+<figcaption>A 2.5 s job on a 1 s schedule, ticks at 1–5 s. The Forbid row matches the real test output below: runs at 1 s and 4 s, three ticks skipped. Scale it up to a 12-minute job on a 5-minute schedule and you get the same pictures.</figcaption>
+</figure>
+
+<h3>Choosing a scheduler</h3>
+<table>
+  <tr><th>Option</th><th>Runs where</th><th>Overlap control</th><th>Missed runs</th><th>Timezone</th><th>Watch out for</th></tr>
+  <tr><td>crontab (cronie, Vixie cron)</td><td>one machine</td><td>none built in (wrap with <code>flock</code>)</td><td>lost; <code>anacron</code> or systemd timers with <code>Persistent=true</code> catch up</td><td><code>CRON_TZ</code> in cronie</td><td>the machine is a single point of failure; output goes to local mail</td></tr>
+  <tr><td>Kubernetes CronJob</td><td>a new Job (Pod) per run</td><td><code>concurrencyPolicy</code>: <code>Allow</code> (default), <code>Forbid</code>, <code>Replace</code></td><td>runs late within <code>startingDeadlineSeconds</code>; after more than 100 missed schedules it starts only the latest</td><td><code>.spec.timeZone</code> (stable since v1.27)</td><td>may create two Jobs or none; Pod startup adds seconds</td></tr>
+  <tr><td>AWS EventBridge Scheduler</td><td>managed; calls a target (Lambda, SQS, ECS, any AWS API)</td><td>none; the target must handle it</td><td>retries with a configurable policy; failed events can go to a DLQ</td><td>any IANA zone, DST handled as above</td><td>at-least-once; 60-second precision; 6-field cron dialect</td></tr>
+  <tr><td>Google Cloud Scheduler</td><td>managed; calls HTTP, Pub/Sub or App Engine</td><td>none</td><td>retries with exponential backoff</td><td>tz database name, default UTC</td><td>at-least-once; can run "multiple times" for one tick</td></tr>
+  <tr><td><code>robfig/cron/v3</code> in-process</td><td>inside every replica of your Go service</td><td><code>SkipIfStillRunning</code>, <code>DelayIfStillRunning</code> (per process)</td><td>lost while the process is down</td><td><code>WithLocation</code>, <code>CRON_TZ=</code></td><td>runs on every replica unless you add a lock or leader; no panic recovery unless you add <code>cron.Recover</code></td></tr>
+  <tr><td>Workflow engine (e.g. Temporal Schedules)</td><td>starts a durable workflow per run</td><td>overlap policies: <code>Skip</code> (default), <code>BufferOne</code>, <code>BufferAll</code>, <code>CancelOther</code>, <code>TerminateOther</code>, <code>AllowAll</code></td><td>catchup window (default one year), backfill</td><td>zone name, UTC by default</td><td>another system to run; worth it for long, multi-step jobs</td></tr>
+</table>
+<pre><code># Not executed here: a Kubernetes CronJob for the nightly cleanup.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: expire-carts
+spec:
+  schedule: "30 2 * * *"
+  timeZone: "Etc/UTC"            # stable since Kubernetes v1.27
+  concurrencyPolicy: Forbid      # default is Allow
+  startingDeadlineSeconds: 600   # missed by &gt;10 min? skip this run
+  successfulJobsHistoryLimit: 3  # default 3
+  failedJobsHistoryLimit: 1      # default 1
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: job
+            image: registry.example.com/shop:1.42
+            args: ["expire-carts"]</code></pre>
+
+<h2>Example</h2>
+<p><strong>Three replicas, one run per tick.</strong> Each replica runs its own <code>robfig/cron/v3</code> scheduler (the realistic case: you deployed one image three times). The job is wrapped in <code>OncePerSlot</code>, which claims a Redis key named after the tick with <code>SET NX</code>. The winner only <em>enqueues</em> work on a Redis stream. Redis is <code>miniredis</code> in the test, with the real <code>go-redis/v9</code> client. <code>@every 1s</code> stands in for <code>30 2 * * *</code> so the test is quick.</p>
+<pre><code>package cronjobs
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// OncePerSlot wraps a job so that, of all replicas firing the same schedule,
+// only the first to claim this time slot in Redis runs it. The key names the
+// slot ("cleanup:1731657600"), so a late replica can't run the same tick again,
+// and the TTL lets Redis forget old slots on its own.
+func OncePerSlot(rdb *redis.Client, replica, job string, slot, ttl time.Duration,
+	run func(ctx context.Context) error, onSkip func()) func() {
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), ttl)
+		defer cancel()
+		tick := time.Now().Truncate(slot).Unix()
+		key := fmt.Sprintf("cron:%s:%d", job, tick)
+
+		won, err := rdb.SetNX(ctx, key, replica, ttl).Result()
+		if err != nil {
+			log.Printf("%s: lock %s: %v", replica, key, err) // Redis down: skip, don't double-run
+			return
+		}
+		if !won {
+			onSkip()
+			return
+		}
+		if err := run(ctx); err != nil {
+			log.Printf("%s: job %s failed: %v", replica, key, err)
+		}
+	}
+}
+
+// Enqueue is the job body: the scheduler only drops a work item on a stream.
+// Workers (any replica) pick it up, retry it and scale independently.
+func Enqueue(rdb *redis.Client, stream, task string) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		return rdb.XAdd(ctx, &amp;redis.XAddArgs{
+			Stream: stream,
+			Values: map[string]any{"task": task, "slot": time.Now().Truncate(time.Second).Unix()},
+		}).Err()
+	}
+}</code></pre>
+
+<p>The test starts 3 replicas just after a whole second, so all of them see the same 3 ticks (the <code>alignToSecond</code> helper is omitted). It runs once without the lock and once with it:</p>
+<pre><code>func runReplicas(t *testing.T, useLock bool) (fired, ran, skipped int64, queued int64) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&amp;redis.Options{Addr: mr.Addr()})
+	var f, r, s atomic.Int64
+
+	start := alignToSecond()
+	var crons []*cron.Cron
+	for _, name := range []string{"pod-a", "pod-b", "pod-c"} {
+		c := cron.New()
+		work := func(ctx context.Context) error { r.Add(1); return Enqueue(rdb, "jobs:cleanup", "expire-carts")(ctx) }
+		var job func()
+		if useLock {
+			job = OncePerSlot(rdb, name, "cleanup", time.Second, 10*time.Second, work, func() { s.Add(1) })
+		} else {
+			job = func() { work(context.Background()) }
+		}
+		if _, err := c.AddFunc("@every 1s", func() { f.Add(1); job() }); err != nil {
+			t.Fatal(err)
+		}
+		c.Start()
+		crons = append(crons, c)
+	}
+	time.Sleep(time.Until(start.Add(3400 * time.Millisecond))) // 3 ticks
+	for _, c := range crons {
+		&lt;-c.Stop().Done()
+	}
+	return f.Load(), r.Load(), s.Load(), rdb.XLen(context.Background(), "jobs:cleanup").Val()
+}
+
+func TestThreeReplicas(t *testing.T) {
+	f, r, s, q := runReplicas(t, false)
+	fmt.Printf("no lock:   fired=%d ran=%d skipped=%d queued=%d&#92;n", f, r, s, q)
+	f, r, s, q = runReplicas(t, true)
+	fmt.Printf("with lock: fired=%d ran=%d skipped=%d queued=%d&#92;n", f, r, s, q)
+}</code></pre>
+
+<p>A second test shows overlap: a 2.5 s job on a 1 s schedule, with <code>SkipIfStillRunning</code>. A tiny logger counts the "skip" messages it logs. <code>cron.Recover</code> is added on purpose: in v3, <code>cron.New()</code> doesn't recover panics unless you add it to the chain.</p>
+<pre><code>func TestSkipIfStillRunning(t *testing.T) {
+	logger := &amp;skipCounter{}
+	c := cron.New(cron.WithChain(cron.Recover(logger), cron.SkipIfStillRunning(logger)))
+
+	var mu sync.Mutex
+	var timeline []string
+	start := alignToSecond()
+	c.AddFunc("@every 1s", func() {
+		at := time.Since(start).Round(time.Second)
+		mu.Lock()
+		timeline = append(timeline, fmt.Sprintf("t=%v start", at))
+		mu.Unlock()
+		time.Sleep(2500 * time.Millisecond) // the job is slower than its schedule
+	})
+	c.Start()
+	time.Sleep(time.Until(start.Add(5400 * time.Millisecond))) // 5 ticks
+	&lt;-c.Stop().Done()
+
+	fmt.Println(timeline)
+	fmt.Printf("ticks=5 runs=%d skipped=%d&#92;n", len(timeline), logger.skips.Load())
+}</code></pre>
+
+<p>Real output of <code>go test -v -race</code> (two runs gave identical counts):</p>
+<pre><code>no lock:   fired=9 ran=9 skipped=0 queued=9
+with lock: fired=9 ran=3 skipped=6 queued=3
+--- PASS: TestThreeReplicas (8.05s)
+[t=1s start t=4s start]
+ticks=5 runs=2 skipped=3
+--- PASS: TestSkipIfStillRunning (7.00s)
+PASS</code></pre>
+<p>Without the lock, 3 replicas × 3 ticks = 9 runs and 9 work items: every user would get three digests. With the lock, the same 9 firings produce 3 runs and 3 work items. One replica per tick wins, and it doesn't matter which. In the overlap test, the job ran at 1 s and 4 s, and ticks 2, 3 and 5 were skipped.</p>
+
+<p><strong>Real-world scenario.</strong> A shop expires unpaid orders every 5 minutes. The job loads orders older than 30 minutes and releases their stock. On a normal day it takes 20 s. On Black Friday, 60,000 pending orders make it take 9 minutes. With in-process cron on 4 replicas and no protection, 4 copies start at 10:00, 4 more at 10:05 while the first ones are still running, and all of them release stock for the same orders. Stock counts go wrong and the database runs at full CPU. With the fixes: one run per tick (the lock), <code>SkipIfStillRunning</code>, and a job that only enqueues "expire orders created before 09:30" for workers to process in batches of 500. Now 120 batches spread across the worker pool and finish in about a minute. A heartbeat alert fires if no run completes for 15 minutes.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>In-process cron on every replica.</strong> It works locally and with one replica. When you scale to 3, every job runs 3 times. Add a lock or leader election, or move the schedule out of the service.</li>
+  <li><strong>A lock with a TTL shorter than the job.</strong> If the lock expires while the job is still running, another replica starts a second copy. Key the lock by tick (as above), or renew it while running, and keep the job idempotent anyway.</li>
+  <li><strong>Machine-local timezone.</strong> Servers in different regions, or a container image that changes its zone, silently move your jobs. Set the zone explicitly. Prefer UTC, and avoid 01:00–03:00 in local zones.</li>
+  <li><strong>Long jobs inside the scheduler.</strong> A 40-minute job dies with the next deploy and leaves half the work done. Enqueue small units, and let workers retry them.</li>
+  <li><strong>"Process the next N items" logic.</strong> If the job runs twice, or catches up after downtime, it processes the wrong set. Define work by time window or state ("orders created before 09:30, still unpaid") so a rerun is harmless.</li>
+  <li><strong>No alert for "didn't run".</strong> Error alerts don't fire for a job that never started. Monitor the last successful run time, not just failures.</li>
+  <li><strong>Thundering herd at :00.</strong> Every team schedules at midnight and on the hour, and the database spikes. Spread jobs across odd minutes, or use flexible windows where the scheduler offers them.</li>
+</ul>
+
+<div class="callout warn"><strong>Every scheduler can double-fire.</strong> Kubernetes, Cloud Scheduler and EventBridge all document at-least-once behaviour. A lock reduces duplicates but can't make them impossible (a GC pause can outlast its TTL). Only an idempotent job is safe.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Five fields: minute, hour, day of month, month, day of week. Both day fields set means OR. Check your scheduler's dialect and timezone.</li>
+  <li>With replicas, guarantee one run per tick: an external scheduler, a leader, or a lock keyed by the tick.</li>
+  <li>Pick an overlap policy on purpose, and keep the scheduled function tiny: it enqueues, workers do the work.</li>
+  <li>Make jobs idempotent and alert on missing heartbeats, because runs will be duplicated and missed.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#distributed-locks">Distributed Locks</a> · <a href="#leader-election">Leader Election</a> · <a href="#message-queues">Message Queues</a> · <a href="#idempotency">Idempotency</a> · <a href="#clock-skew">Clock Skew</a> · <a href="#real-world-async-pipeline">Real-World Async Pipeline</a></p>
+`;
