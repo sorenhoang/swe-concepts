@@ -1,6 +1,6 @@
 # swe-concepts
 
-**Software Engineer Concept** is a single-page tracker for 117 software engineering concepts, grouped into 17 topics. The original 111 come from [@nataindata](https://www.instagram.com/nataindata/)'s "Who's gonna tell vibe coders about…".
+**Software Engineer Concept** is a single-page tracker for 118 software engineering concepts, grouped into 17 topics. The original 111 come from [@nataindata](https://www.instagram.com/nataindata/)'s "Who's gonna tell vibe coders about…".
 
 **Live:** https://sorenhoang.github.io/swe-concepts/
 
@@ -36,7 +36,7 @@ Load the file in `index.html` with `<script src="content/<group-slug>.js"></scri
 | Traffic & API Management | 7 |
 | Caching & Content Delivery | 5 |
 | Resilience & Fault Tolerance | 7 |
-| Messaging & Async Processing | 5 |
+| Messaging & Async Processing | 6 |
 | Distributed Systems | 9 |
 | Databases & Data Modeling | 9 |
 | Concurrency & Memory | 7 |
