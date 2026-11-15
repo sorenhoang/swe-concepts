@@ -1225,3 +1225,323 @@ func Reconnect(ctx context.Context, dial func(context.Context) error) error {
 <p><strong>Related:</strong> <a href="#retries">Retries</a> · <a href="#timeouts">Timeouts</a> · <a href="#circuit-breakers">Circuit Breakers</a> · <a href="#rate-limiting">Rate Limiting</a> · <a href="#websockets">WebSockets</a> · <a href="#server-sent-events">Server-Sent Events</a></p>
 `;
 
+CONTENT["idempotency"] = `
+<p class="tldr"><strong>TL;DR</strong>: An operation is idempotent if doing it twice has the same effect as doing it once. "Set the light to on" is idempotent; "toggle the light" is not. Retries are only safe on idempotent operations, so for things like payments the client sends a unique <strong>idempotency key</strong>, and the server remembers the result per key and returns the same answer to every retry instead of charging again.</p>
+
+<h2>The problem it solves</h2>
+<p>A network call can end in three ways: it worked, it failed, or <strong>you don't know</strong>. The third case is the dangerous one:</p>
+<ul>
+  <li>The client sends "charge 50.00". The server charges the card and commits. The response is lost: a timeout, a dropped mobile connection, a load balancer restart.</li>
+  <li>The client can't tell "failed before charging" from "charged, but the reply got lost". If it gives up, a real order may be lost. If it retries, the customer may be charged twice.</li>
+</ul>
+<p>The same thing happens everywhere work is retried: <a href="#retries">client retries</a>, a proxy retrying an upstream, a user double-clicking "Pay", a queue redelivering a message after a consumer crash, a <a href="#webhooks">webhook</a> sent again because your 200 arrived late. You can't make the network reliable. You can make <strong>repeats harmless</strong>, and then "when in doubt, retry" becomes a safe rule.</p>
+
+<h2>How it works</h2>
+<h3>Idempotent vs safe HTTP methods</h3>
+<p>HTTP (RFC 9110) defines two properties. A <strong>safe</strong> method doesn't change server state, it only reads. An <strong>idempotent</strong> method may change state, but sending it N times leaves the same state as sending it once. The response can differ (a second <code>DELETE</code> may return <code>404</code>); what matters is the effect.</p>
+<table>
+  <tr><th>Method</th><th>Safe</th><th>Idempotent</th><th>Why</th><th>Retry without a key?</th></tr>
+  <tr><td><code>GET</code>, <code>HEAD</code>, <code>OPTIONS</code></td><td>yes</td><td>yes</td><td>read only</td><td>yes</td></tr>
+  <tr><td><code>PUT</code></td><td>no</td><td>yes</td><td>"replace the resource with this": the second time sets the same value</td><td>yes, if implemented as a full replace</td></tr>
+  <tr><td><code>DELETE</code></td><td>no</td><td>yes</td><td>after the first, the resource is already gone</td><td>yes</td></tr>
+  <tr><td><code>POST</code></td><td>no</td><td>no</td><td>"create a new one" or "do this action": each call can do it again</td><td>only with an idempotency key</td></tr>
+  <tr><td><code>PATCH</code></td><td>no</td><td>not guaranteed</td><td>"set name = X" is idempotent, "add 1 to count" is not</td><td>only if you know the patch is</td></tr>
+</table>
+<p>These are promises your implementation has to keep. A <code>PUT</code> handler that appends to a list, or a <code>GET</code> that increments a counter, breaks them, and every proxy and client library that retries "idempotent" methods will now corrupt your data.</p>
+
+<h3>Idempotency keys</h3>
+<p>For non-idempotent operations, the client makes them idempotent by naming the attempt. It generates a unique key (a random UUID) <strong>once per logical operation</strong>, sends it in the <code>Idempotency-Key</code> header, and reuses the same key on every retry. The server stores, per key: a fingerprint of the request, a status (in progress or done), and the response it returned.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 390" role="img" aria-label="Sequence: the client posts a payment with Idempotency-Key K. The API claims K in the key store, charges the payment provider, saves the 201 response under K, but the reply to the client is lost. The client retries with the same key and body. The API finds K done with a matching hash and replays the saved 201. The provider is not charged again.">
+  <defs><marker id="arr-id-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="15" y="10" width="150" height="34" rx="6"/><text x="90" y="32" text-anchor="middle" class="title">Client</text>
+  <rect class="box accent" x="225" y="10" width="150" height="34" rx="6"/><text x="300" y="32" text-anchor="middle" class="title">API + key check</text>
+  <rect class="box" x="425" y="10" width="150" height="34" rx="6"/><text x="500" y="32" text-anchor="middle" class="title">Key store</text>
+  <rect class="box" x="615" y="10" width="150" height="34" rx="6"/><text x="690" y="32" text-anchor="middle" class="title">Payment provider</text>
+  <path class="line dashed" d="M90 44 V385" style="stroke: var(--line)"/><path class="line dashed" d="M300 44 V385" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M500 44 V385" style="stroke: var(--line)"/><path class="line dashed" d="M690 44 V385" style="stroke: var(--line)"/>
+
+  <path class="line" d="M90 76 H298" marker-end="url(#arr-id-1)"/><text x="195" y="68" text-anchor="middle" class="small">1 POST, Idempotency-Key: K</text>
+  <path class="line" d="M300 104 H498" marker-end="url(#arr-id-1)"/><text x="400" y="96" text-anchor="middle" class="small">2 claim K: in progress</text>
+  <path class="line" d="M300 134 H688" marker-end="url(#arr-id-1)"/><text x="595" y="126" text-anchor="middle" class="small">3 charge 50.00</text>
+  <path class="line dashed" d="M690 162 H302" marker-end="url(#arr-id-1)"/><text x="595" y="156" text-anchor="middle" class="small">charged</text>
+  <path class="line" d="M300 192 H498" marker-end="url(#arr-id-1)"/><text x="400" y="184" text-anchor="middle" class="small">4 save 201 + body under K</text>
+  <path class="line bad" d="M300 222 H160"/>
+  <path class="line bad" d="M146 214 L160 230 M160 214 L146 230"/>
+  <text x="230" y="214" text-anchor="middle" class="small">5 201 lost</text>
+
+  <rect class="box muted" x="190" y="246" width="400" height="26" rx="6"/>
+  <text x="390" y="264" text-anchor="middle" class="small">client times out, retries with the SAME key and body</text>
+
+  <path class="line" d="M90 302 H298" marker-end="url(#arr-id-1)"/><text x="195" y="294" text-anchor="middle" class="small">6 POST, same K, same body</text>
+  <path class="line" d="M300 332 H498" marker-end="url(#arr-id-1)"/><text x="400" y="324" text-anchor="middle" class="small">7 K is done, hash matches</text>
+  <path class="line ok" d="M298 362 H92" marker-end="url(#arr-id-1)"/><text x="195" y="354" text-anchor="middle" class="small">8 the same 201, replayed</text>
+  <rect class="box ok" x="620" y="318" width="140" height="28" rx="6"/><text x="690" y="337" text-anchor="middle" class="small">not charged again</text>
+</svg>
+<figcaption>The key turns "maybe it happened" into a question the server can answer. The retry gets the original result, and the side effect happens exactly once.</figcaption>
+</figure>
+
+<p>When a request with a key arrives, the server has four possible answers:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Decision flow for a request with an idempotency key. No key: 400. Key not in store: claim it, run the handler, save the response. Key in store with a different request hash: 422. Same hash but still in progress: 409. Same hash and done: replay the saved response.">
+  <defs><marker id="arr-id-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="128" width="150" height="44" rx="8"/><text x="95" y="155" text-anchor="middle">POST arrives</text>
+  <rect class="box accent" x="215" y="128" width="150" height="44" rx="8"/><text x="290" y="155" text-anchor="middle">K in store?</text>
+  <rect class="box accent" x="410" y="128" width="150" height="44" rx="8"/><text x="485" y="155" text-anchor="middle">same body hash?</text>
+  <rect class="box accent" x="605" y="128" width="150" height="44" rx="8"/><text x="680" y="155" text-anchor="middle">finished?</text>
+
+  <rect class="box bad" x="20" y="228" width="150" height="50" rx="8"/><text x="95" y="250" text-anchor="middle" class="title">400</text><text x="95" y="268" text-anchor="middle" class="small">key required</text>
+  <rect class="box ok" x="215" y="228" width="150" height="50" rx="8"/><text x="290" y="248" text-anchor="middle" class="small">claim K, run handler,</text><text x="290" y="264" text-anchor="middle" class="small">save the response</text>
+  <rect class="box bad" x="410" y="22" width="150" height="50" rx="8"/><text x="485" y="44" text-anchor="middle" class="title">422</text><text x="485" y="62" text-anchor="middle" class="small">key reused, new body</text>
+  <rect class="box bad" x="605" y="22" width="150" height="50" rx="8"/><text x="680" y="44" text-anchor="middle" class="title">409</text><text x="680" y="62" text-anchor="middle" class="small">first one still running</text>
+  <rect class="box ok" x="605" y="228" width="150" height="50" rx="8"/><text x="680" y="248" text-anchor="middle" class="small">replay saved status,</text><text x="680" y="264" text-anchor="middle" class="small">headers and body</text>
+
+  <path class="line" d="M170 150 H213" marker-end="url(#arr-id-2)"/><text x="192" y="142" text-anchor="middle" class="small">key</text>
+  <path class="line bad" d="M95 172 V226" marker-end="url(#arr-id-2)"/><text x="102" y="203" class="small">no key</text>
+  <path class="line ok" d="M290 172 V226" marker-end="url(#arr-id-2)"/><text x="297" y="203" class="small">no</text>
+  <path class="line" d="M365 150 H408" marker-end="url(#arr-id-2)"/><text x="387" y="142" text-anchor="middle" class="small">yes</text>
+  <path class="line bad" d="M485 128 V74" marker-end="url(#arr-id-2)"/><text x="492" y="105" class="small">no</text>
+  <path class="line" d="M560 150 H603" marker-end="url(#arr-id-2)"/><text x="582" y="142" text-anchor="middle" class="small">yes</text>
+  <path class="line bad" d="M680 128 V74" marker-end="url(#arr-id-2)"/><text x="687" y="105" class="small">no</text>
+  <path class="line ok" d="M680 172 V226" marker-end="url(#arr-id-2)"/><text x="687" y="203" class="small">yes</text>
+</svg>
+<figcaption>The status codes follow the IETF draft for the <code>Idempotency-Key</code> header: 400 when a required key is missing, 422 when a key is reused with a different payload, 409 while the original request is still being processed.</figcaption>
+</figure>
+
+<h3>What real APIs do</h3>
+<ul>
+  <li><strong>Stripe</strong> (API v1) accepts an <code>Idempotency-Key</code> on every <code>POST</code>; keys can be up to 255 characters and are suggested to be V4 UUIDs. It saves the status code and body of the first request once the endpoint has started executing, and replays them for retries with the same key, <em>including <code>500</code> errors</em>. If the parameters differ from the original, it returns an error. Requests that fail validation, or that collide with a concurrent request using the same key, are not saved, so they can be retried. Keys can be pruned once they are at least 24 hours old, after which a reuse counts as a new request. Replayed responses carry <code>Idempotent-Replayed: true</code>.</li>
+  <li><strong>The IETF draft</strong> <code>draft-ietf-httpapi-idempotency-key-header</code> (an Internet-Draft, not yet an RFC) standardises the header as a Structured Field string, e.g. <code>Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"</code>. It asks servers to publish their idempotency rules and key expiry policy, and defines the 400 / 422 / 409 responses above. It doesn't prescribe a key lifetime.</li>
+</ul>
+
+<h3>"Exactly once" is at-least-once plus dedup</h3>
+<p>Over an unreliable network, no protocol can guarantee a message is <em>delivered</em> exactly once. What systems actually do is deliver <strong>at least once</strong> (retry until acknowledged) and make the receiver <strong>deduplicate</strong>, so the <em>effect</em> happens once. When a broker or framework advertises "exactly-once", look for where the dedup happens and what it covers. It usually stops at the edge of that system: an email sent or an HTTP call made from inside the handler is outside it.</p>
+
+<h3>Ways to make an operation idempotent</h3>
+<table>
+  <tr><th>Technique</th><th>How</th><th>Good for</th><th>Limits</th></tr>
+  <tr><td>Idempotency key + stored response</td><td>client sends a key; server stores request hash and response per key</td><td>public APIs, payments, any <code>POST</code> that creates something</td><td>needs a shared store, expiry, and handling of in-flight requests</td></tr>
+  <tr><td>Natural key + unique constraint</td><td>one payment per <code>order_id</code>, enforced by a <code>UNIQUE</code> index</td><td>"at most one X per Y" rules</td><td>only works when such a key exists in the domain</td></tr>
+  <tr><td>Upsert / set absolute values</td><td><code>INSERT … ON CONFLICT DO UPDATE</code>; "set balance to 70" instead of "subtract 30"</td><td>sync jobs, state replication, PUT-style APIs</td><td>last write wins; deltas need another technique</td></tr>
+  <tr><td>Conditional write</td><td>update only if <code>version = 7</code> or <code>If-Match: "etag"</code></td><td>edits to existing records</td><td>a retry after success sees a version conflict; the client must treat it as "probably mine" (see <a href="#optimistic-locking">Optimistic Locking</a>)</td></tr>
+  <tr><td>Processed-message table</td><td>consumer records each message ID in the same DB transaction as its effect</td><td><a href="#message-queues">queue</a> consumers, <a href="#webhooks">webhook</a> receivers</td><td>the effect must live in the same database as the dedup record</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>Idempotency-key middleware in Go.</strong> It applies to <code>POST</code> and <code>PATCH</code>, scopes each key to the caller and endpoint, fingerprints the body with SHA-256, claims the key <em>before</em> running the handler, and replays the stored response on a retry. The store is a map behind a mutex, which is enough to show the logic; with several instances, the same steps run against Redis (<code>SET key value NX EX 86400</code> to claim) or a database table.</p>
+<pre><code>package idem
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"io"
+	"net/http"
+	"sync"
+	"time"
+)
+
+type record struct {
+	reqHash [32]byte
+	done    bool // false while the first request is still running
+	status  int
+	header  http.Header
+	body    []byte
+	expires time.Time
+}
+
+// Store keeps one record per key. In production this is Redis or a DB
+// table shared by every instance; a map only works for a single process.
+type Store struct {
+	mu   sync.Mutex
+	recs map[string]*record
+	ttl  time.Duration
+}
+
+func NewStore(ttl time.Duration) *Store {
+	return &amp;Store{recs: map[string]*record{}, ttl: ttl}
+}
+
+func (s *Store) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost &amp;&amp; r.Method != http.MethodPatch {
+			next.ServeHTTP(w, r) // GET, PUT, DELETE are idempotent by definition
+			return
+		}
+		key := r.Header.Get("Idempotency-Key")
+		if key == "" {
+			http.Error(w, "Idempotency-Key header required", http.StatusBadRequest)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1&lt;&lt;20))
+		if err != nil {
+			http.Error(w, "cannot read body", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		// Scope the key to the caller and the endpoint, then fingerprint the request.
+		scoped := r.Header.Get("X-API-Key") + " " + r.Method + " " + r.URL.Path + " " + key
+		hash := sha256.Sum256(body)
+
+		s.mu.Lock()
+		rec, seen := s.recs[scoped]
+		if seen &amp;&amp; time.Now().After(rec.expires) {
+			seen = false // expired: treat as a brand new request
+		}
+		switch {
+		case seen &amp;&amp; rec.reqHash != hash:
+			s.mu.Unlock()
+			http.Error(w, "Idempotency-Key reused with a different request", http.StatusUnprocessableEntity)
+			return
+		case seen &amp;&amp; !rec.done:
+			s.mu.Unlock()
+			http.Error(w, "a request with this Idempotency-Key is in progress", http.StatusConflict)
+			return
+		case seen:
+			s.mu.Unlock()
+			for k, v := range rec.header {
+				w.Header()[k] = v
+			}
+			w.Header().Set("Idempotent-Replayed", "true")
+			w.WriteHeader(rec.status)
+			w.Write(rec.body)
+			return
+		}
+		// First time: claim the key before doing any work, so a concurrent
+		// duplicate sees "in progress" instead of running the handler too.
+		rec = &amp;record{reqHash: hash, expires: time.Now().Add(s.ttl)}
+		s.recs[scoped] = rec
+		s.mu.Unlock()
+
+		cw := &amp;captureWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(cw, r)
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if cw.status &gt;= 500 {
+			delete(s.recs, scoped) // nothing was committed; let the client retry
+			return
+		}
+		rec.done, rec.status, rec.header, rec.body = true, cw.status, w.Header().Clone(), cw.buf.Bytes()
+	})
+}
+
+// captureWriter passes the response through and keeps a copy of it.
+type captureWriter struct {
+	http.ResponseWriter
+	status int
+	buf    bytes.Buffer
+}
+
+func (c *captureWriter) WriteHeader(code int) {
+	c.status = code
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *captureWriter) Write(b []byte) (int, error) {
+	c.buf.Write(b)
+	return c.ResponseWriter.Write(b)
+}</code></pre>
+
+<p>A test drives it with a payment handler that counts real charges:</p>
+<pre><code>func Example() {
+	var charges atomic.Int32
+	release := make(chan struct{})
+	pay := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "slow") {
+			&lt;-release // keep this request in flight for the 409 demo
+		}
+		n := charges.Add(1) // the side effect we must not repeat
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, &#96;{"id":"pay_%d","status":"succeeded"}&#96;, n)
+	})
+	srv := httptest.NewServer(NewStore(24 * time.Hour).Middleware(pay))
+	defer srv.Close()
+
+	post := func(label, key, body string) {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/payments", strings.NewReader(body))
+		req.Header.Set("X-API-Key", "shop_1")
+		if key != "" {
+			req.Header.Set("Idempotency-Key", key)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			panic(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		replayed := resp.Header.Get("Idempotent-Replayed")
+		fmt.Printf("%-22s %d  replayed=%-4s  %s&#92;n", label, resp.StatusCode, replayed, strings.TrimSpace(string(b)))
+	}
+
+	post("first attempt", "order-7-pay", &#96;{"amount":5000}&#96;)
+	post("retry, same key", "order-7-pay", &#96;{"amount":5000}&#96;)
+	post("same key, new amount", "order-7-pay", &#96;{"amount":9000}&#96;)
+	post("no key", "", &#96;{"amount":5000}&#96;)
+
+	done := make(chan struct{})
+	go func() { post("slow original", "order-8-pay", &#96;{"amount":700,"note":"slow"}&#96;); close(done) }()
+	time.Sleep(50 * time.Millisecond)
+	post("duplicate in flight", "order-8-pay", &#96;{"amount":700,"note":"slow"}&#96;)
+	close(release)
+	&lt;-done
+	post("retry after it ends", "order-8-pay", &#96;{"amount":700,"note":"slow"}&#96;)
+
+	fmt.Println("payments actually charged:", charges.Load())
+}</code></pre>
+
+<p>Real output from <code>go test</code> (pinned as the example's expected output; it also passes under <code>-race</code>):</p>
+<pre><code>first attempt          201  replayed=      {"id":"pay_1","status":"succeeded"}
+retry, same key        201  replayed=true  {"id":"pay_1","status":"succeeded"}
+same key, new amount   422  replayed=      Idempotency-Key reused with a different request
+no key                 400  replayed=      Idempotency-Key header required
+duplicate in flight    409  replayed=      a request with this Idempotency-Key is in progress
+slow original          201  replayed=      {"id":"pay_2","status":"succeeded"}
+retry after it ends    201  replayed=true  {"id":"pay_2","status":"succeeded"}
+payments actually charged: 2</code></pre>
+<p>Seven requests, two charges. The retry gets <code>pay_1</code> back instead of creating <code>pay_2</code>; the reused key with a different amount is refused rather than silently replaying the old charge; and the duplicate that arrives while the original is still running gets <code>409</code> instead of running the handler a second time.</p>
+
+<p><strong>The database is the last line of defence.</strong> The middleware handles retries of one HTTP request. A unique constraint handles every path that could create a duplicate, including a second code path, a batch job, or a bug in the middleware:</p>
+<pre><code>// Schema: payments(id, order_id UNIQUE, amount, created_at).
+// The UNIQUE constraint is the real guarantee: two racing inserts
+// for the same order cannot both succeed, whatever the app does.
+func ChargeOnce(ctx context.Context, db *sql.DB, orderID string, amount int64) (paymentID string, created bool, err error) {
+	err = db.QueryRowContext(ctx, &#96;
+		INSERT INTO payments (order_id, amount) VALUES ($1, $2)
+		ON CONFLICT (order_id) DO NOTHING
+		RETURNING id&#96;, orderID, amount).Scan(&amp;paymentID)
+	if errors.Is(err, sql.ErrNoRows) { // conflict: it already exists
+		err = db.QueryRowContext(ctx,
+			&#96;SELECT id FROM payments WHERE order_id = $1&#96;, orderID).Scan(&amp;paymentID)
+		return paymentID, false, err
+	}
+	return paymentID, err == nil, err
+}</code></pre>
+
+<p><strong>Real-world scenario.</strong> A mobile checkout calls <code>POST /payments</code> with a 5 s client timeout. At 14:05 the payment provider's p99 goes from 400 ms to 7 s. Many requests still succeed on the server, after the app has already given up, and the app retries. Without keys, every "timed out but actually charged" request becomes a double charge: support tickets, refunds, and chargebacks. With a key generated when the user taps "Pay" (and saved on the device so it survives an app restart), a retry gets <code>409</code> while the first attempt is still running, and the original <code>201</code> once it has finished. The customer is charged once, and sees one receipt.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>A new key per attempt.</strong> Generating the UUID inside the retry loop makes every retry look new, which defeats the point. Create the key once per user intent, before the first attempt, and keep it until you get a definite answer.</li>
+  <li><strong>Check-then-insert races.</strong> "Look up the key; if absent, run the handler" lets two concurrent duplicates both see "absent". Claim the key atomically first (<code>SET NX</code>, <code>INSERT</code> into a table with a unique key), as the middleware does under its mutex.</li>
+  <li><strong>Stuck "in progress" records.</strong> If the process crashes after claiming a key, every retry gets <code>409</code> forever. Give in-progress claims a lease (an expiry) or a recovery step, and make the work behind them transactional so a crash leaves nothing half-done.</li>
+  <li><strong>Which responses to store.</strong> Stripe replays <code>500</code>s; the example instead forgets the key on <code>5xx</code> so the client can retry. Forgetting is only safe if a <code>5xx</code> really means nothing was committed. Never store a response for a request that failed validation before doing any work.</li>
+  <li><strong>Unscoped keys.</strong> Keys must be unique per client, and usually per endpoint. Otherwise two customers' UUIDs could collide (unlikely) or a bug that reuses keys leaks one customer's response to another (bad).</li>
+  <li><strong>Expiry shorter than the retry window.</strong> If keys are pruned after 1 hour but a queue can redeliver after 2, the duplicate is processed as new. Keep keys longer than any retry path can last.</li>
+  <li><strong>Side effects outside the transaction.</strong> Sending an email or calling another API inside the handler isn't covered by your database's dedup. Pass the key downstream (many payment APIs accept one), or record the side effect in an outbox processed separately.</li>
+</ul>
+
+<div class="callout warn"><strong>Retries without idempotency are a data bug waiting for a slow day.</strong> Every layer that retries (client SDK, service mesh, load balancer, queue) assumes the operation is safe to repeat. Check that each non-idempotent call in a retry path has a key or a unique constraint behind it.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Idempotent = repeating the operation has no extra effect. <code>GET</code>, <code>PUT</code>, <code>DELETE</code> should be; <code>POST</code> is not.</li>
+  <li>Make <code>POST</code> retryable with an idempotency key: store request hash + response, replay on retry, 422 on a mismatched body, 409 while in flight.</li>
+  <li>"Exactly once" in practice means at-least-once delivery plus deduplication of the effect.</li>
+  <li>Back the API-level check with a database unique constraint or upsert, which also catches duplicates from other paths.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#retries">Retries</a> · <a href="#message-queues">Message Queues</a> · <a href="#webhooks">Webhooks</a> · <a href="#distributed-transactions">Distributed Transactions</a> · <a href="#optimistic-locking">Optimistic Locking</a> · <a href="#real-world-resilience-playbook">Real-World Resilience Playbook</a></p>
+`;
