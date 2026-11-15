@@ -1599,3 +1599,530 @@ PASS</code></pre>
 
 <p><strong>Related:</strong> <a href="#distributed-locks">Distributed Locks</a> · <a href="#leader-election">Leader Election</a> · <a href="#message-queues">Message Queues</a> · <a href="#idempotency">Idempotency</a> · <a href="#clock-skew">Clock Skew</a> · <a href="#real-world-async-pipeline">Real-World Async Pipeline</a></p>
 `;
+CONTENT["real-world-async-pipeline"] = `
+<p class="tldr"><strong>TL;DR</strong>: A real async pipeline is five sibling patterns bolted together. A <strong>transactional outbox</strong> makes "order saved" and "event will be published" one atomic fact. <strong>Pub/sub</strong> fans the event out to every service that cares. Each service reads through its own <strong>durable queue</strong> with competing consumers and an idempotent handler. Messages that keep failing go to a <strong>dead-letter queue</strong> instead of looping forever. And a couple of <strong>cron jobs</strong>, running on one replica, redrive the DLQ and clean up. Think of a post office: one stamp logs the parcel, sorting copies it to each route, each route has its own van and its own "return to sender" shelf, and the night shift clears the shelves.</p>
+
+<h2>The problem it solves</h2>
+<p>Take checkout in an online shop. When an order is placed, three other things must happen: the customer gets a confirmation email, inventory reserves the stock, and analytics records the sale. None of them needs to finish before the customer sees "Thank you". If checkout calls all three over HTTP, checkout is only as available as the least available of them, and as slow as the slowest. So you make them asynchronous.</p>
+<p>That swaps one set of problems for another, and in production you meet all of them in the same week:</p>
+<ul>
+  <li>The order row commits, then the publish to the broker fails. The order exists, but nobody hears about it (the <strong>dual-write</strong> problem).</li>
+  <li>A consumer dies halfway through a message. The broker redelivers it, and the stock is reserved twice.</li>
+  <li>One malformed message fails forever, burning CPU and hiding real errors in the logs.</li>
+  <li>A flash sale produces orders faster than inventory can process them, so lag grows by the minute.</li>
+  <li>The nightly cleanup job runs on all 6 replicas at once.</li>
+</ul>
+
+<h2>How it works: one order through the pipeline</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 340" role="img" aria-label="Pipeline: checkout writes order and outbox in one transaction, a relay publishes to the broker, which fans out to email, inventory and analytics subscriptions; failures go to a DLQ; a cron job redrives the DLQ and cleans the outbox.">
+  <defs><marker id="arr-rap-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="10" y="60" width="110" height="80" rx="10"/>
+  <text x="65" y="84" text-anchor="middle" class="title">1 Checkout</text>
+  <text x="65" y="104" text-anchor="middle" class="small">POST /orders</text>
+  <text x="65" y="119" text-anchor="middle" class="small">201 in ~ms</text>
+  <path class="line" d="M120 100 H138" marker-end="url(#arr-rap-1)"/>
+  <rect class="box accent" x="140" y="60" width="140" height="80" rx="10"/>
+  <text x="210" y="84" text-anchor="middle" class="title">Orders DB</text>
+  <text x="210" y="104" text-anchor="middle" class="small">orders + outbox</text>
+  <text x="210" y="119" text-anchor="middle" class="small">in ONE transaction</text>
+  <path class="line" d="M280 100 H298" marker-end="url(#arr-rap-1)"/>
+  <rect class="box" x="300" y="60" width="125" height="80" rx="10"/>
+  <text x="362" y="84" text-anchor="middle" class="title">2 Relay</text>
+  <text x="362" y="104" text-anchor="middle" class="small">polls unsent rows</text>
+  <text x="362" y="119" text-anchor="middle" class="small">Msg-Id = event ID</text>
+  <path class="line" d="M425 100 H448" marker-end="url(#arr-rap-1)"/>
+  <rect class="box accent" x="450" y="40" width="135" height="120" rx="10"/>
+  <text x="517" y="66" text-anchor="middle" class="title">3 Broker</text>
+  <text x="517" y="88" text-anchor="middle" class="small">stream ORDERS</text>
+  <text x="517" y="104" text-anchor="middle" class="small">orders.placed</text>
+  <text x="517" y="120" text-anchor="middle" class="small">kept 7 days</text>
+  <text x="517" y="136" text-anchor="middle" class="small">one copy per group</text>
+  <path class="line" d="M585 70 H600 V40 H613" marker-end="url(#arr-rap-1)"/>
+  <path class="line" d="M585 100 H613" marker-end="url(#arr-rap-1)"/>
+  <path class="line" d="M585 130 H600 V160 H613" marker-end="url(#arr-rap-1)"/>
+  <rect class="box ok" x="615" y="10" width="155" height="58" rx="10"/>
+  <text x="692" y="32" text-anchor="middle" class="title">4 email</text>
+  <text x="692" y="50" text-anchor="middle" class="small">2 workers · dedup</text>
+  <rect class="box ok" x="615" y="72" width="155" height="58" rx="10"/>
+  <text x="692" y="94" text-anchor="middle" class="title">4 inventory</text>
+  <text x="692" y="112" text-anchor="middle" class="small">2 workers · dedup</text>
+  <rect class="box ok" x="615" y="134" width="155" height="58" rx="10"/>
+  <text x="692" y="156" text-anchor="middle" class="title">4 analytics</text>
+  <text x="692" y="174" text-anchor="middle" class="small">1 worker · upsert</text>
+  <path class="line bad dashed" d="M692 192 V256" marker-end="url(#arr-rap-1)"/>
+  <text x="684" y="222" text-anchor="end" class="small">any group, after</text>
+  <text x="684" y="236" text-anchor="end" class="small">3 failed attempts</text>
+  <rect class="box bad" x="615" y="258" width="155" height="62" rx="10"/>
+  <text x="692" y="282" text-anchor="middle" class="title">5 DLQ stream</text>
+  <text x="692" y="300" text-anchor="middle" class="small">dlq.&lt;group&gt; · alert &gt; 0</text>
+  <rect class="box muted" x="300" y="250" width="270" height="70" rx="10"/>
+  <text x="435" y="272" text-anchor="middle" class="title">6 Cron, on ONE replica</text>
+  <text x="435" y="292" text-anchor="middle" class="small">03:00 redrive dlq.inventory → inventory</text>
+  <text x="435" y="308" text-anchor="middle" class="small">03:30 delete sent outbox rows</text>
+  <path class="line dashed" d="M570 285 H613" marker-end="url(#arr-rap-1)"/>
+  <path class="line dashed" d="M300 285 H210 V142" marker-end="url(#arr-rap-1)"/>
+  <text x="218" y="210" class="small">cleanup</text>
+  <text x="300" y="185" class="small">Every hop is at-least-once.</text>
+  <text x="300" y="201" class="small">Every handler must be idempotent.</text>
+</svg>
+<figcaption>The checkout request ends at the database commit. Everything to the right of the orders DB happens later, and any of it can fail and retry without the customer noticing. Each subscription is a separate durable consumer with its own position, its own workers and its own dead letters.</figcaption>
+</figure>
+
+<p>Each numbered piece has its own page; this one only shows how they fit:</p>
+<ol>
+  <li><strong>Save and announce atomically</strong>: <a href="#event-driven-architecture">Event-Driven Architecture</a> (dual writes, the outbox, CDC, event schemas).</li>
+  <li><strong>Relay</strong>: reads unsent outbox rows, publishes, marks them sent. It can crash between the last two steps, so it may publish twice.</li>
+  <li><strong>One event, many readers</strong>: <a href="#pub-sub">Pub/Sub</a> (fan-out, and why subscriptions must be durable).</li>
+  <li><strong>Sharing work inside a service</strong>: <a href="#message-queues">Message Queues</a> (acks, visibility timeouts, prefetch, competing consumers).</li>
+  <li><strong>Messages that never succeed</strong>: <a href="#dead-letter-queues">Dead-Letter Queues</a> (attempt limits, permanent errors, redrive).</li>
+  <li><strong>Housekeeping on a timer</strong>: <a href="#cron-jobs">Cron Jobs</a> (schedules, time zones, running once instead of once per replica).</li>
+</ol>
+<p>The glue between them all is <a href="#idempotency">idempotency</a>. When consumers ack (or commit offsets) after processing, SQS, RabbitMQ, Kafka, Redis Streams and NATS JetStream all deliver at least once. "Exactly once" in practice means <em>at-least-once delivery plus a handler that notices repeats</em>. In the example below, each handler writes its result and the event ID in the same database transaction, so a repeat finds the ID and only acks.</p>
+
+<h3>Which tool answers which problem</h3>
+<table>
+  <tr><th>Problem</th><th>The tool that answers it</th><th>Depth</th></tr>
+  <tr><td>DB commit succeeds, publish fails (or the reverse)</td><td>Transactional outbox + relay</td><td><a href="#event-driven-architecture">Event-Driven Architecture</a></td></tr>
+  <tr><td>Several services need the same event</td><td>Pub/sub fan-out, one durable subscription per service</td><td><a href="#pub-sub">Pub/Sub</a></td></tr>
+  <tr><td>Bursts bigger than consumer capacity</td><td>A durable queue as a buffer; scale competing consumers</td><td><a href="#message-queues">Message Queues</a>, <a href="#backpressure">Backpressure</a></td></tr>
+  <tr><td>A consumer dies mid-message</td><td>Explicit ack + redelivery after a timeout + idempotent handler</td><td><a href="#message-queues">Message Queues</a>, <a href="#idempotency">Idempotency</a></td></tr>
+  <tr><td>A dependency blips for a few seconds</td><td>Retry with a growing delay (nack with delay)</td><td><a href="#retries">Retries</a>, <a href="#exponential-backoff">Exponential Backoff</a></td></tr>
+  <tr><td>A message that can never succeed</td><td>Max attempts, then a dead-letter queue + an alert</td><td><a href="#dead-letter-queues">Dead-Letter Queues</a></td></tr>
+  <tr><td>Leftovers: dead letters, old outbox rows, missed events</td><td>Scheduled redrive, cleanup and reconciliation, on one replica</td><td><a href="#cron-jobs">Cron Jobs</a></td></tr>
+  <tr><td>The relay publishes the same event twice</td><td>Broker-side dedup by message ID, and consumer dedup by event ID</td><td><a href="#idempotency">Idempotency</a></td></tr>
+</table>
+
+<h2>A bad day, with and without the pipeline</h2>
+<p>Here is one day for a shop that normally takes about 200 orders a minute. Each row is a real kind of failure. The left column is the "just call the services" design, or a queue without the guards. The right column is the pipeline above.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 420" role="img" aria-label="Five failures over one day, compared without and with the pipeline: broker restart, flash sale, worker crash before ack, poison message, nightly jobs.">
+  <rect class="box bad" x="100" y="10" width="330" height="30" rx="8"/>
+  <text x="265" y="30" text-anchor="middle" class="title">Without the guards</text>
+  <rect class="box ok" x="450" y="10" width="320" height="30" rx="8"/>
+  <text x="610" y="30" text-anchor="middle" class="title">With the pipeline</text>
+  <path class="line" d="M50 60 V410"/>
+  <path d="M440 56 V410" style="stroke: var(--line)"/>
+  <ellipse class="box bad" cx="50" cy="80" rx="6" ry="6"/>
+  <text x="44" y="64" text-anchor="end" class="small">08:58</text>
+  <text x="110" y="70" class="title">Broker restarts for 40 s</text>
+  <text x="110" y="88" class="small">Order commits, then publish fails. The event is</text>
+  <text x="110" y="103" class="small">gone: no email, no reservation, no error to retry.</text>
+  <text x="460" y="88" class="small">Checkout still commits order + outbox row. The relay</text>
+  <text x="460" y="103" class="small">fails to publish, rows stay unsent, it catches up.</text>
+  <ellipse class="box accent" cx="50" cy="150" rx="6" ry="6"/>
+  <text x="44" y="134" text-anchor="end" class="small">09:00</text>
+  <text x="110" y="140" class="title">Flash sale: 4,000 orders/min</text>
+  <text x="110" y="158" class="small">Checkout calls inventory inline. Inventory handles</text>
+  <text x="110" y="173" class="small">1,500/min, so checkout times out for most buyers.</text>
+  <text x="460" y="158" class="small">Checkout only writes rows. Inventory lag grows by</text>
+  <text x="460" y="173" class="small">2,500/min, alerts fire, it drains after the sale.</text>
+  <ellipse class="box bad" cx="50" cy="220" rx="6" ry="6"/>
+  <text x="44" y="204" text-anchor="end" class="small">09:04</text>
+  <text x="110" y="210" class="title">Worker killed after commit, before ack</text>
+  <text x="110" y="228" class="small">The broker redelivers after the timeout. The second</text>
+  <text x="110" y="243" class="small">worker reserves the same stock again.</text>
+  <text x="460" y="228" class="small">Redelivered to the other worker. The event ID is</text>
+  <text x="460" y="243" class="small">already in the processed table: ack, do nothing.</text>
+  <ellipse class="box bad" cx="50" cy="290" rx="6" ry="6"/>
+  <text x="44" y="274" text-anchor="end" class="small">09:12</text>
+  <text x="110" y="280" class="title">An order with an unknown SKU</text>
+  <text x="110" y="298" class="small">Redelivered over and over, forever. With per-key order,</text>
+  <text x="110" y="313" class="small">everything behind it waits too.</text>
+  <text x="460" y="298" class="small">3 attempts with growing delays, then dlq.inventory.</text>
+  <text x="460" y="313" class="small">DLQ depth &gt; 0 pages someone. Other orders flow.</text>
+  <ellipse class="box ok" cx="50" cy="360" rx="6" ry="6"/>
+  <text x="44" y="344" text-anchor="end" class="small">03:00</text>
+  <text x="110" y="350" class="title">The nightly jobs (next day)</text>
+  <text x="110" y="368" class="small">Cleanup runs on all 6 replicas. Nobody empties</text>
+  <text x="110" y="383" class="small">the DLQ; its messages expire unseen.</text>
+  <text x="460" y="368" class="small">One replica redrives the DLQ after the SKU fix and</text>
+  <text x="460" y="383" class="small">deletes outbox rows that were sent over 7 days ago.</text>
+</svg>
+<figcaption>Each row is a different failure, and each is handled by a different piece. The outbox handles the broker, the queue handles the burst, idempotency handles the crash, the DLQ handles the poison message, and the cron handles what's left over.</figcaption>
+</figure>
+
+<h3>The flash sale, with numbers</h3>
+<p>At 09:00 a sale pushes 4,000 orders a minute for 10 minutes. The inventory service runs 2 workers that together handle 1,500 a minute. The queue absorbs the gap: the backlog grows by 4,000 − 1,500 = 2,500 messages a minute, so it peaks at 25,000 at 09:10. After the sale, normal traffic (200/min, ignored in the chart) is small next to the drain, so the backlog shrinks at about 1,500 a minute and is gone around 09:27. An order placed at 09:10 waits about 25,000 / 1,500 ≈ 17 minutes for its reservation. Nothing is lost and checkout never slowed down.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 270" role="img" aria-label="Chart of inventory backlog from 09:00 to 09:40. With 2 workers at 1,500 a minute, the backlog rises linearly to 25,000 at 09:10 and drains to zero at about 09:27. If autoscaling doubles to 4 workers at 09:05, the backlog peaks at 17,500 at 09:10 and is empty at about 09:16.">
+  <path class="line" d="M70 230 H752"/>
+  <path class="line" d="M70 230 V24"/>
+  <text x="76" y="18" class="small">backlog (messages)</text>
+  <text x="62" y="234" text-anchor="end" class="small">0</text>
+  <text x="62" y="154" text-anchor="end" class="small">10k</text>
+  <text x="62" y="74" text-anchor="end" class="small">20k</text>
+  <path d="M70 150 H750 M70 70 H750" style="stroke: var(--line)"/>
+  <text x="70" y="250" text-anchor="middle" class="small">09:00</text>
+  <text x="240" y="250" text-anchor="middle" class="small">09:10</text>
+  <text x="410" y="250" text-anchor="middle" class="small">09:20</text>
+  <text x="580" y="250" text-anchor="middle" class="small">09:30</text>
+  <text x="750" y="250" text-anchor="middle" class="small">09:40</text>
+  <path class="line dashed" d="M240 230 V30" style="stroke: var(--line)"/>
+  <text x="246" y="222" class="small">sale ends</text>
+  <path class="line bad" d="M70 230 L240 30 L523 230 H750"/>
+  <path class="line ok dashed" d="M70 230 L155 130 L240 90 L339 230"/>
+  <path class="line bad" d="M520 45 H550"/>
+  <text x="558" y="49" class="small">2 workers (1,500/min): empty ~09:27</text>
+  <path class="line ok dashed" d="M520 67 H550"/>
+  <text x="558" y="71" class="small">4 workers from 09:05: empty ~09:16</text>
+</svg>
+<figcaption>Backlog = arrivals − capacity, added up over time. Doubling the workers at 09:05 cuts the peak from 25,000 to 17,500, and the backlog is gone at ~09:16 instead of ~09:27. Alert on the age of the oldest message, not just the count: 25,000 messages is fine at night if they are 2 minutes old.</figcaption>
+</figure>
+<p>"Just add workers" has two limits. The workers' shared database has to keep up, or the queue just moves into its lock waits. And some brokers cap parallelism: a Kafka consumer group can't have more active consumers than the topic has partitions. When consumers can't scale, the queue <em>is</em> the <a href="#backpressure">backpressure</a>: let it grow, watch its age, and agree how much delay the business accepts.</p>
+
+<h3>Defaults to start with</h3>
+<p>Starting points, not rules. Tune them from your <a href="#metrics">metrics</a>. Product defaults are named where they come from documentation.</p>
+<table>
+  <tr><th>Setting</th><th>Start with</th><th>Why, and what the products default to</th></tr>
+  <tr><td>Visibility timeout / ack wait</td><td>a few times the handler's p99, not its average</td><td>Too short: a slow, healthy message goes to a second worker. Too long: a crashed worker's message waits. SQS defaults to 30 s and caps a message at 12 h; JetStream <code>AckWait</code> defaults to 30 s. Long jobs extend it while they work (SQS <code>ChangeMessageVisibility</code>, JetStream <code>InProgress</code>).</td></tr>
+  <tr><td>Attempts before the DLQ</td><td>3–5</td><td>Defaults vary a lot: SQS moves nothing until you set a redrive policy with <code>maxReceiveCount</code>; RabbitMQ quorum queues default <code>delivery-limit</code> to 20 since 4.0; JetStream <code>MaxDeliver</code> defaults to unlimited.</td></tr>
+  <tr><td>Delay between attempts</td><td>growing, e.g. 1 s, 10 s, 60 s</td><td>An instant redelivery hits the same broken dependency again. Use a nack with delay, a backoff list, or retry topics (see <a href="#exponential-backoff">Exponential Backoff</a>).</td></tr>
+  <tr><td>Prefetch / max unacked</td><td>low (1–10) per worker for slow handlers</td><td>A big prefetch parks messages on one busy worker while another idles. JetStream <code>MaxAckPending</code> defaults to 1,000 per consumer.</td></tr>
+  <tr><td>Main queue retention</td><td>longer than your longest outage + weekend</td><td>If a consumer is down longer than retention, events are deleted unread. SQS keeps messages 4 days by default, 14 at most.</td></tr>
+  <tr><td>DLQ retention</td><td>longer than the main queue's</td><td>AWS recommends this for SQS: in a standard queue a message keeps its original enqueue time when it moves to the DLQ, so a short DLQ retention deletes it early.</td></tr>
+  <tr><td>Publish dedup window</td><td>longer than the relay's retry horizon</td><td>Broker dedup only catches repeats inside the window: JetStream's default <code>Duplicates</code> window is 2 minutes; SQS FIFO's dedup interval is 5 minutes. Consumer dedup covers the rest.</td></tr>
+  <tr><td>Outbox cleanup</td><td>delete rows sent &gt; 7 days ago, daily</td><td>Keep enough to debug "was it published?". Alert if the oldest <em>unsent</em> row is more than a few minutes old: the relay is stuck.</td></tr>
+  <tr><td>Alerts</td><td>DLQ depth &gt; 0; age of oldest message per group; oldest unsent outbox row; cron heartbeat</td><td>Each piece has one number that says "this part is stuck". See <a href="#alerts">Alerts</a>.</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>The whole pipeline in one Go package.</strong> It runs in-process with no Docker. SQLite (<code>modernc.org/sqlite</code>) holds the orders, the outbox and each consumer's dedup table. An embedded <code>nats-server</code> with JetStream is the broker: one stream <code>ORDERS</code>, one durable consumer per subscribing service (that's the fan-out), and two workers pulling from each consumer (competing consumers). A message that fails <code>MaxAttempts</code> times, or fails with a permanent error, is published to a <code>DLQ</code> stream with its error and attempt count, then terminated. <code>robfig/cron/v3</code> schedules the nightly redrive and outbox cleanup.</p>
+<pre><code>package pipeline
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	_ "modernc.org/sqlite"
+)
+
+type OrderPlaced struct {
+	EventID string &#96;json:"event_id"&#96;
+	OrderID string &#96;json:"order_id"&#96;
+	SKU     string &#96;json:"sku"&#96;
+	Qty     int    &#96;json:"qty"&#96;
+	Email   string &#96;json:"email"&#96;
+}
+
+// 1. Checkout: the order and its event commit together, or not at all.
+func PlaceOrder(ctx context.Context, db *sql.DB, o OrderPlaced) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, &#96;INSERT INTO orders VALUES (?, ?, ?, ?)&#96;,
+		o.OrderID, o.SKU, o.Qty, o.Email); err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(o)
+	if _, err := tx.ExecContext(ctx, &#96;INSERT INTO outbox (id, subject, payload) VALUES (?, ?, ?)&#96;,
+		o.EventID, "orders.placed", payload); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// 2. Relay: publish unsent outbox rows, then mark them sent.
+type Relay struct {
+	DB         *sql.DB
+	JS         jetstream.JetStream
+	CrashAfter string // test hook: die after publishing this event, before marking it
+}
+
+var ErrCrashed = errors.New("relay crashed")
+
+func (r *Relay) Tick(ctx context.Context) (published, duplicates int, err error) {
+	type row struct {
+		id, subject string
+		payload     []byte
+	}
+	rows, err := r.DB.QueryContext(ctx,
+		&#96;SELECT id, subject, payload FROM outbox WHERE sent_at IS NULL ORDER BY rowid LIMIT 100&#96;)
+	if err != nil {
+		return 0, 0, err
+	}
+	var batch []row
+	for rows.Next() {
+		var x row
+		if err := rows.Scan(&amp;x.id, &amp;x.subject, &amp;x.payload); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		batch = append(batch, x)
+	}
+	rows.Close()
+	for _, x := range batch {
+		// The event ID doubles as Nats-Msg-Id: a re-publish inside the stream's
+		// duplicate window is dropped by the broker.
+		ack, err := r.JS.Publish(ctx, x.subject, x.payload, jetstream.WithMsgID(x.id))
+		if err != nil {
+			return published, duplicates, err // broker down: rows stay unsent, next tick retries
+		}
+		if ack.Duplicate {
+			duplicates++
+		} else {
+			published++
+		}
+		if x.id == r.CrashAfter {
+			r.CrashAfter = ""
+			return published, duplicates, ErrCrashed
+		}
+		if _, err := r.DB.ExecContext(ctx, &#96;UPDATE outbox SET sent_at = ? WHERE id = ?&#96;,
+			time.Now().UnixMilli(), x.id); err != nil {
+			return published, duplicates, err
+		}
+	}
+	return published, duplicates, nil
+}
+
+// 3. Fan-out: one stream, one durable consumer per subscribing service.
+func Setup(ctx context.Context, js jetstream.JetStream) error {
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name: "ORDERS", Subjects: []string{"orders.&gt;"},
+		MaxAge: 7 * 24 * time.Hour, Duplicates: 2 * time.Minute,
+	}); err != nil {
+		return err
+	}
+	_, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name: "DLQ", Subjects: []string{"dlq.&gt;"},
+		Retention: jetstream.WorkQueuePolicy, // a redriven message leaves the DLQ
+		MaxAge:    14 * 24 * time.Hour,
+	})
+	return err
+}
+
+type Group struct {
+	Name     string   // durable consumer name = one subscribing service
+	Subjects []string // what it listens to
+	Handle   func(ctx context.Context, tx *sql.Tx, e OrderPlaced) error
+}
+
+type Pipeline struct {
+	DB          *sql.DB
+	JS          jetstream.JetStream
+	MaxAttempts int
+	AckWait     time.Duration // must exceed the slowest normal handler run
+	RetryDelay  time.Duration
+	Log         func(group string, e OrderPlaced, delivery uint64, what string)
+	CrashBefore func(group, eventID string, delivery uint64) bool // test hook
+}
+
+// Start creates the group's durable consumer and runs &#96;workers&#96; competing workers on it.
+func (p *Pipeline) Start(ctx context.Context, g Group, workers int) (jetstream.Consumer, error) {
+	cons, err := p.JS.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+		Durable:        g.Name,
+		FilterSubjects: g.Subjects,
+		AckPolicy:      jetstream.AckExplicitPolicy,
+		AckWait:        p.AckWait,
+		MaxDeliver:     p.MaxAttempts + 1, // one spare in case the DLQ publish failed
+		MaxAckPending:  16,                // like prefetch: unacked messages in flight
+	})
+	if err != nil {
+		return nil, err
+	}
+	for range workers {
+		go p.worker(ctx, g, cons)
+	}
+	return cons, nil
+}
+
+func (p *Pipeline) worker(ctx context.Context, g Group, cons jetstream.Consumer) {
+	it, err := cons.Messages(jetstream.PullMaxMessages(1))
+	if err != nil {
+		return
+	}
+	defer it.Stop()
+	go func() { &lt;-ctx.Done(); it.Stop() }()
+	for {
+		msg, err := it.Next()
+		if err != nil {
+			return // iterator stopped
+		}
+		if crashed := p.handle(ctx, g, msg); crashed {
+			return // this worker dies; its unacked message is redelivered after AckWait
+		}
+	}
+}
+
+var ErrPermanent = errors.New("permanent")
+
+func (p *Pipeline) handle(ctx context.Context, g Group, msg jetstream.Msg) (crashed bool) {
+	meta, err := msg.Metadata()
+	if err != nil {
+		return false
+	}
+	n := meta.NumDelivered
+	var e OrderPlaced
+	if err := json.Unmarshal(msg.Data(), &amp;e); err != nil {
+		err = fmt.Errorf("%w: bad json: %v", ErrPermanent, err)
+		p.toDLQ(ctx, g, msg, e, n, err) // retrying can't fix a bad payload
+		return false
+	}
+	dup, err := p.once(ctx, g, e)
+	switch {
+	case err == nil &amp;&amp; p.CrashBefore != nil &amp;&amp; p.CrashBefore(g.Name, e.EventID, n):
+		p.Log(g.Name, e, n, "crashed after commit, before ack")
+		return true
+	case err == nil &amp;&amp; dup:
+		p.Log(g.Name, e, n, "already processed: ack only")
+		msg.Ack()
+	case err == nil:
+		p.Log(g.Name, e, n, "done: "+msg.Subject())
+		msg.Ack()
+	case errors.Is(err, ErrPermanent) || int(n) &gt;= p.MaxAttempts:
+		p.toDLQ(ctx, g, msg, e, n, err)
+	default:
+		delay := time.Duration(n) * p.RetryDelay // linear backoff, server-side delay
+		p.Log(g.Name, e, n, fmt.Sprintf("failed (%v): retry in %v", err, delay))
+		msg.NakWithDelay(delay)
+	}
+	return false
+}
+
+// once runs the handler and records the event ID in the same transaction,
+// so a redelivered event is detected and skipped.
+func (p *Pipeline) once(ctx context.Context, g Group, e OrderPlaced) (dup bool, err error) {
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, &#96;INSERT OR IGNORE INTO processed VALUES (?, ?)&#96;, g.Name, e.EventID)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return true, nil
+	}
+	if err := g.Handle(ctx, tx, e); err != nil {
+		return false, err
+	}
+	return false, tx.Commit()
+}
+
+// 4. Dead letters keep the original payload plus why, how often and when it failed.
+func (p *Pipeline) toDLQ(ctx context.Context, g Group, msg jetstream.Msg, e OrderPlaced, n uint64, cause error) {
+	dl := nats.NewMsg("dlq." + g.Name)
+	dl.Data = msg.Data()
+	dl.Header.Set("Dlq-Original-Subject", msg.Subject())
+	dl.Header.Set("Dlq-Attempts", strconv.FormatUint(n, 10))
+	dl.Header.Set("Dlq-Error", cause.Error())
+	dl.Header.Set("Dlq-Failed-At", time.Now().UTC().Format(time.RFC3339))
+	if _, err := p.JS.PublishMsg(ctx, dl); err != nil {
+		msg.NakWithDelay(p.RetryDelay) // never drop it: try the DLQ again later
+		return
+	}
+	p.Log(g.Name, e, n, fmt.Sprintf("failed (%v): moved to dlq.%s", cause, g.Name))
+	msg.Term()
+}
+
+// 5. Nightly jobs. Redrive sends dead letters back to ONE group's subject, so
+// other subscribers don't see the event twice.
+func (p *Pipeline) Redrive(ctx context.Context, group string) (int, error) {
+	cons, err := p.JS.CreateOrUpdateConsumer(ctx, "DLQ", jetstream.ConsumerConfig{
+		Durable: "redrive-" + group, FilterSubject: "dlq." + group,
+		AckPolicy: jetstream.AckExplicitPolicy,
+	})
+	if err != nil {
+		return 0, err
+	}
+	batch, err := cons.FetchNoWait(100)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for msg := range batch.Messages() {
+		// No Msg-Id here: the original ID is still inside the dedup window
+		// and the broker would silently drop the redriven copy.
+		if _, err := p.JS.Publish(ctx, "orders.redrive."+group, msg.Data()); err != nil {
+			return n, err
+		}
+		msg.Ack()
+		n++
+	}
+	return n, batch.Error()
+}</code></pre>
+
+<p>A second file, <code>support.go</code> (not shown, same package, also vetted), holds the table schema, the two handlers and the cron wiring. <code>SendEmail</code> inserts a row a mail sender drains. <code>Catalog.Reserve</code> returns a permanent error for a quantity of 0 and a retryable one for an unknown SKU. <code>Schedule</code> registers <code>CRON_TZ=UTC 0 3 * * *</code> for the redrive and <code>CRON_TZ=UTC 30 3 * * *</code> for <code>CleanupOutbox</code>, which deletes outbox rows sent more than 7 days ago.</p>
+<p><strong>The test</strong> runs the whole story with 5 orders: A-1004 has a SKU the catalog doesn't know yet, and A-1005 has a quantity of 0. Two test hooks inject failures: the relay "crashes" right after publishing A-1002, and the inventory worker that gets A-1002 first dies after committing but before acking. Timings are scaled down: an ack wait of 500 ms instead of 30 s, and a retry delay of 100 ms × attempt.</p>
+<p>Real output of <code>go test -v</code>. The log lines from concurrent workers are sorted by group, order and delivery number so the output is the same on every run; the content of each line is exactly what the handler logged:</p>
+<pre><code>=== RUN   TestPipeline
+== checkout: 5 orders, each with its outbox row in one transaction
+== relay crashes after publishing evt-A-1002, before marking it sent
+  tick 1: published=2 duplicates=0 err=relay crashed
+  tick 2: published=3 duplicates=1 err=&lt;nil&gt;
+  ORDERS stream holds 5 messages
+== consumers exist but no workers yet: lag per group
+  email     pending=5
+  inventory pending=5
+== start 2 competing workers per group
+  email     A-1001 #1 done: orders.placed
+  email     A-1002 #1 done: orders.placed
+  email     A-1003 #1 done: orders.placed
+  email     A-1004 #1 done: orders.placed
+  email     A-1005 #1 done: orders.placed
+  inventory A-1001 #1 done: orders.placed
+  inventory A-1002 #1 crashed after commit, before ack
+  inventory A-1002 #2 already processed: ack only
+  inventory A-1003 #1 done: orders.placed
+  inventory A-1004 #1 failed (unknown sku "X-404"): retry in 100ms
+  inventory A-1004 #2 failed (unknown sku "X-404"): retry in 200ms
+  inventory A-1004 #3 failed (unknown sku "X-404"): moved to dlq.inventory
+  inventory A-1005 #1 failed (permanent: qty 0): moved to dlq.inventory
+  emails=5 reservations=3 dlq depth=2
+== a dead letter, as stored
+  dlq.inventory attempts=1 error="permanent: qty 0"
+    payload={"event_id":"evt-A-1005","order_id":"A-1005","sku":"MUG","qty":0,"email":"buyer@example.com"}
+  dlq.inventory attempts=3 error="unknown sku &#92;"X-404&#92;""
+    payload={"event_id":"evt-A-1004","order_id":"A-1004","sku":"X-404","qty":1,"email":"buyer@example.com"}
+== 03:00 UTC cron: catalog sync fixed X-404, redrive inventory dead letters
+  redriven=2 err=&lt;nil&gt;
+  inventory A-1004 #1 done: orders.redrive.inventory
+  inventory A-1005 #1 failed (permanent: qty 0): moved to dlq.inventory
+  emails=5 reservations=4 dlq depth=1
+== 03:30 UTC cron: delete sent outbox rows
+  deleted=5 err=&lt;nil&gt;
+== schedule check
+  entry 1 next run: 2026-11-16T03:00:00Z
+  entry 2 next run: 2026-11-16T03:30:00Z</code></pre>
+<p>Things to notice:</p>
+<ul>
+  <li><strong>The relay crash produced a duplicate, and nobody saw it.</strong> Tick 1 published A-1001 and A-1002, then "crashed" before marking A-1002 sent. Tick 2 published A-1002 again. JetStream saw the same <code>Nats-Msg-Id</code> inside its dedup window and returned <code>Duplicate: true</code>, so the stream holds 5 messages, not 6.</li>
+  <li><strong>Fan-out is one copy per group.</strong> Email got all 5 orders, including the two inventory couldn't handle.</li>
+  <li><strong>The crash was absorbed by idempotency.</strong> The inventory worker committed A-1002's reservation and died before acking. After the ack wait the other worker got delivery #2, found the event ID in <code>processed</code>, and only acked. Reservations: 3, not 4.</li>
+  <li><strong>Two kinds of failure, two paths.</strong> A-1004's unknown SKU might be a catalog sync lag, so it was retried with growing delays (100 ms, 200 ms) and dead-lettered on attempt 3. A-1005's quantity of 0 can never succeed, so it went to the DLQ on attempt 1.</li>
+  <li><strong>Redrive targets one group.</strong> The 03:00 job re-published both dead letters to <code>orders.redrive.inventory</code>, which only the inventory consumer listens to. A-1004 now succeeded. A-1005 failed again and went straight back to the DLQ, where a human has to look at it. Email stayed at 5.</li>
+</ul>
+<div class="callout warn"><strong>Two redrive traps the code avoids.</strong> If you redrive to the main topic, <em>every</em> subscriber gets the event again, so every handler must dedupe (email would have sent twice without its <code>processed</code> table). And if you redrive with the original message ID while it is still inside the broker's dedup window, the broker drops the redriven copy as a duplicate and the message silently disappears. That's why <code>Redrive</code> publishes without a message ID and relies on the consumer's dedup table.</div>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Dual writes.</strong> "Save the order, then publish" loses events when the process dies between the two, and "publish, then save" announces orders that never committed. The outbox fixes it, at the cost of a relay, a table to clean and at-least-once delivery. CDC (e.g. Debezium's outbox event router) replaces polling but adds infrastructure.</li>
+  <li><strong>Non-idempotent consumers.</strong> Every step here can deliver twice: the relay after a crash, the broker after an ack timeout, the redrive job. A handler that sends an email or charges a card must record "done" in the same transaction as the work, or call something that accepts an <a href="#idempotency">idempotency key</a>.</li>
+  <li><strong>Unbounded retries.</strong> A default of "redeliver forever" (JetStream's <code>MaxDeliver</code> default, a RabbitMQ classic queue with requeue) turns one bad message into an endless loop. Always set a limit and a delay, and send permanent errors straight to the DLQ.</li>
+  <li><strong>A DLQ nobody watches.</strong> A DLQ without an alert is a slow way to delete data. Alert on depth &gt; 0, give each DLQ an owner, and make redrive a tested tool, not a hand-run script.</li>
+  <li><strong>Cron on every replica.</strong> A scheduler inside the app runs on each pod. With 6 pods the redrive runs 6 times. Run it on one (leader election, a lock, or a platform scheduler with a concurrency policy). See <a href="#cron-jobs">Cron Jobs</a>.</li>
+  <li><strong>Assuming order.</strong> Two competing workers, a retry delay or a redrive all reorder messages. If <code>OrderCancelled</code> can overtake <code>OrderPlaced</code>, either partition by order ID (Kafka partition key, SQS FIFO message group) and accept less parallelism, or make handlers check a version and ignore stale events.</li>
+  <li><strong>Losing the trail.</strong> Put a trace context and the event ID in message headers so one order can be followed across the relay and every consumer (see <a href="#distributed-tracing">Distributed Tracing</a>).</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>The request ends at one database commit that writes the order and its outbox row together. Everything after it is asynchronous and allowed to retry.</li>
+  <li>Fan out with one durable subscription per service. Inside a service, share work with competing consumers and explicit acks.</li>
+  <li>Delivery is at-least-once at every hop, so every handler records its event ID in the same transaction as its work.</li>
+  <li>Bound everything: attempts before the DLQ, retention, prefetch. Then alert on DLQ depth, oldest message age and oldest unsent outbox row, and run the cleanup and redrive jobs on one replica.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#message-queues">Message Queues</a> · <a href="#pub-sub">Pub/Sub</a> · <a href="#event-driven-architecture">Event-Driven Architecture</a> · <a href="#dead-letter-queues">Dead-Letter Queues</a> · <a href="#cron-jobs">Cron Jobs</a> · <a href="#idempotency">Idempotency</a></p>
+`;
+
