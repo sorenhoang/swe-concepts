@@ -329,3 +329,288 @@ pending (delivered, not acked): 0 map[]</code></pre>
 
 <p><strong>Related:</strong> <a href="#pub-sub">Pub/Sub</a> · <a href="#dead-letter-queues">Dead-Letter Queues</a> · <a href="#idempotency">Idempotency</a> · <a href="#backpressure">Backpressure</a> · <a href="#event-driven-architecture">Event-Driven Architecture</a> · <a href="#real-world-async-pipeline">Real-World Async Pipeline</a></p>
 `;
+CONTENT["pub-sub"] = `
+<p class="tldr"><strong>TL;DR</strong>: In publish/subscribe, a publisher sends a message to a <strong>topic</strong>, and <em>every</em> subscriber to that topic gets its own copy. The publisher doesn't know who is listening. It's a radio station, not a phone call. The key question for any pub/sub system is what happens to a subscriber that is offline: some forget it (fire-and-forget), others keep its messages until it comes back (durable subscriptions).</p>
+
+<h2>The problem it solves</h2>
+<p>When an order is placed, several teams care: email sends a confirmation, inventory reserves stock, analytics counts revenue, fraud scores the payment. With direct calls, the order service has to know all of them, call each one, and handle each one failing. Every new consumer means a change and a deploy of the order service.</p>
+<p>A <a href="#message-queues">message queue</a> doesn't fix this on its own: a queue gives each message to <em>one</em> consumer, and here every interested service needs <em>its own</em> copy. Pub/sub inverts the dependency. The order service publishes one <code>orders.placed</code> message and is done. Each interested service subscribes. Adding a fraud check next quarter is a new subscription, with no change to the publisher. This is the transport under <a href="#event-driven-architecture">event-driven architecture</a>.</p>
+
+<h2>How it works</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 320" role="img" aria-label="The order service publishes one message to the orders.placed topic. The topic fans it out to three subscriptions: email, inventory and analytics. Each subscription keeps its own copy and its own position. The inventory subscription has two competing consumers that share its messages; email and analytics have one consumer each.">
+  <defs><marker id="arr-ps-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="15" y="128" width="140" height="54" rx="8"/><text x="85" y="151" text-anchor="middle" class="title">Order service</text><text x="85" y="169" text-anchor="middle" class="small">publisher</text>
+  <rect class="box accent" x="210" y="118" width="150" height="74" rx="10"/><text x="285" y="146" text-anchor="middle" class="title">topic</text><text x="285" y="166" text-anchor="middle">orders.placed</text>
+  <path class="line" d="M155 155 H208" marker-end="url(#arr-ps-1)"/><text x="182" y="146" text-anchor="middle" class="small">1 msg</text>
+
+  <rect class="box" x="420" y="22" width="150" height="54" rx="8"/><text x="495" y="45" text-anchor="middle">sub: email</text><text x="495" y="63" text-anchor="middle" class="small">own copy, own cursor</text>
+  <rect class="box" x="420" y="128" width="150" height="54" rx="8"/><text x="495" y="151" text-anchor="middle">sub: inventory</text><text x="495" y="169" text-anchor="middle" class="small">own copy, own cursor</text>
+  <rect class="box" x="420" y="234" width="150" height="54" rx="8"/><text x="495" y="257" text-anchor="middle">sub: analytics</text><text x="495" y="275" text-anchor="middle" class="small">own copy, own cursor</text>
+  <path class="line accent" d="M360 140 L418 52" marker-end="url(#arr-ps-1)"/>
+  <path class="line accent" d="M360 155 H418" marker-end="url(#arr-ps-1)"/>
+  <path class="line accent" d="M360 170 L418 258" marker-end="url(#arr-ps-1)"/>
+  <text x="330" y="222" text-anchor="middle" class="small">3 copies</text>
+
+  <rect class="box ok" x="630" y="27" width="135" height="44" rx="8"/><text x="697" y="54" text-anchor="middle">email worker</text>
+  <rect class="box ok" x="630" y="110" width="135" height="38" rx="8"/><text x="697" y="134" text-anchor="middle">inventory #1</text>
+  <rect class="box ok" x="630" y="162" width="135" height="38" rx="8"/><text x="697" y="186" text-anchor="middle">inventory #2</text>
+  <rect class="box ok" x="630" y="239" width="135" height="44" rx="8"/><text x="697" y="266" text-anchor="middle">analytics job</text>
+  <path class="line" d="M570 49 H628" marker-end="url(#arr-ps-1)"/>
+  <path class="line" d="M570 148 L628 130" marker-end="url(#arr-ps-1)"/>
+  <path class="line" d="M570 162 L628 180" marker-end="url(#arr-ps-1)"/>
+  <path class="line" d="M570 261 H628" marker-end="url(#arr-ps-1)"/>
+  <text x="600" y="222" text-anchor="middle" class="small">competing consumers</text>
+</svg>
+<figcaption>Fan-out between subscriptions, a queue inside each one. Every subscription gets every message; within a subscription, its consumers split the work. Kafka calls a subscription a <em>consumer group</em>, JetStream a <em>durable consumer</em>, Google Pub/Sub a <em>subscription</em>.</figcaption>
+</figure>
+
+<p>Most real systems combine the two patterns this way. Pub/sub decides <em>who</em> gets a copy; each subscription then behaves like a queue, with acks, redelivery and competing consumers, as in <a href="#message-queues">message queues</a>.</p>
+
+<table>
+  <tr><th></th><th>Queue (point-to-point)</th><th>Pub/sub (fan-out)</th></tr>
+  <tr><td>Who gets a message</td><td>exactly one consumer</td><td>every subscription; one consumer inside each</td></tr>
+  <tr><td>Sender's intent</td><td>"someone, do this job"</td><td>"this happened; whoever cares, react"</td></tr>
+  <tr><td>Message naming</td><td>commands: <code>SendInvoice</code></td><td>events (facts): <code>OrderPlaced</code></td></tr>
+  <tr><td>Adding a consumer type</td><td>a new queue, and the producer must send to it</td><td>a new subscription; publisher unchanged</td></tr>
+  <tr><td>Scaling one consumer type</td><td>add competing consumers</td><td>add consumers to that subscription</td></tr>
+  <tr><td>Typical tools</td><td>SQS, RabbitMQ queue, Redis Streams group</td><td>SNS, Google Pub/Sub, Kafka topics, NATS subjects, RabbitMQ fanout/topic exchanges</td></tr>
+</table>
+
+<h3>Fire-and-forget vs durable</h3>
+<p>The biggest difference between pub/sub systems is whether the broker <em>stores</em> messages for subscribers:</p>
+<ul>
+  <li><strong>Fire-and-forget</strong> (Redis Pub/Sub, core NATS). The broker pushes each message to whoever is connected <em>right now</em> and forgets it. Redis documents its Pub/Sub as at-most-once: if the subscriber is disconnected or fails to handle the message, it is lost forever. A subscriber that starts late never sees what was published before. Fast and simple, and fine for data that is replaced by the next message: live prices, presence, cache-invalidation hints, <a href="#server-sent-events">SSE</a> or <a href="#websockets">WebSocket</a> fan-out to connected browsers.</li>
+  <li><strong>Durable</strong> (Kafka consumer groups, JetStream durable consumers, Google Pub/Sub subscriptions, SNS delivering into SQS queues). The broker stores messages, and each subscription has a position that survives restarts. A subscriber that is down for 10 minutes catches up when it comes back. Redis's own docs point to Redis Streams when you need this.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Timeline of six messages published while a subscriber is offline between m3 and m4. With fire-and-forget pub/sub, m1, m2, m5 and m6 arrive, and m3 and m4 are lost. With a durable subscription, m3 and m4 are stored and delivered in a catch-up burst when the subscriber reconnects, followed by m5 and m6.">
+  <defs><marker id="arr-ps-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="20" y="44" class="title">published</text>
+  <path class="line" d="M170 40 H760" marker-end="url(#arr-ps-2)"/>
+  <rect class="box accent" x="190" y="26" width="38" height="28" rx="4"/><text x="209" y="45" text-anchor="middle" class="small">m1</text>
+  <rect class="box accent" x="270" y="26" width="38" height="28" rx="4"/><text x="289" y="45" text-anchor="middle" class="small">m2</text>
+  <rect class="box accent" x="350" y="26" width="38" height="28" rx="4"/><text x="369" y="45" text-anchor="middle" class="small">m3</text>
+  <rect class="box accent" x="430" y="26" width="38" height="28" rx="4"/><text x="449" y="45" text-anchor="middle" class="small">m4</text>
+  <rect class="box accent" x="590" y="26" width="38" height="28" rx="4"/><text x="609" y="45" text-anchor="middle" class="small">m5</text>
+  <rect class="box accent" x="670" y="26" width="38" height="28" rx="4"/><text x="689" y="45" text-anchor="middle" class="small">m6</text>
+
+  <rect class="box bad" x="335" y="66" width="190" height="24" rx="4"/><text x="430" y="82" text-anchor="middle" class="small">subscriber offline (deploy)</text>
+
+  <text x="20" y="124" class="title">fire-and-forget</text>
+  <text x="20" y="140" class="small">Redis Pub/Sub, core NATS</text>
+  <path class="line" d="M170 126 H760" style="stroke: var(--line)"/>
+  <rect class="box ok" x="190" y="112" width="38" height="28" rx="4"/><text x="209" y="131" text-anchor="middle" class="small">m1</text>
+  <rect class="box ok" x="270" y="112" width="38" height="28" rx="4"/><text x="289" y="131" text-anchor="middle" class="small">m2</text>
+  <rect class="box bad" x="350" y="112" width="38" height="28" rx="4"/><text x="369" y="131" text-anchor="middle" class="small">lost</text>
+  <rect class="box bad" x="430" y="112" width="38" height="28" rx="4"/><text x="449" y="131" text-anchor="middle" class="small">lost</text>
+  <rect class="box ok" x="590" y="112" width="38" height="28" rx="4"/><text x="609" y="131" text-anchor="middle" class="small">m5</text>
+  <rect class="box ok" x="670" y="112" width="38" height="28" rx="4"/><text x="689" y="131" text-anchor="middle" class="small">m6</text>
+
+  <text x="20" y="194" class="title">durable</text>
+  <text x="20" y="210" class="small">Kafka, JetStream, GCP</text>
+  <path class="line" d="M170 196 H760" style="stroke: var(--line)"/>
+  <rect class="box ok" x="190" y="182" width="38" height="28" rx="4"/><text x="209" y="201" text-anchor="middle" class="small">m1</text>
+  <rect class="box ok" x="270" y="182" width="38" height="28" rx="4"/><text x="289" y="201" text-anchor="middle" class="small">m2</text>
+  <rect class="box ok" x="530" y="182" width="38" height="28" rx="4"/><text x="549" y="201" text-anchor="middle" class="small">m3</text>
+  <rect class="box ok" x="572" y="182" width="38" height="28" rx="4"/><text x="591" y="201" text-anchor="middle" class="small">m4</text>
+  <rect class="box ok" x="630" y="182" width="38" height="28" rx="4"/><text x="649" y="201" text-anchor="middle" class="small">m5</text>
+  <rect class="box ok" x="690" y="182" width="38" height="28" rx="4"/><text x="709" y="201" text-anchor="middle" class="small">m6</text>
+  <text x="570" y="232" text-anchor="middle" class="small">stored while offline, delivered as a catch-up burst</text>
+</svg>
+<figcaption>Same publisher, same outage. The durable subscriber gets everything, a little late; the fire-and-forget one has a silent gap. Note the burst: a durable subscriber must be able to process a backlog faster than real time to catch up.</figcaption>
+</figure>
+
+<p>Durable subscriptions have their own rules to know:</p>
+<ul>
+  <li><strong>A subscription only sees messages from when it was created.</strong> Google Pub/Sub's docs: only messages published after the subscription exists are available to it (topic retention plus <em>seek</em> can go back further). A JetStream consumer or a Kafka consumer group can instead start from the beginning of what the stream still retains, as the example shows.</li>
+  <li><strong>Delivery is at-least-once.</strong> Google Pub/Sub's default, Kafka's normal mode and JetStream's explicit-ack consumers all redeliver after crashes. Subscribers need to be <a href="#idempotency">idempotent</a>.</li>
+  <li><strong>Retention is finite.</strong> A subscriber that is down longer than the retention period comes back to a gap, just like fire-and-forget, only later.</li>
+</ul>
+
+<h3>Topics, subjects and filtering</h3>
+<p>Subscribers rarely want everything. Systems filter in different places:</p>
+<ul>
+  <li><strong>Subject wildcards</strong> (NATS). Subjects are dot-separated tokens. <code>orders.*</code> matches exactly one token (<code>orders.placed</code>, <code>orders.cancelled</code>); <code>orders.&gt;</code> matches one or more (<code>orders.eu.placed</code> too). Redis has glob patterns with <code>PSUBSCRIBE news.*</code>.</li>
+  <li><strong>Attribute filters on the subscription</strong>. SNS subscriptions take a filter policy, Google Pub/Sub subscriptions a filter on message attributes. The broker only delivers matching messages.</li>
+  <li><strong>Topic per event type</strong> (Kafka). Kafka brokers don't filter; a consumer reads the whole topic and skips what it doesn't need. So topic design matters: one topic per event type, or per domain with a <code>type</code> field.</li>
+</ul>
+<p>Name topics after <em>what happened</em> (<code>orders.placed</code>), not after who consumes it (<code>email-queue</code>). The second ties the publisher to its consumers again.</p>
+
+<table>
+  <tr><th>System</th><th>Subscriber offline</th><th>Late subscriber</th><th>Filtering</th><th>Scaling one subscriber</th></tr>
+  <tr><td>Redis Pub/Sub</td><td>messages lost</td><td>sees only new messages</td><td>channel name, glob patterns</td><td>every connection gets a copy</td></tr>
+  <tr><td>Core NATS</td><td>messages lost</td><td>sees only new messages</td><td>subject wildcards <code>*</code>, <code>&gt;</code></td><td>queue groups: one member gets each message</td></tr>
+  <tr><td>NATS JetStream</td><td>stored in the stream</td><td>can replay from start, a sequence or a time</td><td>filter subjects on the consumer</td><td>many clients pull from one durable consumer</td></tr>
+  <tr><td>Kafka</td><td>stored until retention</td><td>new group can start at earliest or latest offset</td><td>by topic; consumer-side otherwise</td><td>consumers in a group split partitions</td></tr>
+  <tr><td>SNS + SQS</td><td>waits in the subscriber's SQS queue</td><td>gets messages from subscription onwards</td><td>subscription filter policies</td><td>competing consumers on the SQS queue</td></tr>
+  <tr><td>Google Pub/Sub</td><td>kept for the subscription</td><td>from subscription onwards (or seek)</td><td>subscription filter on attributes</td><td>many subscribers on one subscription</td></tr>
+</table>
+
+<h3>The slow subscriber</h3>
+<p>Fan-out means one publisher rate hits every subscriber. If analytics handles 200 messages/s and the topic carries 1,000/s, something has to give:</p>
+<ul>
+  <li><strong>Fire-and-forget brokers protect themselves by dropping the subscriber.</strong> Redis buffers output for each Pub/Sub client and, with the default <code>client-output-buffer-limit pubsub 32mb 8mb 60</code>, disconnects a client whose buffer passes 32 MB, or stays above 8 MB for 60 seconds. The NATS server marks a client that can't keep up as a <em>slow consumer</em> and disconnects it (its default max pending is 64 MB per client). Either way, the subscriber silently loses messages.</li>
+  <li><strong>Durable brokers let the subscription fall behind.</strong> Lag grows for that one subscription, while the others stay current: this isolation is the point. But lag that grows for hours runs into retention, and then you lose data anyway. Watch lag per subscription and scale its consumers (see <a href="#backpressure">backpressure</a>).</li>
+</ul>
+
+<h2>Example</h2>
+<p><strong>Scenario.</strong> The order service publishes about 600 <code>orders.*</code> events a minute. A new audit service, required for compliance, is deployed at 10:00, and its pods restart for 3 minutes during a 14:00 deploy. On core NATS it would have missed everything before 10:00 and about 1,800 events during the restart, with no error anywhere. On a JetStream durable consumer it reads the history the stream still holds on first start, and after the restart it resumes at the next unread message and works through the 1,800-message backlog.</p>
+<p><strong>Code.</strong> An embedded NATS server with JetStream, started inside the test. A stream named <code>ORDERS</code> records everything on <code>orders.&gt;</code>. Core subscriptions show fan-out and the late-subscriber gap; a durable consumer shows replay and resuming.</p>
+<pre><code>package pubsub
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+// StartServer runs a NATS server with JetStream inside this process.
+func StartServer(storeDir string) (*server.Server, error) {
+	ns, err := server.NewServer(&amp;server.Options{Port: -1, JetStream: true, StoreDir: storeDir})
+	if err != nil {
+		return nil, err
+	}
+	ns.Start()
+	if !ns.ReadyForConnections(5 * time.Second) {
+		return nil, context.DeadlineExceeded
+	}
+	return ns, nil
+}
+
+// Drain returns every message already waiting on a core subscription.
+func Drain(sub *nats.Subscription) []string {
+	var out []string
+	for {
+		m, err := sub.NextMsg(50 * time.Millisecond)
+		if err != nil {
+			return out
+		}
+		out = append(out, m.Subject+" "+string(m.Data))
+	}
+}
+
+// Replay fetches up to n messages for a durable JetStream consumer and acks
+// them. The server stores the consumer's position, so a subscriber that
+// restarts with the same name continues where it left off.
+func Replay(ctx context.Context, js jetstream.JetStream, durable string, n int) ([]string, error) {
+	cons, err := js.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+		Durable:       durable,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy, // used only when it is first created
+	})
+	if err != nil {
+		return nil, err
+	}
+	batch, err := cons.Fetch(n, jetstream.FetchMaxWait(200*time.Millisecond))
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for m := range batch.Messages() {
+		meta, _ := m.Metadata()
+		out = append(out, fmt.Sprintf("%s %s seq=%d", m.Subject(), m.Data(), meta.Sequence.Stream))
+		if err := m.Ack(); err != nil {
+			return out, err
+		}
+	}
+	return out, batch.Error()
+}</code></pre>
+<pre><code>package pubsub
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+func Example() {
+	ctx := context.Background()
+	dir, _ := os.MkdirTemp("", "js")
+	defer os.RemoveAll(dir)
+	ns, err := StartServer(dir)
+	if err != nil {
+		panic(err)
+	}
+	defer ns.Shutdown()
+	nc, _ := nats.Connect(ns.ClientURL())
+	defer nc.Close()
+	js, _ := jetstream.New(nc)
+
+	// A stream records everything published on orders.&gt; (used in part 2).
+	_, err = js.CreateStream(ctx, jetstream.StreamConfig{Name: "ORDERS", Subjects: []string{"orders.&gt;"}})
+	if err != nil {
+		panic(err)
+	}
+
+	// Part 1: core NATS. Every subscriber gets its own copy; no one stores it.
+	email, _ := nc.SubscribeSync("orders.placed") // exact subject
+	analytics, _ := nc.SubscribeSync("orders.*")  // wildcard: one token
+	nc.Publish("orders.placed", []byte("o-1"))
+	nc.Publish("orders.cancelled", []byte("o-2"))
+	nc.Flush()
+
+	audit, _ := nc.SubscribeSync("orders.&gt;") // subscribes late
+	nc.Publish("orders.placed", []byte("o-3"))
+	nc.Flush()
+
+	fmt.Println("email     |", strings.Join(Drain(email), ", "))
+	fmt.Println("analytics |", strings.Join(Drain(analytics), ", "))
+	fmt.Println("audit     |", strings.Join(Drain(audit), ", "), " &lt;- missed o-1, o-2")
+
+	// Part 2: JetStream durable consumer. The stream kept every message, so a
+	// subscriber created late can still read from the start.
+	got, _ := Replay(ctx, js, "audit", 10)
+	fmt.Println("durable audit, first run     |", strings.Join(got, ", "))
+
+	// The audit service goes offline; orders keep coming.
+	js.Publish(ctx, "orders.placed", []byte("o-4"))
+	js.Publish(ctx, "orders.placed", []byte("o-5"))
+
+	got, _ = Replay(ctx, js, "audit", 10)
+	fmt.Println("durable audit, after restart |", strings.Join(got, ", "))
+}</code></pre>
+<p>Real output from <code>go test</code> (pinned as the example's expected output; also passes under <code>-race</code>):</p>
+<pre><code>email     | orders.placed o-1, orders.placed o-3
+analytics | orders.placed o-1, orders.cancelled o-2, orders.placed o-3
+audit     | orders.placed o-3  &lt;- missed o-1, o-2
+durable audit, first run     | orders.placed o-1 seq=1, orders.cancelled o-2 seq=2, orders.placed o-3 seq=3
+durable audit, after restart | orders.placed o-4 seq=4, orders.placed o-5 seq=5</code></pre>
+<p>Reading it line by line:</p>
+<ul>
+  <li><strong>Fan-out.</strong> One publish of <code>o-1</code> reached both <code>email</code> and <code>analytics</code>. Each got its own copy.</li>
+  <li><strong>Filtering.</strong> <code>email</code> subscribed to the exact subject and did not get <code>orders.cancelled</code>; <code>analytics</code> used <code>orders.*</code> and did.</li>
+  <li><strong>Fire-and-forget.</strong> <code>audit</code> subscribed after <code>o-1</code> and <code>o-2</code> were published and never saw them. Nothing failed; they simply had no listener.</li>
+  <li><strong>Durable replay.</strong> The JetStream consumer named <code>audit</code> was created later still, but the stream had kept all three messages, so it read them from sequence 1.</li>
+  <li><strong>Resume.</strong> On the second run with the same durable name, the server remembered the position: only <code>o-4</code> and <code>o-5</code>, published while it was "offline", were delivered.</li>
+</ul>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Using fire-and-forget for data that matters.</strong> Redis Pub/Sub or core NATS for "order placed" means every subscriber restart or network blip silently drops orders. Use them for data the next message replaces; use a durable subscription for facts.</li>
+  <li><strong>One shared subscription for different services.</strong> If email and inventory join the same consumer group, they <em>compete</em> for messages, and each gets about half. Every independent consumer type needs its own subscription.</li>
+  <li><strong>No owner for the subscriber list.</strong> The publisher doesn't know who listens, which is the point, but someone must. Before changing or removing an event, you need to know its subscribers. Keep a schema registry or a catalog, and version events (see <a href="#schema-versioning">schema versioning</a>).</li>
+  <li><strong>Assuming order across subscribers.</strong> Email may process <code>o-7</code> before inventory does. Subscribers are independent; don't build logic that needs them to be in step.</li>
+  <li><strong>Not planning for catch-up.</strong> After an outage, a durable subscriber gets a burst. If its downstream (a database, an email provider with a rate limit) can't take it, the catch-up causes the next incident. Limit consumer concurrency and use <a href="#rate-limiting">rate limiting</a> on the way out.</li>
+  <li><strong>Retention shorter than your worst outage.</strong> A 24-hour retention and a subscriber broken over a long weekend means data loss on Monday. Size retention for how long a subscriber can realistically be down, and alert on lag well before that.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Pub/sub sends one message to every subscription; inside a subscription, consumers compete like a queue.</li>
+  <li>Fire-and-forget (Redis Pub/Sub, core NATS) loses messages for anyone not connected; durable subscriptions (Kafka, JetStream, Google Pub/Sub, SNS to SQS) keep them per subscriber.</li>
+  <li>Each independent consumer type needs its own subscription, its own lag metric and an idempotent handler.</li>
+  <li>A slow subscriber is dropped by fire-and-forget brokers and falls behind on durable ones; watch lag against retention.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#message-queues">Message Queues</a> · <a href="#event-driven-architecture">Event-Driven Architecture</a> · <a href="#dead-letter-queues">Dead-Letter Queues</a> · <a href="#backpressure">Backpressure</a> · <a href="#server-sent-events">Server-Sent Events</a> · <a href="#real-world-async-pipeline">Real-World Async Pipeline</a></p>
+`;
