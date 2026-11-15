@@ -1545,3 +1545,309 @@ func ChargeOnce(ctx context.Context, db *sql.DB, orderID string, amount int64) (
 
 <p><strong>Related:</strong> <a href="#retries">Retries</a> · <a href="#message-queues">Message Queues</a> · <a href="#webhooks">Webhooks</a> · <a href="#distributed-transactions">Distributed Transactions</a> · <a href="#optimistic-locking">Optimistic Locking</a> · <a href="#real-world-resilience-playbook">Real-World Resilience Playbook</a></p>
 `;
+CONTENT["backpressure"] = `
+<p class="tldr"><strong>TL;DR</strong>: Backpressure is how a system that can't keep up tells the sender to slow down, instead of silently piling work into a queue until it runs out of memory or every request is late. Think of a kitchen that stops taking orders when every burner is busy and the ticket rail is full, rather than accepting 300 orders it will serve cold an hour later.</p>
+
+<h2>The problem it solves</h2>
+<p>Whenever a producer can send work faster than a consumer can finish it, the difference has to go somewhere. If nothing pushes back, it goes into a queue: a channel, a goroutine per request, a socket buffer, a Kafka topic, a thread pool's task list.</p>
+<ul>
+  <li><strong>Unbounded queues turn overload into latency.</strong> If 80 requests per second arrive and you can serve 40, the queue grows by 40 every second. After 10 seconds, a new request waits 10 seconds before anyone looks at it.</li>
+  <li><strong>Then into memory.</strong> Every queued item holds memory: a goroutine stack, a request body, a buffer. A long enough spike ends with the process being OOM-killed, which drops <em>everything</em> in the queue.</li>
+  <li><strong>Work for nobody.</strong> Clients time out after a few seconds and retry, but the server still works through the old, abandoned requests. Throughput looks fine on a graph while <em>goodput</em> (useful completed work) falls towards zero.</li>
+  <li><strong>Slow recovery.</strong> Even after traffic drops back, the backlog takes minutes to drain, and every request in that time is slow.</li>
+</ul>
+<p>Backpressure makes the limit explicit: bounded buffers, and a clear decision about what happens when they are full.</p>
+
+<h2>How it works</h2>
+<p>Every backpressure design has the same three parts: a <strong>bounded</strong> buffer between producer and consumer, a <strong>signal</strong> when it fills up, and a <strong>policy</strong> for what to do with the extra work.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 330" role="img" aria-label="A producer sends 80 items per second into a bounded queue with 6 slots, all full. A consumer drains 40 per second. When the queue is full there are five options: block the producer, drop items, shed load with 429 or 503, buffer somewhere bigger, or signal the producer to send less.">
+  <defs><marker id="arr-bp-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="30" y="56" width="150" height="56" rx="8"/>
+  <text x="105" y="80" text-anchor="middle" class="title">Producer</text>
+  <text x="105" y="98" text-anchor="middle" class="small">sends 80 / s</text>
+  <rect class="box muted" x="290" y="54" width="190" height="60" rx="6"/>
+  <rect class="box accent" x="300" y="64" width="26" height="40" rx="3"/><rect class="box accent" x="330" y="64" width="26" height="40" rx="3"/><rect class="box accent" x="360" y="64" width="26" height="40" rx="3"/><rect class="box accent" x="390" y="64" width="26" height="40" rx="3"/><rect class="box accent" x="420" y="64" width="26" height="40" rx="3"/><rect class="box accent" x="450" y="64" width="26" height="40" rx="3"/>
+  <text x="385" y="40" text-anchor="middle" class="small">bounded queue: 6 of 6 slots used</text>
+  <rect class="box" x="600" y="56" width="150" height="56" rx="8"/>
+  <text x="675" y="80" text-anchor="middle" class="title">Consumer</text>
+  <text x="675" y="98" text-anchor="middle" class="small">handles 40 / s</text>
+  <path class="line" d="M180 84 H288" marker-end="url(#arr-bp-1)"/>
+  <path class="line" d="M480 84 H598" marker-end="url(#arr-bp-1)"/>
+  <path class="line bad dashed" d="M385 114 V152" marker-end="url(#arr-bp-1)"/>
+  <text x="395" y="138" class="small">full: what now?</text>
+
+  <rect class="box" x="10" y="160" width="142" height="62" rx="8"/>
+  <text x="81" y="184" text-anchor="middle" class="title">Block</text>
+  <text x="81" y="204" text-anchor="middle" class="small">producer waits</text>
+  <rect class="box" x="164" y="160" width="142" height="62" rx="8"/>
+  <text x="235" y="184" text-anchor="middle" class="title">Drop</text>
+  <text x="235" y="204" text-anchor="middle" class="small">newest or oldest</text>
+  <rect class="box bad" x="318" y="160" width="142" height="62" rx="8"/>
+  <text x="389" y="184" text-anchor="middle" class="title">Shed load</text>
+  <text x="389" y="204" text-anchor="middle" class="small">fast 429 / 503</text>
+  <rect class="box" x="472" y="160" width="142" height="62" rx="8"/>
+  <text x="543" y="184" text-anchor="middle" class="title">Buffer</text>
+  <text x="543" y="204" text-anchor="middle" class="small">disk, broker, bigger</text>
+  <rect class="box ok" x="626" y="160" width="142" height="62" rx="8"/>
+  <text x="697" y="184" text-anchor="middle" class="title">Signal</text>
+  <text x="697" y="204" text-anchor="middle" class="small">"send me N more"</text>
+
+  <path class="line ok dashed" d="M697 222 V290 H158 V114" marker-end="url(#arr-bp-1)"/>
+  <text x="400" y="284" text-anchor="middle" class="small">credits / window updates flow back to the producer, which sends only what was asked for</text>
+  <text x="400" y="316" text-anchor="middle" class="small">Block and Signal slow the producer down; Drop and Shed refuse work; Buffer only postpones the decision.</text>
+</svg>
+<figcaption>A queue only helps with short bursts. For sustained overload you must slow the producer down or refuse some work; a bigger buffer just moves the problem.</figcaption>
+</figure>
+
+<h3>Why the bound matters: latency under sustained overload</h3>
+<p>Take the numbers above: 80 requests per second arrive for 10 seconds, the service handles 40. With an unbounded queue the backlog grows by 40 every second, so the wait grows by one second every second. With a bounded queue of 40 items (one second of work), the wait is capped at about one second and the excess is refused immediately.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Chart of queueing delay over time. Overload from second 2 to second 12. With an unbounded queue, the wait climbs linearly from 0 to 10 seconds and is still 9 seconds at second 14. With a bounded queue of 40 items, the wait rises to about 1 second and stays there, then falls to zero once the overload ends.">
+  <path class="line" d="M70 30 V250 H724"/>
+  <path class="line dashed" d="M70 210 H714" style="stroke: var(--line)"/><text x="62" y="214" text-anchor="end" class="small">2 s</text><path class="line dashed" d="M70 170 H714" style="stroke: var(--line)"/><text x="62" y="174" text-anchor="end" class="small">4 s</text><path class="line dashed" d="M70 130 H714" style="stroke: var(--line)"/><text x="62" y="134" text-anchor="end" class="small">6 s</text><path class="line dashed" d="M70 90 H714" style="stroke: var(--line)"/><text x="62" y="94" text-anchor="end" class="small">8 s</text><path class="line dashed" d="M70 50 H714" style="stroke: var(--line)"/><text x="62" y="54" text-anchor="end" class="small">10 s</text><text x="70" y="268" text-anchor="middle" class="small">0</text><text x="162" y="268" text-anchor="middle" class="small">2</text><text x="254" y="268" text-anchor="middle" class="small">4</text><text x="346" y="268" text-anchor="middle" class="small">6</text><text x="438" y="268" text-anchor="middle" class="small">8</text><text x="530" y="268" text-anchor="middle" class="small">10</text><text x="622" y="268" text-anchor="middle" class="small">12</text><text x="714" y="268" text-anchor="middle" class="small">14</text>
+  <text x="392" y="290" text-anchor="middle" class="small">time (s): 80 req/s arrive from 2 s to 12 s, capacity 40 req/s, then arrivals drop to 20 req/s</text>
+  <text x="20" y="22" class="small">wait in queue</text>
+  <path class="line bad dashed" d="M162 30 V250"/><path class="line bad dashed" d="M622 30 V250"/>
+  <text x="392" y="24" text-anchor="middle" class="small">overload: 80 req/s in, 40 req/s served</text>
+  <path class="line bad" d="M70 250 L162 250 L622 50 L714 70" style="stroke-width: 2.5"/>
+  <path class="line ok" d="M70 250 L162 250 L208 230 L622 230 L714 250" style="stroke-width: 2.5"/>
+  <text x="172" y="126" class="small">unbounded queue: +1 s of wait every second</text>
+  <text x="484" y="222" text-anchor="middle" class="small">bounded queue (40 items): capped near 1 s</text>
+  <text x="668" y="88" text-anchor="middle" class="small">still 9 s</text>
+</svg>
+<figcaption>Simple arithmetic, not a measurement: with no bound, every request during and after the spike is late, and the backlog outlives the spike. The bound trades a fast 503 for the excess against every accepted request staying fast.</figcaption>
+</figure>
+<p>This is Little's law at work: items in the system = arrival rate × time in the system. If you cap the number in the system and the service rate is fixed, you cap the time. A queue's job is to absorb <em>bursts</em> shorter than its size, not to hide a capacity shortfall.</p>
+
+<h3>The strategies</h3>
+<table>
+  <tr><th>Strategy</th><th>What happens when full</th><th>Good for</th><th>Cost</th></tr>
+  <tr><td>Block the producer</td><td>the send waits until there is room</td><td>in-process pipelines, batch jobs, reading a file faster than you can write it</td><td>blocking propagates upstream; needs a timeout or it can deadlock</td></tr>
+  <tr><td>Drop newest / oldest</td><td>discard the new item, or evict the oldest one</td><td>metrics, telemetry, live video frames, UI updates where only the latest matters</td><td>silent data loss; count what you drop</td></tr>
+  <tr><td>Shed load</td><td>reject immediately with <code>503</code> (server overloaded) or <code>429</code> (this client over its quota) plus <code>Retry-After</code></td><td>request/response APIs</td><td>some users see errors; clients must back off, not retry at once</td></tr>
+  <tr><td>Buffer elsewhere</td><td>spill to disk or a durable broker (Kafka, SQS) and process later</td><td>work that may be late but must not be lost: orders, emails, events</td><td>only absorbs; if consumers stay too slow, lag grows forever. Monitor it.</td></tr>
+  <tr><td>Signal / pull-based flow</td><td>the consumer grants credit ("send 64 KB more", <code>request(n)</code>), the producer never exceeds it</td><td>streams: TCP, HTTP/2, gRPC streaming, Reactive Streams</td><td>needs protocol support on both sides</td></tr>
+  <tr><td>Sample / aggregate</td><td>keep 1 in N, or merge items into one</td><td>logs, traces, counters</td><td>loses detail by design</td></tr>
+</table>
+
+<h3>Backpressure is built into the layers below you</h3>
+<ul>
+  <li><strong>TCP flow control.</strong> Every ACK carries the receiver's free buffer space, the <em>receive window</em>. The sender may only have that many unacknowledged bytes in flight. If your Go server stops reading a request body, its kernel buffer fills, the window drops to zero, and the client's writes block. (Congestion control is a separate mechanism that protects the network, not the receiver.)</li>
+  <li><strong>HTTP/2 flow control.</strong> Because many streams share one TCP connection, HTTP/2 adds its own windows per stream and per connection (65,535 bytes initially), refilled with <code>WINDOW_UPDATE</code> frames. One slow stream can't starve the others. gRPC streaming relies on this (see <a href="#http-2-http-3">HTTP/2 &amp; HTTP/3</a>, <a href="#grpc">gRPC</a>).</li>
+  <li><strong>Reactive Streams</strong> (Java's <code>Flow</code>, RxJava, Project Reactor) make it an API rule: a subscriber calls <code>request(n)</code>, and the publisher may send at most n items until asked again.</li>
+  <li><strong>Go channels.</strong> A buffered channel is a bounded queue, and a send on a full channel blocks. That is backpressure for free, as long as you don't hide it behind an unbounded slice or one goroutine per item.</li>
+</ul>
+<p>The gap is usually in your own code: an HTTP server that starts a goroutine for every request with no limit, or a consumer that reads from Kafka as fast as possible into an in-memory slice. Those layers absorb load without pushing back.</p>
+
+<h3>Concurrency limits and adaptive limits</h3>
+<p>For request/response services, the simplest useful bound is the number of requests <strong>in flight</strong>, not requests per second. By Little's law, a service that answers in 50 ms and should handle 2,000 requests/s needs about 100 in flight; if latency rises, a fixed in-flight cap automatically admits fewer requests per second. That is different from <a href="#rate-limiting">rate limiting</a>, which caps each client but not total load.</p>
+<p>Picking the number by hand is hard, and it changes with every deploy. <strong>Adaptive concurrency limits</strong> find it at runtime, borrowing ideas from TCP congestion control: raise the limit while latency stays flat, cut it when latency rises (queuing) or requests time out. Netflix's <code>concurrency-limits</code> library (Java) is the best-known example, with algorithms such as Vegas and Gradient2, and rejects excess requests with <code>429</code> in its servlet filter or <code>UNAVAILABLE</code> in gRPC.</p>
+
+<h2>Example</h2>
+<p>Two tools in Go: a <strong>bounded worker pool</strong> (a buffered channel with fixed workers, offering both "block" and "reject" when full) and <strong>load-shedding middleware</strong> that caps requests in flight with <code>golang.org/x/sync/semaphore</code>, lets a request wait briefly for a slot, then returns a fast <code>503</code>.</p>
+<pre><code>package bp
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"time"
+
+	"golang.org/x/sync/semaphore"
+)
+
+var ErrQueueFull = errors.New("queue full")
+
+// Pool runs jobs on a fixed number of workers. The buffered channel is
+// the bounded queue: once it is full, producers must wait or give up.
+type Pool struct {
+	jobs chan func()
+}
+
+func NewPool(workers, queueSize int) *Pool {
+	p := &amp;Pool{jobs: make(chan func(), queueSize)}
+	for range workers {
+		go func() {
+			for job := range p.jobs {
+				job()
+			}
+		}()
+	}
+	return p
+}
+
+// TrySubmit never blocks: when the queue is full, the caller hears "no" now.
+func (p *Pool) TrySubmit(job func()) error {
+	select {
+	case p.jobs &lt;- job:
+		return nil
+	default:
+		return ErrQueueFull
+	}
+}
+
+// Submit blocks the producer until there is room or ctx is done.
+// Blocking is backpressure: a slow consumer slows the producer down.
+func (p *Pool) Submit(ctx context.Context, job func()) error {
+	select {
+	case p.jobs &lt;- job:
+		return nil
+	case &lt;-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *Pool) Close() { close(p.jobs) }
+
+// Shed lets at most maxInFlight requests run at once. A request may wait
+// up to maxWait for a slot; after that it gets a fast 503 instead of
+// joining an ever-growing queue.
+func Shed(maxInFlight int64, maxWait time.Duration, next http.Handler) http.Handler {
+	sem := semaphore.NewWeighted(maxInFlight)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), maxWait)
+		err := sem.Acquire(ctx, 1)
+		cancel()
+		if err != nil {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "overloaded, try again shortly", http.StatusServiceUnavailable)
+			return
+		}
+		defer sem.Release(1)
+		next.ServeHTTP(w, r)
+	})
+}</code></pre>
+
+<p>The tests: 12 jobs submitted to a pool with 2 workers and 5 queue slots, then a burst of 10 simultaneous requests at an API whose database pool allows 4 queries at a time (100 ms each), first without and then with <code>Shed</code>:</p>
+<pre><code>func ExamplePool() {
+	gate := make(chan struct{}) // holds the workers busy until we say so
+	var wg sync.WaitGroup
+	p := NewPool(2, 5)                // 2 workers, room for 5 waiting jobs
+	time.Sleep(10 * time.Millisecond) // let both workers start and wait for jobs
+
+	accepted, rejected := 0, 0
+	for range 12 {
+		wg.Add(1)
+		if err := p.TrySubmit(func() { &lt;-gate; wg.Done() }); err != nil {
+			wg.Done()
+			rejected++
+			continue
+		}
+		accepted++
+	}
+	fmt.Printf("TrySubmit x12: accepted %d (2 running + 5 queued), rejected %d&#92;n", accepted, rejected)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := p.Submit(ctx, func() {})
+	fmt.Printf("Submit while full: blocked %v, then: %v&#92;n", time.Since(start).Round(50*time.Millisecond), err)
+
+	close(gate)
+	wg.Wait()
+	p.Close()
+	fmt.Println("all accepted jobs finished; nothing was lost silently")
+}
+
+func ExampleShed() {
+	// The bottleneck: a database pool with 4 connections, 100 ms per query.
+	db := semaphore.NewWeighted(4)
+	api := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := db.Acquire(r.Context(), 1); err != nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+		db.Release(1)
+		fmt.Fprintln(w, "ok")
+	})
+
+	burst := func(name string, h http.Handler) {
+		srv := httptest.NewServer(h)
+		defer srv.Close()
+		type result struct {
+			code int
+			took time.Duration
+		}
+		var mu sync.Mutex
+		var results []result
+		var wg sync.WaitGroup
+		for range 10 { // 10 requests arrive at the same moment
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				start := time.Now()
+				resp, err := http.Get(srv.URL)
+				if err != nil {
+					panic(err)
+				}
+				resp.Body.Close()
+				mu.Lock()
+				results = append(results, result{resp.StatusCode, time.Since(start)})
+				mu.Unlock()
+			}()
+		}
+		wg.Wait()
+		sort.Slice(results, func(i, j int) bool { return results[i].took &lt; results[j].took })
+		// Group by status and latency, truncated to 100 ms so runs compare.
+		fmt.Println(name)
+		for i := 0; i &lt; len(results); {
+			r, n := results[i], 0
+			bucket := r.took.Truncate(100 * time.Millisecond)
+			for ; i &lt; len(results) &amp;&amp; results[i].code == r.code &amp;&amp;
+				results[i].took.Truncate(100*time.Millisecond) == bucket; i++ {
+				n++
+			}
+			when := fmt.Sprintf("in %v-%v", bucket, bucket+100*time.Millisecond)
+			if bucket == 0 {
+				when = "in under 100ms"
+			}
+			fmt.Printf("  %2d x %d  %s&#92;n", n, r.code, when)
+		}
+	}
+
+	burst("no limit: everyone queues for the 4 DB connections", api)
+	burst("Shed(4 in flight, wait up to 20ms):", Shed(4, 20*time.Millisecond, api))
+}</code></pre>
+
+<p>Real output from <code>go test</code> (latencies grouped into 100 ms buckets so the run is repeatable; the test pins this output):</p>
+<pre><code>TrySubmit x12: accepted 7 (2 running + 5 queued), rejected 5
+Submit while full: blocked 50ms, then: context deadline exceeded
+all accepted jobs finished; nothing was lost silently
+
+no limit: everyone queues for the 4 DB connections
+   4 x 200  in 100ms-200ms
+   4 x 200  in 200ms-300ms
+   2 x 200  in 300ms-400ms
+Shed(4 in flight, wait up to 20ms):
+   6 x 503  in under 100ms
+   4 x 200  in 100ms-200ms</code></pre>
+<ul>
+  <li><strong>The pool</strong> accepts exactly what it can hold: 2 jobs running and 5 queued. The other 5 producers are told "queue full" at once and can choose to retry later, drop the job, or report an error. <code>Submit</code> instead blocks the producer and gives up when its context expires.</li>
+  <li><strong>Without a limit</strong>, all 10 requests are accepted and queue for the 4 database connections. The last two wait 300 ms or more. Scale that to thousands of requests and the tail is seconds long.</li>
+  <li><strong>With <code>Shed</code></strong>, 4 requests run and finish in about 100 ms. The other 6 wait at most 20 ms and get a <code>503</code> with <code>Retry-After: 1</code>. Nobody waits in a hidden queue.</li>
+</ul>
+
+<p><strong>Real-world scenario.</strong> At 09:00 a marketing email lands and traffic to an API jumps from 300 to 1,200 requests per second. The database can serve about 600 per second. Without backpressure, the Go server accepts everything: goroutines and memory climb, p99 latency goes from 120 ms to many seconds, mobile clients time out at 5 s and retry, and the server spends its database time on requests whose clients have already gone. With an in-flight cap sized to what the database can do, roughly half the requests get a fast <code>503</code> during the peak, the clients back off with jitter (see <a href="#exponential-backoff">Exponential Backoff</a>), and every accepted request keeps its normal latency. Meanwhile <a href="#autoscaling">autoscaling</a> adds capacity, and the shed rate falls back to zero.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Unbounded anything.</strong> <code>go handle(req)</code> for every request, a slice used as a queue, a channel "big enough for any load". Each one removes backpressure. Every queue needs a bound and a policy for when it is reached.</li>
+  <li><strong>Buffers that are too big.</strong> A 100,000-item queue in front of a service that does 100 items/s is a 1,000-second wait. Size queues in <em>time</em> ("at most 1 s of work"), not in items.</li>
+  <li><strong>Shedding too late.</strong> Rejecting a request after parsing it, authenticating it and opening a DB transaction saves little. Shed as early and as cheaply as possible: at the load balancer, gateway, or first middleware.</li>
+  <li><strong>Shedding the wrong work.</strong> When you must drop, drop the cheap-to-retry and less important work first: background sync and batch jobs before checkout. Prioritised limits do this explicitly.</li>
+  <li><strong>Clients that retry instantly.</strong> A <code>503</code> answered with an immediate retry doubles the load. Send <code>Retry-After</code>, and make clients use backoff with jitter and a retry budget (see <a href="#retries">Retries</a>).</li>
+  <li><strong>Blocking without a timeout.</strong> A producer blocked forever on a full channel is a goroutine leak or a deadlock. Pair every blocking send with a <code>context</code>.</li>
+  <li><strong>Dropping silently.</strong> Dropped items and shed requests must be counted and graphed (see <a href="#metrics">Metrics</a>). A rising shed rate is your earliest signal that you need more capacity.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>When producers outrun consumers, the excess becomes queue, then latency, then memory. Backpressure makes the limit explicit.</li>
+  <li>Bound every queue, sized in time, and choose a policy: block, drop, shed, buffer durably, or signal the producer.</li>
+  <li>For APIs, cap requests in flight and shed early with a fast <code>503</code> + <code>Retry-After</code>; consider adaptive limits.</li>
+  <li>TCP, HTTP/2 and Go channels already push back. Don't defeat them with unbounded goroutines or buffers in your own code.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#rate-limiting">Rate Limiting</a> · <a href="#message-queues">Message Queues</a> · <a href="#circuit-breakers">Circuit Breakers</a> · <a href="#autoscaling">Autoscaling</a> · <a href="#throughput">Throughput</a> · <a href="#real-world-resilience-playbook">Real-World Resilience Playbook</a></p>
+`;
