@@ -614,3 +614,341 @@ durable audit, after restart | orders.placed o-4 seq=4, orders.placed o-5 seq=5<
 
 <p><strong>Related:</strong> <a href="#message-queues">Message Queues</a> · <a href="#event-driven-architecture">Event-Driven Architecture</a> · <a href="#dead-letter-queues">Dead-Letter Queues</a> · <a href="#backpressure">Backpressure</a> · <a href="#server-sent-events">Server-Sent Events</a> · <a href="#real-world-async-pipeline">Real-World Async Pipeline</a></p>
 `;
+CONTENT["event-driven-architecture"] = `
+<p class="tldr"><strong>TL;DR</strong>: In an event-driven architecture, a service announces facts about what happened ("OrderPlaced") and doesn't care who listens. It doesn't call each service that needs to react. It's like a newspaper: the publisher prints once, and every subscriber reads it at their own pace. You get loose coupling and independent scaling. In return, you take on eventual consistency, harder debugging, and one specific trap: you must save the data <em>and</em> publish the event reliably. The <strong>transactional outbox</strong> solves that.</p>
+
+<h2>The problem it solves</h2>
+<p>Picture a checkout service. When an order is placed, five things must happen: charge the card, reserve stock, send a confirmation email, update analytics, and notify the warehouse. The obvious design has checkout call each service in turn. That design has real costs:</p>
+<ul>
+  <li><strong>Latency adds up.</strong> The user waits for the slowest call, and for the sum of every call made in sequence.</li>
+  <li><strong>Availability multiplies.</strong> If any one of five services is down, checkout fails, even if that service only sends emails.</li>
+  <li><strong>Every new consumer is a change to checkout.</strong> Fraud scoring wants to know about orders? Someone edits, tests and redeploys the checkout service.</li>
+</ul>
+<p>Event-driven architecture flips the dependency. Checkout records the order and publishes <code>OrderPlaced</code>. Each interested service subscribes and reacts on its own schedule. Checkout no longer knows who those services are.</p>
+
+<h2>How it works</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Left: request-driven. Checkout calls Payment, Inventory and Email synchronously and waits for each. Right: event-driven. Checkout emits OrderPlaced to a broker, which delivers it to Payment, Inventory and Email independently.">
+  <defs><marker id="arr-eda-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="195" y="20" text-anchor="middle" class="title">Request-driven</text>
+  <text x="590" y="20" text-anchor="middle" class="title">Event-driven</text>
+  <path class="line dashed" d="M390 10 V295" style="stroke: var(--line)"/>
+
+  <rect class="box" x="30" y="120" width="120" height="40" rx="6"/><text x="90" y="145" text-anchor="middle">Checkout</text>
+  <rect class="box" x="230" y="40" width="130" height="40" rx="6"/><text x="295" y="65" text-anchor="middle">Payment</text>
+  <rect class="box" x="230" y="120" width="130" height="40" rx="6"/><text x="295" y="145" text-anchor="middle">Inventory</text>
+  <rect class="box" x="230" y="200" width="130" height="40" rx="6"/><text x="295" y="225" text-anchor="middle">Email</text>
+  <path class="line" d="M150 140 L228 62" marker-end="url(#arr-eda-1)"/>
+  <path class="line" d="M150 140 H228" marker-end="url(#arr-eda-1)"/>
+  <path class="line" d="M150 140 L228 218" marker-end="url(#arr-eda-1)"/>
+  <text x="189" y="133" text-anchor="middle" class="small">call</text>
+  <text x="195" y="268" text-anchor="middle" class="small">latency = sum of the calls</text>
+  <text x="195" y="285" text-anchor="middle" class="small">any one service down = checkout fails</text>
+
+  <rect class="box" x="410" y="120" width="90" height="40" rx="6"/><text x="455" y="145" text-anchor="middle">Checkout</text>
+  <rect class="box accent" x="545" y="112" width="100" height="56" rx="6"/><text x="595" y="136" text-anchor="middle" class="title">Broker</text><text x="595" y="154" text-anchor="middle" class="small">OrderPlaced</text>
+  <rect class="box" x="668" y="40" width="102" height="40" rx="6"/><text x="719" y="65" text-anchor="middle">Payment</text>
+  <rect class="box" x="668" y="120" width="102" height="40" rx="6"/><text x="719" y="145" text-anchor="middle">Inventory</text>
+  <rect class="box" x="668" y="200" width="102" height="40" rx="6"/><text x="719" y="225" text-anchor="middle">Email</text>
+  <path class="line accent" d="M500 140 H543" marker-end="url(#arr-eda-1)"/>
+  <text x="521" y="132" text-anchor="middle" class="small">emit</text>
+  <path class="line accent" d="M645 130 L666 62" marker-end="url(#arr-eda-1)"/>
+  <path class="line accent" d="M645 140 H666" marker-end="url(#arr-eda-1)"/>
+  <path class="line accent" d="M645 150 L666 218" marker-end="url(#arr-eda-1)"/>
+  <text x="590" y="268" text-anchor="middle" class="small">checkout returns once the order is saved</text>
+  <text x="590" y="285" text-anchor="middle" class="small">a new consumer needs no change to checkout</text>
+</svg>
+<figcaption>The producer stops knowing its consumers. The broker gives each consumer its own copy of the event (see <a href="#pub-sub">Pub/Sub</a>), and each one usually reads from its own durable queue (see <a href="#message-queues">Message Queues</a>).</figcaption>
+</figure>
+
+<h3>Events are facts, commands are requests</h3>
+<p>An <strong>event</strong> is named in the past tense: <code>OrderPlaced</code>, <code>PaymentFailed</code>. It records something that already happened, and the producer doesn't expect any particular reaction. A <strong>command</strong> is imperative: <code>SendEmail</code>, <code>ReserveStock</code>. It's addressed to one handler, and the sender expects it to be done. Both can travel over a broker. The difference is who owns the decision. Mixing them up is a common smell. In his article "What do you mean by Event-Driven?", Martin Fowler calls an event that is really an instruction in disguise a "passive-aggressive command".</p>
+
+<h3>"Event-driven" means four different things</h3>
+<p>Fowler's article separates four patterns that all get called event-driven. Most teams start with event notification and move toward state transfer when consumers tire of calling back. Event sourcing and CQRS are bigger commitments that change how you store data.</p>
+
+<table>
+  <tr><th>Pattern</th><th>What the event holds</th><th>Strength</th><th>Cost</th></tr>
+  <tr><td>Event notification</td><td>an ID and the fact: <code>{"order_id": 42}</code></td><td>tiny events, minimal coupling to the schema</td><td>consumers call the producer back for details, which brings back runtime coupling and load. The overall flow isn't visible in any one codebase.</td></tr>
+  <tr><td>Event-carried state transfer</td><td>the data consumers need: items, totals, address</td><td>consumers keep working when the producer is down, and need no callbacks</td><td>data is duplicated across services; consumers must handle out-of-date copies; bigger schema contract</td></tr>
+  <tr><td>Event sourcing</td><td>every state change, stored forever as the primary record</td><td>full audit trail; you can rebuild state or build new views from history</td><td>replaying needs care when handlers have side effects; old event versions live forever; querying needs projections</td></tr>
+  <tr><td>CQRS</td><td>(not about events as such) a write model and one or more read models</td><td>each side can be shaped and scaled for its job</td><td>two models to keep in sync; Fowler warns the gain must outweigh the extra complexity</td></tr>
+</table>
+
+<h3>Choreography vs orchestration</h3>
+<p>When a business process spans services, there are two ways to coordinate it. With <strong>choreography</strong>, each service reacts to events and emits its own: Payment hears <code>OrderPlaced</code> and emits <code>PaymentCaptured</code>, then Inventory hears that and emits <code>StockReserved</code>. Nobody is in charge. With <strong>orchestration</strong>, a coordinator (a workflow engine, or an orchestrator service) sends commands step by step and tracks the state of the process. Choreography keeps services decoupled, but "where is order 42 stuck?" gets hard to answer. Orchestration puts the flow in one readable place, at the price of a central component. Long processes with compensation steps (refund if stock fails) usually want orchestration. See <a href="#saga-pattern">Saga Pattern</a>.</p>
+
+<h3>Event schemas are a public API</h3>
+<p>Once five teams consume <code>OrderPlaced</code>, its shape is a contract you can't change casually. Two habits help:</p>
+<ul>
+  <li><strong>A standard envelope.</strong> <a href="https://cloudevents.io">CloudEvents</a> (a CNCF specification, version 1.0) defines the metadata every event carries. The required attributes are <code>id</code>, <code>source</code>, <code>specversion</code> and <code>type</code>. Optional ones include <code>time</code>, <code>subject</code>, <code>datacontenttype</code> and <code>dataschema</code>. Producers must make <code>source</code> + <code>id</code> unique per event, and a consumer may treat two events with the same pair as duplicates. That's exactly the dedup key you need. The spec suggests a reverse-DNS prefix for <code>type</code>.</li>
+  <li><strong>Additive changes only.</strong> Adding an optional field is safe. Renaming, removing or changing the meaning of a field breaks consumers you may not know about. For a breaking change, publish a new type (<code>…order.placed.v2</code>) alongside the old one until every consumer has moved. See <a href="#schema-versioning">Schema Versioning</a>.</li>
+</ul>
+<pre><code>{
+  "specversion": "1.0",
+  "id": "evt-o-1",
+  "source": "/checkout",
+  "type": "com.example.order.placed.v1",
+  "time": "2026-11-15T09:00:00Z",
+  "datacontenttype": "application/json",
+  "data": { "order_id": "o-1", "customer": "ana", "total_cents": 4999 }
+}</code></pre>
+
+<h3>The dual-write problem</h3>
+<p>Here is the trap every event-driven system meets. The handler has to do two things: commit the order to its database, and publish <code>OrderPlaced</code> to the broker. These are two different systems, and no transaction spans both.</p>
+<ul>
+  <li><strong>Commit, then publish:</strong> if the process crashes, is deployed or loses the broker between the two steps, the order exists but the event is never sent. Inventory never reserves stock, and no email goes out. Nothing errors. The order is just silently missing downstream.</li>
+  <li><strong>Publish, then commit:</strong> if the commit fails (a constraint, a deadlock, a timeout), consumers react to an order that doesn't exist. That's a ghost event.</li>
+</ul>
+<p>Retrying doesn't help: the process that would retry is the one that died.</p>
+
+<h3>The transactional outbox</h3>
+<p>The fix is to stop writing to two systems. The handler writes the business row <em>and</em> an event row to an <code>outbox</code> table <strong>in the same database transaction</strong>, so both commit or neither does. A separate <strong>relay</strong> reads unsent outbox rows in order, publishes each one, and marks it sent.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 310" role="img" aria-label="Transactional outbox. 1: the checkout API writes the order row and the outbox row in one transaction. 2: the relay reads unsent outbox rows. 3: it publishes them to the broker. 4: it marks them sent. The broker delivers to Email and Inventory, which deduplicate on event id. Alternative: CDC tails the database log instead of polling. A box lists where a crash can happen and what follows.">
+  <defs><marker id="arr-eda-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="15" y="100" width="110" height="50" rx="6"/><text x="70" y="122" text-anchor="middle" class="title">Checkout</text><text x="70" y="139" text-anchor="middle" class="small">API handler</text>
+  <rect class="box muted" x="180" y="30" width="185" height="135" rx="10"/><text x="272" y="50" text-anchor="middle" class="title">Database</text>
+  <rect class="box ok" x="195" y="62" width="155" height="36" rx="6"/><text x="272" y="85" text-anchor="middle">orders</text>
+  <rect class="box ok" x="195" y="110" width="155" height="36" rx="6"/><text x="272" y="133" text-anchor="middle">outbox (unsent)</text>
+  <path class="line ok" d="M125 125 H178" marker-end="url(#arr-eda-3)"/><text x="151" y="117" text-anchor="middle" class="small">1 one tx</text>
+
+  <rect class="box accent" x="420" y="95" width="130" height="60" rx="6"/><text x="485" y="120" text-anchor="middle" class="title">Outbox relay</text><text x="485" y="138" text-anchor="middle" class="small">polls unsent rows</text>
+  <path class="line" d="M350 118 H418" marker-end="url(#arr-eda-3)"/><text x="392" y="110" text-anchor="middle" class="small">2 read</text>
+  <path class="line dashed" d="M418 140 H352" marker-end="url(#arr-eda-3)"/><text x="392" y="157" text-anchor="middle" class="small">4 mark</text>
+  <text x="485" y="182" text-anchor="middle" class="small">alt: CDC (e.g. Debezium) tails the DB log</text>
+
+  <rect class="box" x="620" y="95" width="140" height="60" rx="6"/><text x="690" y="120" text-anchor="middle" class="title">Broker</text><text x="690" y="138" text-anchor="middle" class="small">NATS / Kafka / SQS</text>
+  <path class="line" d="M550 125 H618" marker-end="url(#arr-eda-3)"/><text x="584" y="117" text-anchor="middle" class="small">3 publish</text>
+
+  <rect class="box" x="560" y="215" width="95" height="36" rx="6"/><text x="607" y="238" text-anchor="middle">Email</text>
+  <rect class="box" x="670" y="215" width="95" height="36" rx="6"/><text x="717" y="238" text-anchor="middle">Inventory</text>
+  <path class="line" d="M680 155 L612 213" marker-end="url(#arr-eda-3)"/>
+  <path class="line" d="M700 155 L714 213" marker-end="url(#arr-eda-3)"/>
+  <text x="662" y="272" text-anchor="middle" class="small">consumers dedup on event id</text>
+
+  <rect class="box bad" x="15" y="200" width="490" height="100" rx="8"/>
+  <text x="260" y="222" text-anchor="middle" class="title">Where can it crash?</text>
+  <text x="30" y="244" class="small">before COMMIT (1): no order, no event. The client gets an error and retries.</text>
+  <text x="30" y="264" class="small">after COMMIT, before publish (3): the row is still unsent, so the relay sends it later.</text>
+  <text x="30" y="284" class="small">after publish, before mark (4): sent twice. That's at-least-once, so consumers dedup.</text>
+</svg>
+<figcaption>The outbox turns "maybe the event was lost" into "the event may arrive twice", which an idempotent consumer handles easily.</figcaption>
+</figure>
+<p>Notice what the outbox does <em>not</em> give you: exactly-once delivery. If the relay crashes after the broker accepts an event but before marking the row, it sends that event again on restart. That's why every consumer must be idempotent: it records the event IDs it has applied, in the same transaction as its own effect. See <a href="#idempotency">Idempotency</a>.</p>
+<p>There are two ways to get rows out of the outbox:</p>
+<ul>
+  <li><strong>Polling relay</strong>: a loop that runs <code>SELECT … WHERE sent_at IS NULL ORDER BY seq</code>. It's simple and works with any database, at the cost of the poll interval in latency and some query load. Several relays on Postgres can share the table with <code>SELECT … FOR UPDATE SKIP LOCKED</code>, but parallel relays give up strict global order.</li>
+  <li><strong>Change data capture (CDC)</strong>: a connector reads the database's replication log and turns each new outbox row into a message. Debezium ships an "outbox event router" transform for exactly this. You get low latency and no polling queries, but you have one more piece of infrastructure to run.</li>
+</ul>
+
+<h3>Living with eventual consistency</h3>
+<p>Consumers update their data <em>after</em> the producer commits: usually within milliseconds, sometimes minutes during an incident. Show pending states in the UI, and make each consumer correct under reordering and redelivery (see <a href="#eventual-consistency">Eventual Consistency</a>). To debug a flow across five services, carry a trace context in the event headers so one trace links the request, the publish and every consumer (see <a href="#distributed-tracing">Distributed Tracing</a>).</p>
+
+<h2>Example</h2>
+<p><strong>A transactional outbox in Go, on SQLite.</strong> <code>PlaceOrder</code> writes the order and its <code>OrderPlaced</code> envelope in one transaction. <code>RelayOnce</code> publishes unsent rows in order, marking each one sent after the broker accepts it. It runs on the real <code>modernc.org/sqlite</code> driver; with Postgres, only the placeholders (<code>$1</code>) and the locking clause change.</p>
+<pre><code>package outbox
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+const Schema = &#96;
+CREATE TABLE orders (
+	id          TEXT PRIMARY KEY,
+	customer    TEXT NOT NULL,
+	total_cents INTEGER NOT NULL
+);
+CREATE TABLE outbox (
+	seq     INTEGER PRIMARY KEY AUTOINCREMENT, -- publish order
+	id      TEXT NOT NULL UNIQUE,              -- event id, consumers dedup on it
+	type    TEXT NOT NULL,
+	source  TEXT NOT NULL,
+	data    TEXT NOT NULL,
+	sent_at TEXT                               -- NULL = not yet published
+);&#96;
+
+// Event is a CloudEvents-style envelope: id, source, specversion and type
+// are the required attributes; data is the payload.
+type Event struct {
+	SpecVersion string          &#96;json:"specversion"&#96;
+	ID          string          &#96;json:"id"&#96;
+	Source      string          &#96;json:"source"&#96;
+	Type        string          &#96;json:"type"&#96;
+	Time        string          &#96;json:"time"&#96;
+	Data        json.RawMessage &#96;json:"data"&#96;
+}
+
+type Order struct {
+	ID         string &#96;json:"order_id"&#96;
+	Customer   string &#96;json:"customer"&#96;
+	TotalCents int64  &#96;json:"total_cents"&#96;
+}
+
+// PlaceOrder writes the order AND its OrderPlaced event in one transaction.
+// Either both rows exist or neither does; no broker call happens here.
+func PlaceOrder(ctx context.Context, db *sql.DB, o Order) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // no-op after Commit
+
+	if _, err := tx.ExecContext(ctx,
+		&#96;INSERT INTO orders (id, customer, total_cents) VALUES (?, ?, ?)&#96;,
+		o.ID, o.Customer, o.TotalCents); err != nil {
+		return fmt.Errorf("insert order: %w", err)
+	}
+	data, err := json.Marshal(o)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		&#96;INSERT INTO outbox (id, type, source, data) VALUES (?, ?, ?, ?)&#96;,
+		"evt-"+o.ID, "com.example.order.placed.v1", "/checkout", string(data)); err != nil {
+		return fmt.Errorf("insert outbox: %w", err)
+	}
+	return tx.Commit()
+}
+
+// Publish sends one event to the broker (NATS, Kafka, SQS...).
+type Publish func(ctx context.Context, e Event) error
+
+// RelayOnce publishes up to batch unsent events in order and marks each one
+// sent after the broker accepts it. A crash between Publish and the UPDATE
+// re-sends that event on the next run: delivery is at-least-once.
+func RelayOnce(ctx context.Context, db *sql.DB, publish Publish, batch int) (int, error) {
+	rows, err := db.QueryContext(ctx,
+		&#96;SELECT id, type, source, data FROM outbox
+		 WHERE sent_at IS NULL ORDER BY seq LIMIT ?&#96;, batch)
+	if err != nil {
+		return 0, err
+	}
+	var pending []Event
+	for rows.Next() {
+		var e Event
+		var data string
+		if err := rows.Scan(&amp;e.ID, &amp;e.Type, &amp;e.Source, &amp;data); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		e.SpecVersion, e.Data = "1.0", json.RawMessage(data)
+		e.Time = time.Now().UTC().Format(time.RFC3339)
+		pending = append(pending, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	sent := 0
+	for _, e := range pending {
+		if err := publish(ctx, e); err != nil {
+			return sent, fmt.Errorf("publish %s: %w", e.ID, err) // stop: keep order
+		}
+		if _, err := db.ExecContext(ctx,
+			&#96;UPDATE outbox SET sent_at = ? WHERE id = ?&#96;,
+			time.Now().UTC().Format(time.RFC3339), e.ID); err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
+}</code></pre>
+
+<p>The test (helpers <code>openDB</code> and <code>count</code> omitted) breaks things on purpose. First, the outbox insert fails, which must roll back the order too. Then the relay dies right after the broker accepted <code>evt-o-2</code> but before marking it sent.</p>
+<pre><code>func TestOutboxCrashBetweenPublishAndMark(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+
+	for _, o := range []Order{{"o-1", "ana", 4999}, {"o-2", "ben", 1250}, {"o-3", "cy", 800}} {
+		if err := PlaceOrder(ctx, db, o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Make the SECOND insert of a transaction fail: an event id evt-o-9 already
+	// exists (already sent), so PlaceOrder(o-9) breaks on the outbox insert.
+	db.Exec(&#96;INSERT INTO outbox (id, type, source, data, sent_at) VALUES ('evt-o-9', 't', '/x', '{}', 'old')&#96;)
+	err := PlaceOrder(ctx, db, Order{"o-9", "dee", 100})
+	fmt.Println("place o-9:", err)
+	fmt.Println("o-9 in orders:", count(db, &#96;SELECT COUNT(*) FROM orders WHERE id = 'o-9'&#96;),
+		"(order insert rolled back with the failed outbox insert)")
+
+	// Broker + one consumer that dedups on event id.
+	var deliveries []string
+	seen := map[string]bool{}
+	applied := 0
+	broker := func(_ context.Context, e Event) error {
+		deliveries = append(deliveries, e.ID)
+		if !seen[e.ID] { // idempotent consumer
+			seen[e.ID] = true
+			applied++
+		}
+		return nil
+	}
+
+	// Run 1: the broker accepts evt-o-2, then the relay dies before marking it sent.
+	calls := 0
+	crashing := func(ctx context.Context, e Event) error {
+		calls++
+		broker(ctx, e)
+		if calls == 2 {
+			return errCrash // stands in for "killed after publish, before UPDATE"
+		}
+		return nil
+	}
+	n, err := RelayOnce(ctx, db, crashing, 10)
+	fmt.Printf("relay run 1: marked=%d err=%v&#92;n", n, err)
+	fmt.Println("unsent after run 1:", count(db, &#96;SELECT COUNT(*) FROM outbox WHERE sent_at IS NULL&#96;))
+
+	// Run 2: a restarted relay picks up where the table says it left off.
+	n, err = RelayOnce(ctx, db, broker, 10)
+	fmt.Printf("relay run 2: marked=%d err=%v&#92;n", n, err)
+	fmt.Println("unsent after run 2:", count(db, &#96;SELECT COUNT(*) FROM outbox WHERE sent_at IS NULL&#96;))
+	fmt.Println("broker deliveries:", deliveries)
+	fmt.Println("consumer applied:", applied, "(duplicate evt-o-2 ignored)")
+}</code></pre>
+
+<p>Real output of <code>go test -v</code>:</p>
+<pre><code>=== RUN   TestOutboxCrashBetweenPublishAndMark
+place o-9: insert outbox: constraint failed: UNIQUE constraint failed: outbox.id (2067)
+o-9 in orders: 0 (order insert rolled back with the failed outbox insert)
+relay run 1: marked=1 err=publish evt-o-2: process killed
+unsent after run 1: 2
+relay run 2: marked=2 err=&lt;nil&gt;
+unsent after run 2: 0
+broker deliveries: [evt-o-1 evt-o-2 evt-o-2 evt-o-3]
+consumer applied: 3 (duplicate evt-o-2 ignored)
+--- PASS: TestOutboxCrashBetweenPublishAndMark (0.00s)
+PASS</code></pre>
+<p>The failed outbox insert took the order row with it (<code>o-9 in orders: 0</code>). The relay crash left two rows unsent. The second run published them, so the broker saw <code>evt-o-2</code> twice, and the consumer's dedup applied three events for three orders.</p>
+
+<p><strong>Real-world scenario.</strong> A shop takes about 300 orders per minute on a normal day. It deploys checkout 10 times a day, and each rolling restart kills a few in-flight requests. With commit-then-publish, even 2 lost events per deploy add up to roughly 20 orders a day that are never shipped and never emailed. They show up a week later as support tickets. With an outbox polled every 500 ms, those 20 events are published a few seconds late instead of never. During a 15-minute broker outage, about 4,500 events pile up in the outbox table (300/min × 15), and checkout keeps taking orders. When the broker comes back, the relay drains the backlog in order. Watch the oldest unsent row's age as a metric, and alert when it grows (see <a href="#alerts">Alerts</a>).</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Dual writes "because the broker is reliable".</strong> The broker being up doesn't help when <em>your</em> process dies between the commit and the publish. Any code that writes to the database and then calls <code>publish()</code> has this bug. Use an outbox or CDC.</li>
+  <li><strong>Assuming exactly-once.</strong> The outbox, the broker and the consumer's retries all deliver at least once. A consumer that charges, emails or increments counters without deduplicating will do it twice. Make it idempotent with the event <code>id</code>.</li>
+  <li><strong>Assuming global order.</strong> Most brokers order only within a partition or message group. Partition by the entity key (<code>order_id</code>) when per-entity order matters, and design consumers to tolerate <code>OrderShipped</code> arriving before <code>OrderPaid</code> across entities.</li>
+  <li><strong>Events that are commands in disguise.</strong> <code>SendWelcomeEmailRequested</code> emitted by the signup service means signup still decides what email does. That's only coupling, now invisible. Emit the fact (<code>UserSignedUp</code>) and let the email service decide.</li>
+  <li><strong>Invisible flows.</strong> With choreography, nobody can say "this is the order process" by reading one file. Keep an event catalogue (who emits what, who consumes it), trace across hops, and switch to orchestration once a process has many steps and compensations.</li>
+  <li><strong>Unbounded outbox.</strong> Sent rows pile up forever. Delete them on a schedule (see <a href="#cron-jobs">Cron Jobs</a>) and index the unsent rows so the relay query stays fast.</li>
+  <li><strong>Events where you need an answer.</strong> "Is this card valid?" needs a synchronous reply. And a small app with one database and one team often gets only latency and debugging cost from going event-driven.</li>
+</ul>
+
+<div class="callout warn"><strong>"Save, then publish" is a data-loss bug, not a style choice.</strong> It works in every test and loses events in production on crashes and deploys. If the event matters, write it to an outbox in the same transaction as the state change.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Services publish facts in the past tense; consumers decide what to do. That decouples deployment, availability and load.</li>
+  <li>Know which pattern you mean: notification, event-carried state, event sourcing or CQRS. Each has different costs.</li>
+  <li>Never write to the database and the broker separately. Use a transactional outbox (polling relay or CDC), and expect duplicates.</li>
+  <li>Treat event schemas as public APIs: a standard envelope like CloudEvents, additive changes, new types for breaking changes.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#pub-sub">Pub/Sub</a> · <a href="#message-queues">Message Queues</a> · <a href="#saga-pattern">Saga Pattern</a> · <a href="#idempotency">Idempotency</a> · <a href="#eventual-consistency">Eventual Consistency</a> · <a href="#real-world-async-pipeline">Real-World Async Pipeline</a></p>
+`;
