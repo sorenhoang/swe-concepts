@@ -343,3 +343,288 @@ call 18  closed     [socks boots]  ok                        server hits: 15</co
 
 <p><strong>Related:</strong> <a href="#timeouts">Timeouts</a> · <a href="#retries">Retries</a> · <a href="#backpressure">Backpressure</a> · <a href="#health-checks">Health Checks</a> · <a href="#load-balancing">Load Balancing</a> · <a href="#real-world-resilience-playbook">Real-World Resilience Playbook</a></p>
 `;
+CONTENT["timeouts"] = `
+<p class="tldr"><strong>TL;DR</strong>: A timeout is the longest you are willing to wait for something before giving up and doing something else. Without one, a single slow dependency can hold your goroutines, connections and memory forever. It's the kitchen timer on a pot: you don't stand there all night because the stove might be broken.</p>
+
+<h2>The problem it solves</h2>
+<p>A network call can fail in two ways. A <strong>fast failure</strong> (connection refused, <code>503</code>) is easy: you get an error and move on. A <strong>slow failure</strong> is the dangerous one: the other side accepted the connection but never answers, or answers one byte per minute. Nothing returns an error. Your code just waits.</p>
+<ul>
+  <li><strong>Resources pile up.</strong> Every waiting request holds a goroutine, a socket, a pooled connection and its buffers. By <a href="#throughput">Little's law</a>, requests in flight = arrival rate × time each one takes. At 500 requests per second and 200 ms each, about 100 requests are in flight. If the dependency starts taking 8 s, that becomes about 4,000.</li>
+  <li><strong>The slowness spreads upstream.</strong> Your callers are now waiting on you, so their goroutines and threads pile up too. One slow database turns into a slow website.</li>
+  <li><strong>Users wait for nothing.</strong> A load balancer in front of you typically gives up after some fixed time and returns <code>504</code>, while your service keeps working on a request nobody is waiting for.</li>
+</ul>
+<p>A timeout turns a slow failure into a fast one. Then the other patterns can act on it: <a href="#retries">retry</a> it, count it in a <a href="#circuit-breakers">circuit breaker</a>, or serve a fallback.</p>
+
+<div class="callout warn"><strong>The defaults wait forever.</strong> In Go, <code>http.DefaultClient</code> (used by <code>http.Get</code>) has <code>Timeout: 0</code>, which means no limit. <code>DefaultTransport</code> limits only the TCP connect (30 s) and the TLS handshake (10 s), not the wait for a response. A zero-value <code>http.Server</code> has no read, write or idle timeouts at all. Most database and RPC clients in other languages are similar. Never ship a network call that relies on defaults.</div>
+
+<h2>How it works</h2>
+<p>"The request timed out" can mean several different limits. An outbound HTTP call goes through phases, and each phase can hang for a different reason:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 196" role="img" aria-label="Phases of an HTTP call: DNS and TCP connect, TLS handshake, sending the request, waiting for response headers, reading the body. Dialer.Timeout covers the connect, TLSHandshakeTimeout the handshake, ResponseHeaderTimeout the wait for headers. http.Client.Timeout covers the whole exchange including the body, and a context deadline covers the whole call.">
+  <defs><marker id="arr-to-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="390" y="18" text-anchor="middle" class="small">context deadline: the whole call, and anything else the request does after it</text>
+  <path class="line accent" d="M22 28 H758" marker-start="url(#arr-to-1)" marker-end="url(#arr-to-1)"/>
+  <text x="390" y="50" text-anchor="middle" class="small">http.Client.Timeout: connect + TLS + request + headers + reading the whole body</text>
+  <path class="line" d="M22 60 H758" marker-start="url(#arr-to-1)" marker-end="url(#arr-to-1)"/>
+
+  <rect class="box" x="20" y="76" width="130" height="40" rx="6"/><text x="85" y="101" text-anchor="middle">DNS + connect</text>
+  <rect class="box" x="154" y="76" width="96" height="40" rx="6"/><text x="202" y="101" text-anchor="middle">TLS</text>
+  <rect class="box" x="254" y="76" width="96" height="40" rx="6"/><text x="302" y="101" text-anchor="middle" class="small">send request</text>
+  <rect class="box bad" x="354" y="76" width="226" height="40" rx="6"/><text x="467" y="101" text-anchor="middle">wait for response headers</text>
+  <rect class="box" x="584" y="76" width="176" height="40" rx="6"/><text x="672" y="101" text-anchor="middle">read body</text>
+
+  <path class="line ok" d="M22 130 H148"/><path class="line ok" d="M22 125 V135"/><path class="line ok" d="M148 125 V135"/>
+  <text x="85" y="150" text-anchor="middle" class="small">Dialer.Timeout</text>
+  <path class="line ok" d="M156 130 H248"/><path class="line ok" d="M156 125 V135"/><path class="line ok" d="M248 125 V135"/>
+  <text x="202" y="168" text-anchor="middle" class="small">TLSHandshakeTimeout</text>
+  <path class="line ok" d="M356 130 H578"/><path class="line ok" d="M356 125 V135"/><path class="line ok" d="M578 125 V135"/>
+  <text x="467" y="150" text-anchor="middle" class="small">ResponseHeaderTimeout</text>
+  <text x="672" y="150" text-anchor="middle" class="small">no per-phase field:</text>
+  <text x="672" y="166" text-anchor="middle" class="small">Client.Timeout or ctx</text>
+  <text x="467" y="186" text-anchor="middle" class="small">a slow or overloaded server usually hangs here</text>
+</svg>
+<figcaption>Per-phase limits (green) catch a specific hang early. <code>Client.Timeout</code> and the context deadline (top) cap the total, whatever phase is stuck.</figcaption>
+</figure>
+
+<h3>The four kinds of timeout</h3>
+<ul>
+  <li><strong>Connect timeout</strong>: how long to wait for the TCP (and TLS) handshake. It should be short, often well under a second inside a data centre, because a healthy host answers a SYN almost immediately. A long connect usually means the host is gone.</li>
+  <li><strong>Read timeout</strong>: how long to wait for data once connected, either the first byte of the response (<code>ResponseHeaderTimeout</code>) or the gap between reads. It catches a server that accepted the request and then went quiet.</li>
+  <li><strong>Write timeout</strong>: how long sending the request (or, on a server, the response) may take. It catches a peer that stopped reading.</li>
+  <li><strong>Total timeout / deadline</strong>: one budget for the whole operation, including retries. This is the one the user actually feels, and the one that should be <em>propagated</em> to downstream calls.</li>
+</ul>
+<p>In Go the total is usually a <code>context</code>: <code>context.WithTimeout(ctx, 2*time.Second)</code> returns a context whose <code>Done()</code> channel closes after 2 s. Everything that accepts a <code>ctx</code> (<code>http.NewRequestWithContext</code>, <code>db.QueryContext</code>, gRPC calls, <code>errgroup</code>) stops and returns <code>context.DeadlineExceeded</code>. A context deadline can only get <em>earlier</em> as you derive children: <code>WithTimeout</code> on a parent with a sooner deadline keeps the parent's deadline.</p>
+
+<h3>Deadline propagation: inner budgets are smaller</h3>
+<p>A request crosses several services. Each hop should know how much time the original caller has left, and spend less than that. Otherwise the outer layer gives up first, returns <code>504</code>, and the inner layers keep working (and retrying) on a request nobody is waiting for. The rule:</p>
+<ul>
+  <li>Each downstream call gets <code>min(its own limit, remaining budget − a small reserve)</code>. The reserve leaves time to log, fall back and write the error response.</li>
+  <li>If the remaining budget is already zero or negative, <strong>don't make the call</strong>. Fail fast.</li>
+  <li>gRPC does this for you: the client sends the remaining time in the <code>grpc-timeout</code> header, converted to a relative timeout so clock differences between machines don't matter, and Go and Java servers turn it into the server-side context deadline by default. Plain HTTP has no standard header, so you send one yourself (the example below uses <code>X-Request-Budget-Ms</code>).</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 320" role="img" aria-label="Timeline of the Go example. The edge sends checkout a 1000 millisecond budget. Checkout keeps 100 milliseconds in reserve and sends payment an 899 millisecond budget. Payment needs 3 seconds, so at 900 milliseconds its context ends and it stops working. Checkout's call fails with context deadline exceeded and it returns 504 to the edge at 900 milliseconds, before the edge's own 1000 millisecond deadline.">
+  <defs><marker id="arr-to-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="50" y="14" width="120" height="36" rx="8"/><text x="110" y="37" text-anchor="middle" class="title">edge</text>
+  <rect class="box accent" x="330" y="14" width="120" height="36" rx="8"/><text x="390" y="37" text-anchor="middle" class="title">checkout</text>
+  <rect class="box" x="610" y="14" width="120" height="36" rx="8"/><text x="670" y="37" text-anchor="middle" class="title">payment</text>
+  <path d="M110 50 V306" style="stroke: var(--line)"/>
+  <path d="M390 50 V306" style="stroke: var(--line)"/>
+  <path d="M670 50 V306" style="stroke: var(--line)"/>
+  <text x="22" y="84" class="small">0 ms</text>
+  <text x="22" y="264" class="small">900 ms</text>
+  <text x="22" y="284" class="small">1000 ms</text>
+
+  <path class="line" d="M110 80 H386" marker-end="url(#arr-to-2)"/>
+  <text x="250" y="72" text-anchor="middle" class="small">budget 1000 ms</text>
+  <path class="line" d="M390 96 H662" marker-end="url(#arr-to-2)"/>
+  <text x="530" y="88" text-anchor="middle" class="small">budget 899 ms (100 ms kept in reserve)</text>
+  <rect class="box accent" x="662" y="100" width="16" height="156" rx="3"/>
+  <text x="648" y="170" text-anchor="end" class="small">working; needs 3 s today</text>
+  <text x="648" y="186" text-anchor="end" class="small">select on r.Context().Done()</text>
+
+  <path class="line bad dashed" d="M662 260 H394" marker-end="url(#arr-to-2)"/>
+  <text x="530" y="252" text-anchor="middle" class="small">context deadline exceeded</text>
+  <path class="line bad" d="M390 262 H114" marker-end="url(#arr-to-2)"/>
+  <text x="250" y="254" text-anchor="middle" class="small">504 at 900 ms</text>
+  <text x="670" y="276" text-anchor="middle" class="small">work stopped</text>
+  <path class="line dashed" d="M84 280 H136"/>
+  <text x="110" y="298" text-anchor="middle" class="small">edge deadline, never reached</text>
+</svg>
+<figcaption>The real run of the Go example below. Every layer's deadline sits inside its caller's, so the innermost layer gives up first and everyone gets a clear answer before the edge's own limit.</figcaption>
+</figure>
+
+<h3>Choosing a value</h3>
+<p>Don't guess "30 seconds". Base timeouts on the dependency's measured latency (see <a href="#p99-latency">p99 Latency</a>):</p>
+<ul>
+  <li><strong>Pick an acceptable false-timeout rate</strong>, then use that percentile. AWS's Builders' Library describes exactly this: if timing out 0.1% of healthy requests is acceptable, set the timeout near the downstream's <strong>p99.9</strong> latency, plus some padding. A p50-based timeout fails a large share of perfectly healthy requests.</li>
+  <li><strong>Measure from the client side</strong>. The server's own latency metric doesn't include the network, TLS or queueing in your connection pool.</li>
+  <li><strong>Fit it in the caller's budget</strong>. If you will retry once, each attempt needs to fit in roughly half of what remains.</li>
+  <li><strong>Revisit it.</strong> A timeout chosen two years ago is either too tight (latency grew) or so loose that it no longer protects anything.</li>
+</ul>
+
+<h3>What happens on the other side</h3>
+<p>A timeout only stops <em>your</em> waiting. The server may still be working, and it may finish the job:</p>
+<ul>
+  <li>A Go server cancels <code>r.Context()</code> when the client's connection closes, when an HTTP/2 stream is reset, or when the handler returns. Work stops only if your handler and the code it calls <strong>check the context</strong>: <code>db.QueryContext</code>, outgoing requests built with the same <code>ctx</code>, <code>select</code> on <code>ctx.Done()</code> in long loops.</li>
+  <li>Work that ignores the context runs to completion, uses capacity, and its result is thrown away.</li>
+  <li>For writes, a timeout means <strong>"unknown outcome"</strong>, not "failed". The payment may have gone through. The safe follow-up is to retry with the same <a href="#idempotency">idempotency key</a> or look the result up, never to blindly try again.</li>
+</ul>
+
+<h2>Every timeout in Go's net/http</h2>
+<table>
+  <tr><th>Field</th><th>Side</th><th>What it limits</th><th>Default</th><th>Starting point</th></tr>
+  <tr><td><code>net.Dialer.Timeout</code></td><td>client</td><td>TCP connect (incl. DNS)</td><td>30 s in <code>DefaultTransport</code></td><td>0.5–2 s</td></tr>
+  <tr><td><code>Transport.TLSHandshakeTimeout</code></td><td>client</td><td>TLS handshake</td><td>10 s in <code>DefaultTransport</code></td><td>1–2 s</td></tr>
+  <tr><td><code>Transport.ResponseHeaderTimeout</code></td><td>client</td><td>request fully sent → response headers received</td><td>none</td><td>near the dependency's p99.9</td></tr>
+  <tr><td><code>Transport.IdleConnTimeout</code></td><td>client</td><td>how long an unused pooled connection is kept</td><td>90 s in <code>DefaultTransport</code></td><td>below the server's idle timeout</td></tr>
+  <tr><td><code>Client.Timeout</code></td><td>client</td><td>whole exchange, including reading the body</td><td>none</td><td>hard cap; not for streaming downloads</td></tr>
+  <tr><td><code>context.WithTimeout</code></td><td>both</td><td>everything that takes the <code>ctx</code>, across calls</td><td>none</td><td>per request, from the caller's budget</td></tr>
+  <tr><td><code>Server.ReadHeaderTimeout</code></td><td>server</td><td>reading request headers</td><td>none (falls back to <code>ReadTimeout</code>)</td><td>a few seconds; blocks slowloris</td></tr>
+  <tr><td><code>Server.ReadTimeout</code></td><td>server</td><td>reading headers + body</td><td>none</td><td>depends on upload sizes</td></tr>
+  <tr><td><code>Server.WriteTimeout</code></td><td>server</td><td>end of request headers → response written</td><td>none</td><td>longer than your slowest handler</td></tr>
+  <tr><td><code>Server.IdleTimeout</code></td><td>server</td><td>keep-alive connection waiting for its next request</td><td>none (falls back to <code>ReadTimeout</code>)</td><td>30–120 s</td></tr>
+  <tr><td><code>http.TimeoutHandler</code></td><td>server</td><td>one handler; replies <code>503</code> and cancels its context</td><td>not used</td><td>per route, below the edge's timeout</td></tr>
+</table>
+<p>The "starting points" are reasonable first values, not standards. Replace them with numbers from your own latency data.</p>
+
+<h2>Example</h2>
+<p><strong>A client and server with explicit timeouts, plus deadline propagation over HTTP.</strong> <code>ChildContext</code> applies the "inner budget is smaller" rule, and <code>Call</code> sends the remaining budget downstream so the next service can set the same deadline:</p>
+<pre><code>package timeouts
+
+import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+// NewClient gives every phase of an outbound call its own limit,
+// plus Client.Timeout as a hard cap on the whole exchange.
+func NewClient() *http.Client {
+	tr := &amp;http.Transport{
+		DialContext: (&amp;net.Dialer{
+			Timeout:   1 * time.Second, // TCP connect
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   1 * time.Second,
+		ResponseHeaderTimeout: 2 * time.Second, // request sent -&gt; response headers
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   100,
+	}
+	return &amp;http.Client{
+		Transport: tr,
+		Timeout:   3 * time.Second, // dial + TLS + headers + reading the body
+	}
+}
+
+// NewServer protects the server from slow or idle clients.
+func NewServer(addr string, h http.Handler) *http.Server {
+	return &amp;http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 2 * time.Second,  // slowloris: headers must arrive quickly
+		ReadTimeout:       10 * time.Second, // headers + body
+		WriteTimeout:      15 * time.Second, // from end of headers until the response is written
+		IdleTimeout:       60 * time.Second, // keep-alive connection waiting for the next request
+	}
+}
+
+// HTTP has no standard deadline header (gRPC sends grpc-timeout for you),
+// so we propagate the remaining budget in our own header.
+const budgetHeader = "X-Request-Budget-Ms"
+
+// WithBudget turns an incoming budget header into a context deadline.
+func WithBudget(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ms, err := strconv.Atoi(r.Header.Get(budgetHeader)); err == nil &amp;&amp; ms &gt; 0 {
+			ctx, cancel := context.WithTimeout(r.Context(), time.Duration(ms)*time.Millisecond)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ChildContext picks the deadline for one downstream call: our own limit,
+// or the caller's deadline minus a reserve kept for answering, whichever is earlier.
+func ChildContext(parent context.Context, own, reserve time.Duration) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(own)
+	if d, ok := parent.Deadline(); ok &amp;&amp; d.Add(-reserve).Before(deadline) {
+		deadline = d.Add(-reserve)
+	}
+	return context.WithDeadline(parent, deadline)
+}
+
+var ErrNoBudget = errors.New("no time budget left")
+
+// Call sends a request that carries its own remaining budget downstream.
+func Call(ctx context.Context, c *http.Client, url string) (*http.Response, error) {
+	d, ok := ctx.Deadline()
+	if ok &amp;&amp; time.Until(d) &lt;= 0 {
+		return nil, ErrNoBudget // fail fast: the caller has already given up
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		req.Header.Set(budgetHeader, strconv.FormatInt(time.Until(d).Milliseconds(), 10))
+	}
+	return c.Do(req)
+}</code></pre>
+
+<p>A test wires three layers together: the edge gives checkout 1 s, checkout calls payment, and payment needs 3 s today. Payment's handler watches its context, so it stops as soon as the budget runs out:</p>
+<pre><code>// payment: needs 3 s today, but stops as soon as its context ends.
+payment := httptest.NewServer(WithBudget(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	logf("payment:  got request, budget header %sms", r.Header.Get(budgetHeader))
+	select {
+	case &lt;-time.After(3 * time.Second):
+		fmt.Fprint(w, "charged")
+	case &lt;-r.Context().Done():
+		logf("payment:  stopping work: %v", r.Context().Err())
+	}
+})))
+defer payment.Close()
+
+client := NewClient()
+// checkout: calls payment with its budget minus a 100 ms reserve.
+checkout := httptest.NewServer(WithBudget(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := ChildContext(r.Context(), 2*time.Second, 100*time.Millisecond)
+	defer cancel()
+	resp, err := Call(ctx, client, payment.URL)
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrNoBudget) {
+		logf("checkout: payment call failed: %v", err)
+		http.Error(w, "payment timed out, try again", http.StatusGatewayTimeout)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(w, resp.Body)
+})))</code></pre>
+<p>Real output (port replaced; the budget header is 898–899 ms depending on scheduling):</p>
+<pre><code>$ go test -v -run TestDeadlinePropagation
+=== RUN   TestDeadlinePropagation
+t=   0ms  payment:  got request, budget header 899ms
+t= 900ms  payment:  stopping work: context deadline exceeded
+t= 900ms  checkout: payment call failed: Get "http://127.0.0.1:PORT": context deadline exceeded
+t= 900ms  edge:     504 payment timed out, try again
+--- PASS: TestDeadlinePropagation (1.11s)</code></pre>
+<p>The edge got a clear <code>504</code> at 900 ms, inside its own 1 s limit, and payment stopped working at the same moment instead of burning 3 s on an abandoned request. A second test shows the two client-side limits. Without a context, <code>ResponseHeaderTimeout</code> (2 s) fires before <code>Client.Timeout</code> (3 s) because the server never sends headers. With a 500 ms context, the context wins:</p>
+<pre><code>=== RUN   TestClientTimeout
+t=2000ms  no context, client caps it: Get "http://127.0.0.1:PORT": net/http: timeout awaiting response headers
+t= 500ms  ctx 500ms: Get "http://127.0.0.1:PORT": context deadline exceeded (DeadlineExceeded=true)
+--- PASS: TestClientTimeout (2.51s)</code></pre>
+<p>Note the error types: a context deadline gives <code>errors.Is(err, context.DeadlineExceeded) == true</code>, which is what your code should branch on. Transport timeouts produce a <code>net.Error</code> whose <code>Timeout()</code> method returns true.</p>
+
+<p><strong>Real-world scenario.</strong> A shop's checkout API serves 500 requests per second and calls a payment provider whose p99 is normally 200 ms. Its HTTP client was <code>http.DefaultClient</code>. At 14:05 the provider has a partial outage and its p99 jumps to 8 s, with some requests never answering. In-flight calls climb from about 100 to several thousand. Goroutines, connections and memory grow until the pods are killed for using too much memory, and even the product pages (which never touch payments) start failing because they share the same pods. With a 1.5 s deadline on the payment call (above the provider's healthy p99.9), in-flight payment calls are capped at about 500 × 1.5 = 750. Checkout fails fast with "payment is slow, try again", and a <a href="#circuit-breakers">circuit breaker</a> can then stop calling the provider altogether until it recovers.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>No timeout at all.</strong> The most common bug. <code>http.Get</code>, a zero-value <code>http.Server</code>, a database driver without a <code>ctx</code>. Search your code base for them.</li>
+  <li><strong>Inner timeouts longer than outer ones.</strong> If the gateway gives up at 10 s but your service waits 30 s for the database, users get <code>504</code>s while your service keeps working. Every layer's limit must sit inside its caller's (see <a href="#real-world-traffic-stack">Real-World Traffic Stack</a>).</li>
+  <li><strong>Timeouts that are too tight.</strong> A timeout at p50 or p90 fails healthy requests all day, and if those are retried you have doubled your load for nothing. Base it on p99.9 and watch the timeout rate as a <a href="#metrics">metric</a>.</li>
+  <li><strong>Forgetting the body.</strong> <code>ResponseHeaderTimeout</code> stops at the headers; a server that sends headers and then trickles the body is caught only by <code>Client.Timeout</code> or the context. Conversely, <code>Client.Timeout</code> will kill a legitimately long download or stream.</li>
+  <li><strong><code>WriteTimeout</code> doesn't stop your handler.</strong> It sets a deadline on the connection, so writes fail afterwards, but the handler keeps running. To stop the work, use a context (<code>http.TimeoutHandler</code> or your own <code>WithTimeout</code>). For long-lived responses such as <a href="#server-sent-events">server-sent events</a>, a server-wide <code>WriteTimeout</code> will cut the stream; extend it per request with <code>http.NewResponseController(w).SetWriteDeadline</code>.</li>
+  <li><strong>Treating a timeout as "it failed".</strong> For writes the outcome is unknown. Retrying a charge after a timeout without an <a href="#idempotency">idempotency key</a> is how customers get billed twice.</li>
+  <li><strong>Retries that ignore the deadline.</strong> Three attempts of 2 s each don't fit in a 3 s budget. A retry loop must check the time left before sleeping and before each attempt (see <a href="#retries">Retries</a>).</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Every network call needs a timeout. Defaults in Go's <code>net/http</code> wait forever for a response.</li>
+  <li>Use per-phase limits (connect, headers) to catch specific hangs, and a context deadline as the overall budget.</li>
+  <li>Propagate the deadline: each hop gets less time than its caller, and no time left means don't call.</li>
+  <li>Pick values from client-side p99.9 latency. A timeout on a write means "unknown outcome", so pair it with idempotency.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#retries">Retries</a> · <a href="#circuit-breakers">Circuit Breakers</a> · <a href="#idempotency">Idempotency</a> · <a href="#p99-latency">p99 Latency</a> · <a href="#real-world-traffic-stack">Real-World Traffic Stack</a> · <a href="#real-world-resilience-playbook">Real-World Resilience Playbook</a></p>
+`;
+
