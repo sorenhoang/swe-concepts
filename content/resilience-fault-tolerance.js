@@ -1851,3 +1851,438 @@ Shed(4 in flight, wait up to 20ms):
 
 <p><strong>Related:</strong> <a href="#rate-limiting">Rate Limiting</a> · <a href="#message-queues">Message Queues</a> · <a href="#circuit-breakers">Circuit Breakers</a> · <a href="#autoscaling">Autoscaling</a> · <a href="#throughput">Throughput</a> · <a href="#real-world-resilience-playbook">Real-World Resilience Playbook</a></p>
 `;
+CONTENT["real-world-resilience-playbook"] = `
+<p class="tldr"><strong>TL;DR</strong>: Each resilience pattern answers one kind of failure. Timeouts bound how long you wait. Retries with jittered backoff absorb short blips. A circuit breaker stops you from calling something that is down. An idempotency key makes a retried payment safe. Load shedding at the front door keeps a spike from sinking everything. This page wires all of them into one checkout call and replays an incident with and without them. Think of a ship: bulkheads, pumps and lifeboats each handle a different emergency, and they only help if they're in the right place before the storm.</p>
+
+<h2>The problem it solves</h2>
+<p>A checkout is a chain of remote calls: the client calls your API, the API reserves stock in the inventory service, and then charges the card through an external payments provider. Every link can fail in a different way. It can be slow or refuse connections. It can return a 503 for one second. It can time out <em>after</em> doing the work. Or it can be buried under more traffic than it can take. Each sibling page in this group fixes one of these. In production you need all of them at once, and they interact. If retries sit at the wrong layer, they multiply. A breaker that counts the wrong errors trips for no reason. A timeout longer than its caller's does work nobody is waiting for. And a fallback can hide an outage from the people who should be fixing it.</p>
+<p>The worst failures come from slowness, not from errors. A provider that answers "no" in 5 ms is easy. A provider that takes 8 seconds to answer holds a goroutine, a connection and maybe a database transaction for each request, and those pile up until the service runs out of them. Then pages that have nothing to do with payments start failing too. That's a <strong>cascading failure</strong>, and stopping it is what this playbook is for.</p>
+
+<h2>How it works: one checkout through the patterns</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Checkout call chain. The client calls the API entry, which sheds load above 64 requests in flight and sets a 5 second deadline. The checkout handler calls an inventory client with its own breaker and 300 millisecond timeout, and a payments client with its own breaker, up to 3 jittered attempts, a 2 second timeout per attempt and an Idempotency-Key, which calls the external provider. On failure, the order goes to a payment pending queue whose worker retries later through the payments client with the same key.">
+  <defs><marker id="arr-rrp-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="10" y="60" width="120" height="90" rx="10"/>
+  <text x="70" y="84" text-anchor="middle" class="title">1 Client</text>
+  <text x="70" y="104" text-anchor="middle" class="small">mobile app</text>
+  <text x="70" y="119" text-anchor="middle" class="small">10 s timeout</text>
+  <text x="70" y="134" text-anchor="middle" class="small">retries 503 only</text>
+  <path class="line" d="M130 105 H148" marker-end="url(#arr-rrp-1)"/>
+  <rect class="box accent" x="150" y="60" width="140" height="90" rx="10"/>
+  <text x="220" y="84" text-anchor="middle" class="title">2 API entry</text>
+  <text x="220" y="104" text-anchor="middle" class="small">shed above 64</text>
+  <text x="220" y="119" text-anchor="middle" class="small">in flight: 503</text>
+  <text x="220" y="134" text-anchor="middle" class="small">deadline: 5 s</text>
+  <path class="line" d="M290 105 H308" marker-end="url(#arr-rrp-1)"/>
+  <rect class="box" x="310" y="60" width="140" height="90" rx="10"/>
+  <text x="380" y="84" text-anchor="middle" class="title">3 Checkout</text>
+  <text x="380" y="104" text-anchor="middle" class="small">reserve stock</text>
+  <text x="380" y="119" text-anchor="middle" class="small">charge card</text>
+  <text x="380" y="134" text-anchor="middle" class="small">else: pending</text>
+  <path class="line" d="M450 80 H468 V55 H488" marker-end="url(#arr-rrp-1)"/>
+  <path class="line" d="M450 130 H468 V160 H488" marker-end="url(#arr-rrp-1)"/>
+  <rect class="box accent" x="490" y="20" width="140" height="70" rx="10"/>
+  <text x="560" y="42" text-anchor="middle" class="title">inventory client</text>
+  <text x="560" y="62" text-anchor="middle" class="small">breaker · 300 ms</text>
+  <text x="560" y="77" text-anchor="middle" class="small">1 retry, keyed</text>
+  <path class="line" d="M630 55 H658" marker-end="url(#arr-rrp-1)"/>
+  <rect class="box ok" x="660" y="20" width="110" height="70" rx="10"/>
+  <text x="715" y="50" text-anchor="middle" class="title">Inventory</text>
+  <text x="715" y="70" text-anchor="middle" class="small">internal service</text>
+  <rect class="box accent" x="490" y="108" width="140" height="112" rx="10"/>
+  <text x="560" y="130" text-anchor="middle" class="title">payments client</text>
+  <text x="560" y="150" text-anchor="middle" class="small">breaker "payments"</text>
+  <text x="560" y="166" text-anchor="middle" class="small">≤ 3 attempts, jittered</text>
+  <text x="560" y="182" text-anchor="middle" class="small">2 s per attempt</text>
+  <text x="560" y="198" text-anchor="middle" class="small">Idempotency-Key</text>
+  <path class="line" d="M630 164 H658" marker-end="url(#arr-rrp-1)"/>
+  <rect class="box ok" x="660" y="129" width="110" height="70" rx="10"/>
+  <text x="715" y="159" text-anchor="middle" class="title">Provider</text>
+  <text x="715" y="179" text-anchor="middle" class="small">external API</text>
+  <path class="line dashed" d="M380 150 V198" marker-end="url(#arr-rrp-1)"/>
+  <text x="388" y="180" class="small">on failure</text>
+  <rect class="box muted" x="310" y="200" width="140" height="60" rx="10"/>
+  <text x="380" y="222" text-anchor="middle" class="title">pending queue</text>
+  <text x="380" y="242" text-anchor="middle" class="small">worker, same key</text>
+  <path class="line dashed" d="M450 210 H488" marker-end="url(#arr-rrp-1)"/>
+  <text x="390" y="288" text-anchor="middle" class="small">Each failure is retried by one layer only: the client retries the API's 503s, the payments client retries the provider's.</text>
+</svg>
+<figcaption>Load shedding and the deadline live at the entry. Breakers, retries and per-attempt timeouts live in the client of each dependency, one set per dependency. The idempotency key belongs to the order, so every attempt and the later worker retry send the same one.</figcaption>
+</figure>
+
+<p>Each sibling page owns one part of this picture:</p>
+<ol>
+  <li><strong>How long to wait</strong>: <a href="#timeouts">Timeouts</a> covers connect, read and total timeouts, Go's <code>http.Client</code> and <code>http.Server</code> fields, and passing a deadline down with <code>context</code>.</li>
+  <li><strong>When to try again</strong>: <a href="#retries">Retries</a> covers which errors are transient, retry budgets and amplification across layers.</li>
+  <li><strong>How long to wait between tries</strong>: <a href="#exponential-backoff">Exponential Backoff</a> covers the formula, the cap and full, equal and decorrelated jitter.</li>
+  <li><strong>When to stop trying</strong>: <a href="#circuit-breakers">Circuit Breakers</a> covers the closed, open and half-open states, trip conditions and fallbacks.</li>
+  <li><strong>Making a repeat harmless</strong>: <a href="#idempotency">Idempotency</a> covers idempotency keys, request hashes and replayed responses.</li>
+  <li><strong>Saying no when full</strong>: <a href="#backpressure">Backpressure</a> covers bounded queues, concurrency limits and load shedding.</li>
+</ol>
+
+<h3>The order of the wrappers</h3>
+<p>Inside the payments client, the patterns wrap each other in a fixed order. Change the order and the behaviour changes, so pick one on purpose.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Nested wrappers. The outer box is the request deadline of 5 seconds, set at the entry. Inside it, the payments circuit breaker, which counts one sample per checkout and makes zero attempts when open. Inside that, the retry loop with up to 3 attempts, full-jitter backoff, stopping when the remaining budget can't fit another attempt. Inside that, attempt 1 and attempt 2, each with a 2 second timeout and the same Idempotency-Key header.">
+  <rect class="box muted" x="20" y="14" width="740" height="222" rx="12"/>
+  <text x="36" y="36" class="title">Request deadline: 5 s (context.WithTimeout at the entry)</text>
+  <rect class="box bad" x="50" y="48" width="680" height="178" rx="10"/>
+  <text x="66" y="70" class="title">Circuit breaker "payments": one sample per checkout; open → 0 attempts</text>
+  <rect class="box accent" x="80" y="82" width="620" height="134" rx="10"/>
+  <text x="96" y="104" class="title">Retry loop: ≤ 3 attempts, full-jitter backoff</text>
+  <text x="96" y="122" class="small">stops early when the time left can't fit backoff + one more attempt</text>
+  <rect class="box ok" x="110" y="136" width="270" height="66" rx="8"/>
+  <text x="245" y="158" text-anchor="middle" class="title">attempt 1: 2 s timeout</text>
+  <text x="245" y="178" text-anchor="middle" class="small">POST /charges</text>
+  <text x="245" y="193" text-anchor="middle" class="small">Idempotency-Key: order-2001</text>
+  <path class="line dashed" d="M380 169 H408" marker-end="url(#arr-rrp-2)"/>
+  <text x="394" y="160" text-anchor="middle" class="small">wait</text>
+  <rect class="box ok" x="410" y="136" width="270" height="66" rx="8"/>
+  <text x="545" y="158" text-anchor="middle" class="title">attempt 2: 2 s timeout</text>
+  <text x="545" y="178" text-anchor="middle" class="small">POST /charges</text>
+  <text x="545" y="193" text-anchor="middle" class="small">Idempotency-Key: order-2001 (same)</text>
+  <defs><marker id="arr-rrp-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+</svg>
+<figcaption>Outside in: the deadline caps everything, the breaker decides whether to try at all, the retry loop decides how many times, and each attempt has its own smaller timeout. Two 2 s attempts plus backoff fit inside 5 s; a third only runs if the first two failed fast.</figcaption>
+</figure>
+<p>Here the breaker sits <em>outside</em> the retry loop. A checkout that needed three attempts counts as one failure or one success, and an open breaker means no attempts at all. The other common order, retry outside the breaker, is the default aspect order in resilience4j (<code>Retry(CircuitBreaker(…))</code>). There every attempt is a sample, and the retry policy must treat "breaker open" as a final answer, or it just burns its attempts against the open breaker. Both orders work. The bug is not knowing which one you have.</p>
+
+<h3>Which pattern answers which failure</h3>
+<table>
+  <tr><th>Failure</th><th>What you see</th><th>Pattern that answers it</th><th>Without it</th></tr>
+  <tr><td>A dependency gets slow</td><td>p99 goes from 200 ms to 8 s</td><td><a href="#timeouts">Timeout</a> per attempt, deadline per request; then a <a href="#circuit-breakers">breaker</a> on slow calls</td><td>goroutines, connections and DB transactions pile up; unrelated pages fail</td></tr>
+  <tr><td>A dependency is down</td><td>connection refused, 5xx on every call</td><td><a href="#circuit-breakers">Breaker</a> + a fallback</td><td>every request pays a timeout to learn the same thing</td></tr>
+  <tr><td>A brief blip</td><td>one 503, a reset connection</td><td><a href="#retries">Retry</a> with <a href="#exponential-backoff">jittered backoff</a></td><td>users see errors for a 100 ms hiccup</td></tr>
+  <tr><td>An unknown outcome</td><td>timeout after the provider charged the card</td><td><a href="#idempotency">Idempotency key</a> + retry or reconcile with the same key</td><td>a retry charges twice; no retry loses the order</td></tr>
+  <tr><td>More traffic than capacity</td><td>in-flight count and latency climb together</td><td><a href="#backpressure">Load shedding</a> at the entry; <a href="#rate-limiting">rate limits</a> per client</td><td>queues grow, every request gets slow, then memory runs out</td></tr>
+  <tr><td>Everyone retries at once</td><td>load spikes right after an outage ends</td><td>Jitter, a retry budget, few half-open probes</td><td>the recovering service gets knocked over again</td></tr>
+  <tr><td>The caller already gave up</td><td>work continues for a request with no one waiting</td><td>Deadline propagation through <code>context</code></td><td>capacity spent on answers nobody reads</td></tr>
+</table>
+
+<h2>An incident, with and without the playbook</h2>
+<p>Say checkout gets 200 requests per second across 4 API pods, 50 per pod. Normally the payments provider answers in about 150 ms on average, so each pod has around 50 × 0.15 ≈ 8 checkouts in flight (Little's law: in flight = rate × latency). At 14:05:00 the provider's p99 goes from 200 ms to 8 s. At 8 s, the same pod would need 50 × 8 = 400 checkouts in flight to keep up.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 404" role="img" aria-label="Incident timeline comparing two versions of the same service after the payments provider slows to 8 seconds at 14:05. Without patterns: calls hang, the database pool is exhausted, client and API retries multiply calls by 9, pods restart, recovery is slow and some customers are charged twice. With patterns: attempts time out at 2 seconds, load shedding caps in-flight work at 64 per pod, the breaker opens at about 14:05:10 and checkouts return payment pending, a half-open probe fails and it reopens, at 14:20 the probe succeeds and the breaker closes, and the pending worker replays the same keys so no one is charged twice.">
+  <rect class="box bad" x="100" y="14" width="330" height="30" rx="8"/>
+  <text x="265" y="34" text-anchor="middle" class="title">Without the playbook</text>
+  <rect class="box ok" x="450" y="14" width="320" height="30" rx="8"/>
+  <text x="610" y="34" text-anchor="middle" class="title">With the playbook</text>
+  <path class="line" d="M50 84 V392"/>
+  <text x="50" y="70" text-anchor="middle" class="title">14:05:00</text>
+  <text x="440" y="70" text-anchor="middle">The payments provider's p99 goes from 200 ms to 8 s.</text>
+  <ellipse class="box accent" cx="50" cy="104" rx="6" ry="6"/>
+  <text x="62" y="96" class="small">:01</text>
+  <text x="110" y="100" class="small">Calls hang: a zero-value http.Client has no</text>
+  <text x="110" y="115" class="small">timeout. Each one holds a DB transaction open.</text>
+  <text x="460" y="100" class="small">Each attempt gives up at 2 s, waits a jittered</text>
+  <text x="460" y="115" class="small">backoff, tries once more with the same key.</text>
+  <ellipse class="box accent" cx="50" cy="154" rx="6" ry="6"/>
+  <text x="62" y="146" class="small">:03</text>
+  <text x="110" y="150" class="small">The 50-connection DB pool is used up. Product</text>
+  <text x="110" y="165" class="small">pages wait for the pool too: the site is down.</text>
+  <text x="460" y="150" class="small">In flight hits 64 per pod. Extra checkouts get</text>
+  <text x="460" y="165" class="small">503 + Retry-After in a few ms. Browsing is fine.</text>
+  <ellipse class="box accent" cx="50" cy="204" rx="6" ry="6"/>
+  <text x="62" y="196" class="small">:10</text>
+  <text x="110" y="200" class="small">Apps time out at 10 s and retry 3×, the API</text>
+  <text x="110" y="215" class="small">retries 3×: up to 9 provider calls per tap.</text>
+  <text x="460" y="200" class="small">≥ 50% of 20+ calls failed: the breaker opens.</text>
+  <text x="460" y="215" class="small">Checkout answers 202 payment_pending in ~1 ms.</text>
+  <ellipse class="box accent" cx="50" cy="254" rx="6" ry="6"/>
+  <text x="62" y="246" class="small">:40</text>
+  <text x="110" y="250" class="small">The provider drowns in retries. Pods fail health</text>
+  <text x="110" y="265" class="small">checks and restart, dropping in-flight orders.</text>
+  <text x="460" y="250" class="small">Half-open: one probe, still slow, so the breaker</text>
+  <text x="460" y="265" class="small">opens for another 30 s. Repeats until recovery.</text>
+  <ellipse class="box ok" cx="50" cy="304" rx="6" ry="6"/>
+  <text x="62" y="296" class="small">14:20</text>
+  <text x="110" y="300" class="small">The provider recovers, then is hit by restarted</text>
+  <text x="110" y="315" class="small">pods and every app retrying in sync.</text>
+  <text x="460" y="300" class="small">A probe succeeds: the breaker closes. The worker</text>
+  <text x="460" y="315" class="small">drains the pending queue at a fixed, slow rate.</text>
+  <ellipse class="box ok" cx="50" cy="354" rx="6" ry="6"/>
+  <text x="62" y="346" class="small">after</text>
+  <text x="110" y="350" class="small">Retries without a key charged some customers</text>
+  <text x="110" y="365" class="small">twice. Support issues refunds by hand.</text>
+  <text x="460" y="350" class="small">Timed-out orders replay their key: the provider</text>
+  <text x="460" y="365" class="small">returns the existing charge. One charge per order.</text>
+  <path d="M440 84 V384" style="stroke: var(--line)"/>
+</svg>
+<figcaption>The same 15-minute provider slowdown. Without limits, slowness spreads: a payments problem becomes a database problem, then a whole-site outage, then duplicate charges. With the playbook it stays a payments problem: checkouts are delayed, not lost, and the rest of the site never notices.</figcaption>
+</figure>
+<p>The first 10 seconds are the hard part even with the playbook. Until the breaker has seen enough failures, each checkout costs two 2-second attempts, so a pod needs about 50 × 4 = 200 slots and has 64. For those seconds, shedding rejects roughly two thirds of checkouts with a fast 503. That's the point: a fast "try again in a second" from 4 pods is far better than a slow "maybe" that takes the database down with it. A breaker that also trips on slow calls (resilience4j can trip on a slow-call rate, for example) shortens this window.</p>
+<div class="callout warn"><strong>A fallback only works if the business accepts it.</strong> "Payment pending, we'll email you" is fine for a shop that ships the next day. It is not fine for a concert ticket that must be paid before it's issued. There the honest fallback is a fast "payments are down, try again in a few minutes", and the breaker still saves you from the cascade.</div>
+
+<h3>Defaults to start with</h3>
+<p>These are starting points to tune from your own <a href="#metrics">metrics</a>, not universal truths. The ones that come from a named source say so.</p>
+<table>
+  <tr><th>Setting</th><th>Start with</th><th>Why, and how to tune</th></tr>
+  <tr><td>Client timeout</td><td>longer than the API's deadline (e.g. 10 s)</td><td>the outer layer must wait longer than the inner one, or it gives up on work that is still running</td></tr>
+  <tr><td>Request deadline at the entry</td><td>e.g. 5 s for checkout, set once with <code>context.WithTimeout</code></td><td>everything below gets what's left of it; inner budgets are always smaller</td></tr>
+  <tr><td>Per-attempt timeout</td><td>near the dependency's p99.9</td><td>the AWS Builders' Library picks an acceptable false-timeout rate (their example: 0.1%) and uses that percentile of the downstream latency</td></tr>
+  <tr><td>Attempts per call</td><td>3 at most, including the first</td><td>Google's SRE book uses "up to three attempts" per request; gRPC caps <code>maxAttempts</code> at 5</td></tr>
+  <tr><td>Backoff</td><td>base 100 ms, cap 1 s, full jitter</td><td>spreads retries out; see <a href="#exponential-backoff">Exponential Backoff</a></td></tr>
+  <tr><td>Retry budget</td><td>retries ≤ 10% of requests</td><td>the SRE book only retries while the retry ratio stays below 10%; the AWS SDKs use a token bucket for the same reason</td></tr>
+  <tr><td>Breaker trip</td><td>≥ 50% failures over ≥ 20 calls in a 10 s window</td><td>the minimum call count stops 1 failure out of 2 from tripping it at night. gobreaker's default is more than 5 consecutive failures</td></tr>
+  <tr><td>Breaker open period</td><td>10–30 s, then 1–3 half-open probes</td><td>gobreaker defaults to 60 s open and 1 half-open request; shorter means faster recovery, more probes against a sick service</td></tr>
+  <tr><td>Max in flight per pod</td><td>≈ peak rate per pod × p99 latency × 2</td><td>Little's law plus headroom; shed above it with 503 + <code>Retry-After</code></td></tr>
+  <tr><td>Idempotency key</td><td>one per order, not per attempt; keep it ≥ 24 h</td><td>Stripe keeps keys for at least 24 hours and accepts up to 255 characters</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>The checkout service in Go.</strong> The entry sheds load with a buffered channel used as a semaphore and sets the request deadline. The payments client composes the rest: deadline → breaker (<code>github.com/sony/gobreaker/v2</code>) → retry loop with full-jitter backoff → one HTTP attempt with its own timeout and the order's <code>Idempotency-Key</code>. A declined card (4xx) counts as a <em>success</em> for the breaker, because the provider worked fine. A cancelled request is excluded, because the client left, not the provider. When the charge fails for any other reason, the order goes to a pending queue and the client gets <code>202 payment_pending</code>.</p>
+<pre><code>package checkout
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/sony/gobreaker/v2"
+)
+
+type Config struct {
+	RequestBudget  time.Duration // whole checkout, set once at the entry
+	AttemptTimeout time.Duration // one HTTP attempt to the provider
+	MaxAttempts    int
+	BaseBackoff    time.Duration
+	MaxBackoff     time.Duration
+	BreakerOpenFor time.Duration
+	MaxInFlight    int // entry load shedding
+}
+
+var (
+	errRetryable = errors.New("retryable")
+	errDeclined  = errors.New("card declined") // a 4xx: our answer, not an outage
+)
+
+type PaymentClient struct {
+	cfg  Config
+	url  string
+	http *http.Client
+	cb   *gobreaker.CircuitBreaker[string]
+}
+
+func NewPaymentClient(url string, cfg Config, onState func(from, to gobreaker.State)) *PaymentClient {
+	cb := gobreaker.NewCircuitBreaker[string](gobreaker.Settings{
+		Name:        "payments",
+		MaxRequests: 1,                // half-open: one probe at a time
+		Interval:    10 * time.Second, // closed-state counting window
+		Timeout:     cfg.BreakerOpenFor,
+		ReadyToTrip: func(c gobreaker.Counts) bool {
+			return c.Requests &gt;= 5 &amp;&amp; c.TotalFailures*2 &gt;= c.Requests // ≥50% of ≥5 calls
+		},
+		IsSuccessful: func(err error) bool { return err == nil || errors.Is(err, errDeclined) },
+		IsExcluded:   func(err error) bool { return errors.Is(err, context.Canceled) }, // caller left
+		OnStateChange: func(_ string, from, to gobreaker.State) {
+			if onState != nil {
+				onState(from, to)
+			}
+		},
+	})
+	return &amp;PaymentClient{cfg: cfg, url: url, http: &amp;http.Client{}, cb: cb}
+}
+
+// Charge: breaker outside, retries inside. One checkout = one breaker sample,
+// and an open breaker means zero attempts, not three fast failures.
+func (p *PaymentClient) Charge(ctx context.Context, orderID string, cents int64) (string, error) {
+	return p.cb.Execute(func() (string, error) {
+		return p.chargeWithRetry(ctx, "order-"+orderID, cents)
+	})
+}
+
+func (p *PaymentClient) chargeWithRetry(ctx context.Context, key string, cents int64) (string, error) {
+	var err error
+	for attempt := 1; attempt &lt;= p.cfg.MaxAttempts; attempt++ {
+		var id string
+		var retryAfter time.Duration
+		id, retryAfter, err = p.once(ctx, key, cents) // same key on every attempt
+		if err == nil {
+			return id, nil
+		}
+		if !errors.Is(err, errRetryable) || attempt == p.cfg.MaxAttempts {
+			return "", err
+		}
+		wait := max(retryAfter, fullJitter(p.cfg.BaseBackoff, p.cfg.MaxBackoff, attempt))
+		if dl, ok := ctx.Deadline(); ok &amp;&amp; time.Until(dl) &lt; wait+p.cfg.AttemptTimeout {
+			return "", err // not enough budget left for a whole attempt: stop now
+		}
+		select {
+		case &lt;-time.After(wait):
+		case &lt;-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return "", err
+}
+
+// fullJitter: random in [0, min(cap, base·2^(attempt-1))).
+func fullJitter(base, maxBackoff time.Duration, attempt int) time.Duration {
+	return rand.N(min(maxBackoff, base&lt;&lt;(attempt-1)))
+}
+
+func (p *PaymentClient) once(ctx context.Context, key string, cents int64) (string, time.Duration, error) {
+	actx, cancel := context.WithTimeout(ctx, p.cfg.AttemptTimeout)
+	defer cancel()
+	body := strings.NewReader(fmt.Sprintf(&#96;{"amount":%d,"currency":"usd"}&#96;, cents))
+	req, err := http.NewRequestWithContext(actx, http.MethodPost, p.url+"/charges", body)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	resp, err := p.http.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", 0, ctx.Err() // the whole budget is gone, not just this attempt
+		}
+		return "", 0, fmt.Errorf("%w: %w", errRetryable, err) // attempt timeout, conn reset
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode &lt; 300:
+		var out struct{ ID string }
+		err := json.NewDecoder(resp.Body).Decode(&amp;out)
+		return out.ID, 0, err
+	case resp.StatusCode == 409 || resp.StatusCode == 429 || // 409: same key still in flight
+		resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 504:
+		secs, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
+		return "", time.Duration(secs) * time.Second,
+			fmt.Errorf("%w: status %d", errRetryable, resp.StatusCode)
+	case resp.StatusCode &lt; 500:
+		return "", 0, errDeclined
+	default:
+		return "", 0, fmt.Errorf("payments: status %d", resp.StatusCode)
+	}
+}
+
+type Server struct {
+	cfg     Config
+	slots   chan struct{}
+	pay     *PaymentClient
+	pending func(orderID string) // queue: a worker charges later with the same key
+}
+
+func NewServer(cfg Config, pay *PaymentClient, pending func(string)) *Server {
+	return &amp;Server{cfg: cfg, slots: make(chan struct{}, cfg.MaxInFlight), pay: pay, pending: pending}
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	select { // backpressure at the door: reject fast instead of queueing forever
+	case s.slots &lt;- struct{}{}:
+		defer func() { &lt;-s.slots }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "overloaded", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestBudget)
+	defer cancel()
+
+	orderID := r.URL.Query().Get("order")
+	// Inventory reservation goes here, with its own breaker and timeout.
+	chargeID, err := s.pay.Charge(ctx, orderID, 4999)
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case err == nil:
+		json.NewEncoder(w).Encode(map[string]string{"status": "paid", "charge": chargeID})
+	case errors.Is(err, errDeclined):
+		w.WriteHeader(http.StatusPaymentRequired)
+		json.NewEncoder(w).Encode(map[string]string{"status": "declined"})
+	default: // breaker open, timeout, provider down: outcome unknown or not tried
+		s.pending(orderID)
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"status": "payment_pending", "reason": reason(err)})
+	}
+}
+
+func reason(err error) string {
+	switch {
+	case errors.Is(err, gobreaker.ErrOpenState), errors.Is(err, gobreaker.ErrTooManyRequests):
+		return "breaker_open"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		return "provider_error"
+	}
+}</code></pre>
+
+<p><strong>The test.</strong> A fake provider built on <code>httptest</code> behaves like a real payments API. It stores one charge per <code>Idempotency-Key</code> and replays it on a repeat. It records the charge <em>before</em> sending its reply, so a slow reply means "charged, but the caller doesn't know yet". Timings are scaled down so the test runs in a few seconds:</p>
+<pre><code>var cfg = Config{
+	RequestBudget:  600 * time.Millisecond,
+	AttemptTimeout: 200 * time.Millisecond,
+	MaxAttempts:    3,
+	BaseBackoff:    20 * time.Millisecond,
+	MaxBackoff:     100 * time.Millisecond,
+	BreakerOpenFor: 500 * time.Millisecond,
+	MaxInFlight:    4,
+}</code></pre>
+<p>Real output of <code>go test -v</code>. It covers a transient 503, a reply that arrives after the attempt timeout, a provider that slows to 2 s per call, its recovery, the pending worker, and a burst of 10 concurrent checkouts:</p>
+<pre><code>== a 503, then success
+  200 {"charge":"ch_1","status":"paid"}  provider requests=2 charges=1
+== provider charged, but the reply came after our 200 ms attempt timeout
+  200 {"charge":"ch_2","status":"paid"}  provider requests=4 charges=2
+== provider slows to 2 s per call
+  order 2001: 202 {"reason":"timeout","status":"payment_pending"}  took=400ms attempts=2
+  order 2002: 202 {"reason":"timeout","status":"payment_pending"}  took=400ms attempts=2
+  order 2003: 202 {"reason":"timeout","status":"payment_pending"}  took=400ms attempts=2
+  order 2004: 202 {"reason":"timeout","status":"payment_pending"}  took=400ms attempts=2
+  [t=2.1s] breaker payments: closed -&gt; open
+  order 2005: 202 {"reason":"timeout","status":"payment_pending"}  took=400ms attempts=2
+  order 2006: 202 {"reason":"breaker_open","status":"payment_pending"}  took=0ms attempts=0
+  order 2007: 202 {"reason":"breaker_open","status":"payment_pending"}  took=0ms attempts=0
+  order 2008: 202 {"reason":"breaker_open","status":"payment_pending"}  took=0ms attempts=0
+== provider recovers; wait out the open period
+  [t=2.7s] breaker payments: open -&gt; half-open
+  [t=2.7s] breaker payments: half-open -&gt; closed
+  order 2009: 200 {"charge":"ch_6","status":"paid"}
+== pending worker retries 8 orders with their original keys
+  order 2001 -&gt; ch_1 ok
+  order 2002 -&gt; ch_2 ok
+  order 2003 -&gt; ch_3 ok
+  order 2004 -&gt; ch_4 ok
+  order 2005 -&gt; ch_5 ok
+  order 2006 -&gt; ch_7 ok
+  order 2007 -&gt; ch_8 ok
+  order 2008 -&gt; ch_9 ok
+  unique charges: 6 before the worker, 9 after (one per order)
+== 10 concurrent checkouts, MaxInFlight=4, provider takes 100 ms
+  map[200 in 100ms:4 503 in 0ms:6]</code></pre>
+<p>Things to notice:</p>
+<ul>
+  <li><strong>The retry used the same key.</strong> Order 1002's first attempt timed out after the provider had already charged. The second attempt replayed the key and got <code>ch_2</code> back: 2 requests, 1 charge.</li>
+  <li><strong>Slowness became fast failure.</strong> While the breaker was closed, each checkout spent about 400 ms (two 200 ms attempts) and then gave up with budget left over, because a third attempt wouldn't fit. Once 5 calls had failed (the trip rule uses 5 calls so the test stays short; production would use the 20 from the table above), the breaker opened and checkouts answered in under a millisecond without touching the provider.</li>
+  <li><strong>The half-open probe is lazy.</strong> gobreaker moves from open to half-open when the next call arrives after the open period, not on a timer. That one call was the probe; it succeeded, so the breaker closed.</li>
+  <li><strong>No double charges.</strong> Orders 2001–2005 had timed out, but the provider had charged them. The worker's retries with the original keys got <code>ch_1</code>–<code>ch_5</code> back. Only 2006–2008, which never reached the provider, created new charges.</li>
+  <li><strong>Shedding is instant.</strong> With 4 slots, 4 checkouts took 100 ms and 6 were rejected in 0 ms with a 503, instead of queueing behind them.</li>
+</ul>
+
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Retry and breaker fighting each other.</strong> If the retry loop is outside the breaker and treats "breaker open" as retryable, every request spins through its attempts against an open breaker. If the breaker is outside, one checkout is one sample, so it trips after more failed attempts. Choose an order, and never retry <code>ErrOpenState</code>.</li>
+  <li><strong>Timeouts longer than the caller's.</strong> An API that waits 30 s on a provider while the app gives up at 10 s keeps working for nobody. Set the deadline once at the entry and derive every inner timeout from what's left (<code>ctx</code> does this for you).</li>
+  <li><strong>Retrying non-idempotent calls.</strong> A POST that creates a charge is only safe to retry with an idempotency key. The key must be fixed per order. A new UUID per attempt protects nothing. A 409 for that key usually means the first attempt is still running, so wait and retry; it is not a decline.</li>
+  <li><strong>Retrying at every layer.</strong> The app, the API and the HTTP library each retrying 3 times means 9 or 27 calls per click. The AWS Builders' Library shows 3 retries at each of 5 layers giving 243× the load on the database. Retry at one layer per failure, with a budget.</li>
+  <li><strong>A fallback that hides the outage.</strong> <code>202 payment_pending</code> looks like success on a dashboard of status codes. Count fallbacks as their own metric and alert on them. Also cap the pending queue, because a fallback that grows forever is just a slower outage.</li>
+  <li><strong>The breaker counting the wrong things.</strong> A burst of declined cards or users closing the app should not trip it. Count 5xx, timeouts and connection errors; treat 4xx as success and cancellations as excluded.</li>
+  <li><strong>Holding scarce resources across a remote call.</strong> A DB transaction or a pooled connection held open while you wait on a provider turns their latency into your outage. Commit, call, then write the result.</li>
+  <li><strong>Modes that never run.</strong> Breakers and fallbacks only run during incidents, so they are the least tested code you have. The AWS Builders' Library warns that circuit breakers add modal behaviour that is hard to test. Inject latency, not just errors, in staging and game days (see <a href="#chaos-engineering">Chaos Engineering</a>).</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Match each failure to its pattern: slow → timeout and breaker, blip → retry with jitter, unknown outcome → idempotency key, too much traffic → shed at the entry.</li>
+  <li>Set one deadline at the entry and shrink it inward. Retry at one layer per failure, with a cap and a budget.</li>
+  <li>One breaker per dependency, counting only real dependency failures, with a fallback the business has agreed to and an alert on every use of it.</li>
+  <li>Test the failure paths on purpose: slow dependencies, not just dead ones.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#timeouts">Timeouts</a> · <a href="#retries">Retries</a> · <a href="#exponential-backoff">Exponential Backoff</a> · <a href="#circuit-breakers">Circuit Breakers</a> · <a href="#idempotency">Idempotency</a> · <a href="#backpressure">Backpressure</a></p>
+`;
