@@ -945,3 +945,283 @@ POST with Idempotency-Key, 503:
 <p><strong>Related:</strong> <a href="#exponential-backoff">Exponential Backoff</a> · <a href="#idempotency">Idempotency</a> · <a href="#timeouts">Timeouts</a> · <a href="#circuit-breakers">Circuit Breakers</a> · <a href="#rate-limiting">Rate Limiting</a> · <a href="#real-world-resilience-playbook">Real-World Resilience Playbook</a></p>
 `;
 
+CONTENT["exponential-backoff"] = `
+<p class="tldr"><strong>TL;DR</strong>: Exponential backoff makes each retry wait longer than the last (100 ms, 200 ms, 400 ms…, up to a cap), so a struggling service gets room to recover. <strong>Jitter</strong> randomises each wait so that thousands of clients that failed at the same moment don't all retry at the same moment. Like a crowd leaving a stadium: staggered exits flow, everyone through one door at once is a crush.</p>
+
+<h2>The problem it solves</h2>
+<p>A <a href="#retries">retry</a> needs a pause before it. The two naive choices both fail:</p>
+<ul>
+  <li><strong>No wait.</strong> A client retrying in a tight loop sends hundreds of requests per second at a service that is already failing. Multiply by every client and you've built a denial-of-service attack against yourself.</li>
+  <li><strong>A fixed wait</strong> (say 1 s). Better for one client, but if the service is down for a minute every client still hammers it once per second, and clients that failed together stay in lockstep forever.</li>
+</ul>
+<p>The second problem is the <strong>thundering herd</strong>. When a shared dependency fails, it fails for everyone at the same instant: all requests in flight error out together, or all WebSocket connections drop together when a gateway restarts. If every client then follows the same deterministic schedule, their retries arrive as synchronized waves. Each wave is far bigger than what the recovering service can handle, so most of it fails, which schedules the next wave, again all at the same time. The service can be healthy and still never catch up.</p>
+<p>Exponential growth fixes the first problem (the total retry rate falls quickly while the outage lasts). Jitter fixes the second (it spreads the herd out in time).</p>
+
+<h2>How it works</h2>
+<h3>The formula</h3>
+<p>With a base delay <code>base</code>, a cap <code>cap</code>, and retry number <code>n</code> (starting at 0):</p>
+<pre><code>wait = min(cap, base × 2^n)                      // exponential backoff, no jitter</code></pre>
+<p>With <code>base = 100 ms</code> that gives 100, 200, 400, 800 ms, 1.6 s, 3.2 s… The <strong>cap</strong> stops it growing without bound (a client waiting an hour to retry is effectively broken), and a <strong>maximum number of attempts</strong> or an overall deadline stops it retrying forever. The multiplier doesn't have to be 2: gRPC's connection backoff uses 1.6.</p>
+<p>Jitter replaces the exact value with a random one. The AWS Architecture Blog post <em>Exponential Backoff and Jitter</em> (Marc Brooker, 2015) compares three variants, with <code>random_between</code> uniform:</p>
+<pre><code>full:         wait = random_between(0, min(cap, base × 2^n))
+equal:        t = min(cap, base × 2^n);  wait = t/2 + random_between(0, t/2)
+decorrelated: wait = min(cap, random_between(base, previous_wait × 3))</code></pre>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="Backoff waits for 7 retries with base 100 milliseconds and cap 2 seconds. Without jitter the wait is the top of each bar: 100, 200, 400, 800 milliseconds, 1.6 seconds, then 2 seconds twice at the cap. With full jitter the wait is a random point inside the bar; the real draws were 100, 0, 300, 120, 380, 600 and 1620 milliseconds.">
+  <path class="line" d="M100 30 V230 H760"/>
+  <text x="92" y="234" text-anchor="end" class="small">0</text>
+  <text x="92" y="134" text-anchor="end" class="small">1 s</text>
+  <text x="92" y="34" text-anchor="end" class="small">2 s</text>
+  <path class="line bad dashed" d="M100 30 H760"/>
+  <text x="104" y="24" class="small">cap = 2 s</text>
+  <rect class="box muted" x="125" y="220" width="50" height="10"/>
+  <path class="line" d="M125 220 H175" style="stroke-width: 3"/>
+  <circle class="box accent" cx="150" cy="220" r="5"/>
+  <text x="150" y="248" text-anchor="middle" class="small">retry 1</text>
+  <rect class="box muted" x="217" y="210" width="50" height="20"/>
+  <path class="line" d="M217 210 H267" style="stroke-width: 3"/>
+  <circle class="box accent" cx="242" cy="230" r="5"/>
+  <text x="242" y="248" text-anchor="middle" class="small">retry 2</text>
+  <rect class="box muted" x="309" y="190" width="50" height="40"/>
+  <path class="line" d="M309 190 H359" style="stroke-width: 3"/>
+  <circle class="box accent" cx="334" cy="200" r="5"/>
+  <text x="334" y="248" text-anchor="middle" class="small">retry 3</text>
+  <rect class="box muted" x="401" y="150" width="50" height="80"/>
+  <path class="line" d="M401 150 H451" style="stroke-width: 3"/>
+  <circle class="box accent" cx="426" cy="218" r="5"/>
+  <text x="426" y="248" text-anchor="middle" class="small">retry 4</text>
+  <rect class="box muted" x="493" y="70" width="50" height="160"/>
+  <path class="line" d="M493 70 H543" style="stroke-width: 3"/>
+  <circle class="box accent" cx="518" cy="192" r="5"/>
+  <text x="518" y="248" text-anchor="middle" class="small">retry 5</text>
+  <rect class="box muted" x="585" y="30" width="50" height="200"/>
+  <path class="line" d="M585 30 H635" style="stroke-width: 3"/>
+  <circle class="box accent" cx="610" cy="170" r="5"/>
+  <text x="610" y="248" text-anchor="middle" class="small">retry 6</text>
+  <rect class="box muted" x="677" y="30" width="50" height="200"/>
+  <path class="line" d="M677 30 H727" style="stroke-width: 3"/>
+  <circle class="box accent" cx="702" cy="68" r="5"/>
+  <text x="702" y="248" text-anchor="middle" class="small">retry 7</text>
+  <rect class="box muted" x="110" y="264" width="22" height="14"/><text x="140" y="276" class="small">full jitter: anywhere in [0, top)</text>
+  <path class="line" d="M350 271 H380" style="stroke-width: 3"/><text x="388" y="276" class="small">no jitter: always the top</text>
+  <circle class="box accent" cx="570" cy="271" r="5"/><text x="582" y="276" class="small">one real full-jitter draw</text>
+</svg>
+<figcaption>Base 100 ms, cap 2 s. The ceiling doubles until it hits the cap; full jitter picks a random point below it each time (dots: real values from the test below).</figcaption>
+</figure>
+
+<h3>Why jitter matters: synchronized vs spread retries</h3>
+<p>The simulation in the example below starts 1,000 clients whose requests all fail at the same moment, when a dependency comes back after an outage. The recovering server can handle 10 requests per 10 ms; everything above that is rejected and retried. Same base (100 ms) and cap (10 s), different jitter:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Requests per 50 milliseconds after a dependency recovers, from the Go simulation. Without jitter, about 1,000 clients retry in synchronized spikes of 990, 980, 970, 960 and 950 requests at 0.1, 0.3, 0.7, 1.5 and 3.1 seconds, far above the server capacity of 50 per 50 milliseconds, with nothing in between. With full jitter the same clients spread out: load starts high and decays smoothly to near zero by about 2 seconds.">
+  <text x="70" y="22" class="small">requests per 50 ms</text>
+  <rect class="box bad" x="420" y="12" width="8" height="14"/><text x="436" y="24" class="small">no jitter: synchronized waves</text>
+  <path class="line accent" d="M600 19 H630" style="stroke-width: 2"/><text x="638" y="24" class="small">full jitter</text>
+  <path class="line" d="M70 50 V250 H750"/>
+  <text x="62" y="254" text-anchor="end" class="small">0</text>
+  <text x="62" y="154" text-anchor="end" class="small">500</text>
+  <text x="62" y="54" text-anchor="end" class="small">1,000</text>
+  <path class="line dashed" d="M70 150 H750" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M70 50 H750" style="stroke: var(--line)"/>
+  <rect class="box bad" x="71.8" y="50.0" width="6" height="200.0"/>
+  <rect class="box bad" x="91.2" y="52.0" width="6" height="198.0"/>
+  <rect class="box bad" x="130.1" y="54.0" width="6" height="196.0"/>
+  <rect class="box bad" x="207.8" y="56.0" width="6" height="194.0"/>
+  <rect class="box bad" x="363.2" y="58.0" width="6" height="192.0"/>
+  <rect class="box bad" x="674.1" y="60.0" width="6" height="190.0"/>
+  <path class="line accent" d="M74.9 50.0 L84.6 114.2 L94.3 189.2 L104.0 198.4 L113.7 191.0 L123.4 216.4 L133.1 222.8 L142.9 223.6 L152.6 227.0 L162.3 228.0 L172.0 231.0 L181.7 234.0 L191.4 242.6 L201.1 242.6 L210.9 244.8 L220.6 243.8 L230.3 242.6 L240.0 246.0 L249.7 244.0 L259.4 243.8 L269.1 244.8 L278.9 245.2 L288.6 244.0 L298.3 248.2 L308.0 248.4 L317.7 248.2 L327.4 249.0 L337.1 249.2 L346.9 249.2 L356.6 249.0 L366.3 249.6 L376.0 249.6 L385.7 249.2 L395.4 248.8 L405.1 248.6 L414.9 249.6 L424.6 249.8 L434.3 250.0 L444.0 249.8 L453.7 249.6 L463.4 249.6 L473.1 249.6 L482.9 250.0 L492.6 250.0 L502.3 250.0 L512.0 250.0 L521.7 250.0 L531.4 250.0 L541.1 250.0 L550.9 249.8 L560.6 250.0 L570.3 250.0 L580.0 250.0 L589.7 249.8 L599.4 250.0 L609.1 250.0 L618.9 250.0 L628.6 249.8 L638.3 250.0 L648.0 249.8 L657.7 250.0 L667.4 250.0 L677.1 250.0 L686.9 250.0 L696.6 250.0 L706.3 250.0 L716.0 250.0 L725.7 249.8 L735.4 250.0 L745.1 250.0" style="stroke-width: 2"/>
+  <text x="142" y="44" class="small">full jitter, first 50 ms: 1,489 (off scale)</text>
+  <path class="line ok dashed" d="M70 243.3 H750"/>
+  <text x="420" y="235" class="small">server capacity: 50 per 50 ms</text>
+  <text x="70.0" y="268" text-anchor="middle" class="small">0 s</text>
+  <text x="264.3" y="268" text-anchor="middle" class="small">1 s</text>
+  <text x="458.6" y="268" text-anchor="middle" class="small">2 s</text>
+  <text x="652.9" y="268" text-anchor="middle" class="small">3 s</text>
+  <text x="410" y="290" text-anchor="middle" class="small">time since the dependency came back (real output of the simulation below, seed 42)</text>
+</svg>
+<figcaption>Without jitter, every rejected client retries at exactly the same instant, so the server sees a wave of ~1,000 requests, serves 10 and rejects the rest, over and over. With full jitter the same clients arrive spread out and the backlog drains in a few seconds.</figcaption>
+</figure>
+<p>Without jitter, the server is idle between waves and drowning during them. Average load looks fine on a per-minute dashboard; per-second load is a series of spikes. That is why "the service is up but nobody can get in" incidents often follow a restart.</p>
+
+<h3>What the AWS post found</h3>
+<p>Brooker simulated clients contending to update the same database row with optimistic concurrency (100 contending clients in the main case). Un-jittered exponential backoff was the clear loser on both total calls and completion time. Full and equal jitter made a similar number of calls, with equal jitter doing slightly more work; decorrelated jitter made more calls than both. On completion time, decorrelated was slightly faster than full jitter, and equal jitter was much slower. The post recommends full jitter as the usual choice and concludes that jittered backoff "should be considered a standard approach for remote clients". A 2023 update notes that most AWS SDKs now support backoff with jitter.</p>
+<p>The exact ranking depends on the workload: in our capacity-limited simulation below, decorrelated jitter happened to make the fewest calls. What doesn't change is the gap between "no jitter" and any jitter.</p>
+
+<h2>Variants compared</h2>
+<table>
+  <tr><th>Strategy</th><th>Wait before retry n</th><th>Spread</th><th>Notes</th></tr>
+  <tr><td>Constant</td><td><code>d</code></td><td>none</td><td>fine for a single background job; synchronizes herds</td></tr>
+  <tr><td>Exponential, no jitter</td><td><code>min(cap, base·2^n)</code></td><td>none</td><td>backs off but keeps clients in lockstep</td></tr>
+  <tr><td>Full jitter</td><td><code>rand[0, min(cap, base·2^n))</code></td><td>widest</td><td>the usual default; some waits are near zero</td></tr>
+  <tr><td>Equal jitter</td><td>half fixed + <code>rand[0, half)</code></td><td>half as wide</td><td>guarantees a minimum wait; slower to drain in AWS's results</td></tr>
+  <tr><td>Decorrelated jitter</td><td><code>min(cap, rand[base, 3·prev))</code></td><td>wide, depends on the last wait</td><td>needs state (the previous wait); can shrink as well as grow</td></tr>
+  <tr><td>Proportional jitter (±x%)</td><td><code>min(cap, base·m^n) × rand[1−x, 1+x]</code></td><td>narrow</td><td>gRPC: ±20% on connection backoff (base 1 s, ×1.6, max 120 s) and on call retries</td></tr>
+  <tr><td>Server-directed</td><td><code>Retry-After</code> / pushback value</td><td>set by server</td><td>prefer it when present; add a little jitter if many clients get the same value</td></tr>
+</table>
+<p>Defaults in real clients: the AWS SDK for Go v2's standard retryer makes at most 3 attempts with a maximum backoff of 20 s, with a client-side retry token bucket on top. gRPC's connection backoff starts at 1 s, multiplies by 1.6, caps at 120 s and adds ±20% jitter.</p>
+
+<h2>Example</h2>
+<p><strong>A backoff type with the four variants.</strong> One <code>Backoff</code> value per operation (it counts attempts); pass a seeded <code>*rand.Rand</code> only when you need reproducible output, as in tests:</p>
+<pre><code>package backoff
+
+import (
+	"math/rand/v2"
+	"time"
+)
+
+type Jitter int
+
+const (
+	None         Jitter = iota // base * 2^n, capped
+	Full                       // random in [0, base * 2^n)
+	Equal                      // half fixed + half random
+	Decorrelated               // random in [base, 3 * previous wait)
+)
+
+// Backoff hands out the wait before each retry. Use one per call, not one per client.
+type Backoff struct {
+	Base, Cap time.Duration
+	Jitter    Jitter
+	Rand      *rand.Rand // nil: the global, auto-seeded source
+
+	attempt int
+	prev    time.Duration
+}
+
+func (b *Backoff) Next() time.Duration {
+	exp := b.Base
+	for i := 0; i &lt; b.attempt &amp;&amp; exp &lt; b.Cap; i++ {
+		exp *= 2 // doubling in a loop can't overflow the way base&lt;&lt;attempt can
+	}
+	exp = min(exp, b.Cap)
+	b.attempt++
+
+	switch b.Jitter {
+	case Full:
+		return b.random(exp)
+	case Equal:
+		return exp/2 + b.random(exp/2)
+	case Decorrelated:
+		prev := max(b.prev, b.Base)
+		b.prev = min(b.Cap, b.Base+b.random(3*prev-b.Base))
+		return b.prev
+	default:
+		return exp
+	}
+}
+
+func (b *Backoff) Reset() { b.attempt, b.prev = 0, 0 }
+
+// random returns a duration in [0, n).
+func (b *Backoff) random(n time.Duration) time.Duration {
+	if n &lt;= 0 {
+		return 0
+	}
+	if b.Rand != nil {
+		return time.Duration(b.Rand.Int64N(int64(n)))
+	}
+	return rand.N(n)
+}</code></pre>
+<p>Seven consecutive waits from each variant with base 100 ms and cap 2 s (real output, rounded to 10 ms; the dots in the first chart are the <code>full</code> row):</p>
+<pre><code>=== RUN   TestSequence     (base 100 ms, cap 2 s, 7 retries)
+none          [100ms 200ms 400ms 800ms 1.6s 2s 2s]
+full          [100ms 0s 300ms 120ms 380ms 600ms 1.62s]
+equal         [60ms 140ms 310ms 610ms 1.07s 1.19s 1.48s]
+decorrelated  [240ms 330ms 640ms 470ms 1.22s 2s 340ms]</code></pre>
+<p><strong>The thundering-herd simulation.</strong> 1,000 clients fail at <code>t = 0</code>; each 10 ms tick the server serves 10 requests in random order and rejects the rest, and each rejected client schedules its next try with its own <code>Backoff</code>:</p>
+<pre><code>// simulate: every client's request fails at t=0 when the dependency comes back.
+// In each tick the server serves &#96;capacity&#96; requests in random order and rejects the rest.
+func simulate(j Jitter, seed uint64) result {
+	r := rand.New(rand.NewPCG(seed, 1))
+	next := make([]time.Duration, clients) // when each client sends next; -1 = done
+	offs := make([]*Backoff, clients)
+	for i := range offs {
+		offs[i] = &amp;Backoff{Base: 100 * time.Millisecond, Cap: 10 * time.Second, Jitter: j, Rand: r}
+	}
+	res := result{series: make([]int, 70)}
+	left := clients
+	for now := time.Duration(0); left &gt; 0; now += tick {
+		var sending []int
+		for i, t := range next {
+			if t &gt;= 0 &amp;&amp; t &lt;= now {
+				sending = append(sending, i)
+			}
+		}
+		res.calls += len(sending)
+		if now &gt; 0 {
+			res.peak = max(res.peak, len(sending)) // largest retry burst after the first wave
+		}
+		if b := int(now / (50 * time.Millisecond)); b &lt; len(res.series) {
+			res.series[b] += len(sending)
+		}
+		r.Shuffle(len(sending), func(a, b int) { sending[a], sending[b] = sending[b], sending[a] })
+		for k, i := range sending {
+			if k &lt; capacity {
+				next[i] = -1
+				left--
+				continue
+			}
+			next[i] = now + offs[i].Next().Round(tick)
+		}
+		res.done = now
+	}
+	return res
+}</code></pre>
+<p>Real output (<code>retry peak</code> is the largest number of retries arriving in one 10 ms tick, after the initial wave):</p>
+<pre><code>=== RUN   TestSimulation   (1,000 clients, server serves 10 per 10 ms, base 100 ms, cap 10 s)
+jitter           calls  retry peak/10ms    all done at
+none             50500              990         932.7s
+full              4270              157           3.4s
+equal             4265              203           2.9s
+decorrelated      3161               67           2.3s</code></pre>
+<p>Without jitter, each wave serves only 10 clients and the next wave comes 2× later, until the 10 s cap: 50,500 calls and over 15 minutes to serve everyone, against a server that was healthy the whole time. Every jittered variant finishes in 2–4 seconds with 3,000–4,300 calls and retry peaks 5–15× lower. The results are similar with other seeds.</p>
+
+<p><strong>Reconnecting clients.</strong> The same rules apply to long-lived connections. A client that reconnects a dropped <a href="#websockets">WebSocket</a> or <a href="#server-sent-events">server-sent events</a> stream should back off with jitter (SSE servers can also suggest a delay with the <code>retry:</code> field):</p>
+<pre><code>package backoff
+
+import (
+	"context"
+	"time"
+)
+
+// Reconnect dials until it succeeds or ctx ends, sleeping a jittered backoff between tries.
+func Reconnect(ctx context.Context, dial func(context.Context) error) error {
+	b := &amp;Backoff{Base: 500 * time.Millisecond, Cap: 30 * time.Second, Jitter: Full}
+	for {
+		if err := dial(ctx); err == nil {
+			return nil
+		}
+		t := time.NewTimer(b.Next())
+		select {
+		case &lt;-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case &lt;-t.C:
+		}
+	}
+}</code></pre>
+<p><strong>Real-world scenario.</strong> A chat app keeps 200,000 mobile clients connected to a WebSocket gateway. At 14:05 a gateway deploy drops every connection, and the app reconnects after a fixed 1 s. At 14:05:01 the gateway receives 200,000 TLS handshakes and connection requests at once; it can complete a few thousand per second, the rest time out, and those clients retry at 14:05:02, together again. The gateway's CPU sits at 100% for twenty minutes while most users see "connecting…". With full-jitter backoff (base 500 ms, cap 30 s) and a 0–5 s random delay before the very first reconnect, the same 200,000 clients arrive spread over the first several seconds, and the gateway reconnects them in a minute or two.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Backoff without jitter.</strong> It reduces total load but keeps clients synchronized. Always add jitter; full jitter is a good default.</li>
+  <li><strong>No cap, or a cap that's too high.</strong> Waits of minutes make a recovered service look down to the user. Cap the wait, and cap total time with the caller's <a href="#timeouts">deadline</a>.</li>
+  <li><strong>No attempt limit.</strong> Backoff slows retries; it doesn't stop them. Pair it with max attempts, a retry budget or a <a href="#circuit-breakers">circuit breaker</a>.</li>
+  <li><strong>Sharing one backoff counter across requests.</strong> Backoff state belongs to one operation. A process-wide counter makes unrelated requests wait because of each other.</li>
+  <li><strong>Resetting too eagerly.</strong> A reconnect loop that resets backoff as soon as the connection opens will hammer a server that accepts connections and then drops them. Reset only after the connection has been healthy for a while.</li>
+  <li><strong>Identical random seeds.</strong> Jitter from a generator seeded with a constant, or with the same value on every device, is not jitter. Go's top-level <code>math/rand/v2</code> functions are seeded randomly; use a fixed seed only in tests.</li>
+  <li><strong>Overflow.</strong> <code>base &lt;&lt; n</code> overflows <code>time.Duration</code> for large <code>n</code> and can become negative. Clamp before shifting, or double in a loop up to the cap as above.</li>
+  <li><strong>Ignoring the server.</strong> When a <code>429</code> or <code>503</code> carries <code>Retry-After</code>, that value beats your formula (see <a href="#rate-limiting">Rate Limiting</a>).</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Exponential backoff: <code>min(cap, base·2^n)</code>, so the retry rate drops fast during an outage.</li>
+  <li>Jitter breaks up the thundering herd. Without it, clients that failed together retry together, in waves.</li>
+  <li>Full jitter, <code>rand[0, min(cap, base·2^n))</code>, is the usual default; always bound it with a cap, attempts and a deadline.</li>
+  <li>Prefer the server's <code>Retry-After</code> when it sends one, and use the same rules for reconnecting clients.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#retries">Retries</a> · <a href="#timeouts">Timeouts</a> · <a href="#circuit-breakers">Circuit Breakers</a> · <a href="#rate-limiting">Rate Limiting</a> · <a href="#websockets">WebSockets</a> · <a href="#server-sent-events">Server-Sent Events</a></p>
+`;
+
