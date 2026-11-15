@@ -628,3 +628,320 @@ t= 500ms  ctx 500ms: Get "http://127.0.0.1:PORT": context deadline exceeded (Dea
 <p><strong>Related:</strong> <a href="#retries">Retries</a> · <a href="#circuit-breakers">Circuit Breakers</a> · <a href="#idempotency">Idempotency</a> · <a href="#p99-latency">p99 Latency</a> · <a href="#real-world-traffic-stack">Real-World Traffic Stack</a> · <a href="#real-world-resilience-playbook">Real-World Resilience Playbook</a></p>
 `;
 
+CONTENT["retries"] = `
+<p class="tldr"><strong>TL;DR</strong>: A retry sends a failed request again, betting that the failure was a blip: a dropped connection, a restarting pod, a moment of overload. Done right, retries hide most transient errors from users. Done wrong, they double-charge customers and multiply load on a system that is already struggling. Like redialling a call that dropped: fine once or twice, harmful if a thousand people all redial at once, forever.</p>
+
+<h2>The problem it solves</h2>
+<p>In a distributed system, some requests fail for reasons that have nothing to do with the request itself:</p>
+<ul>
+  <li>a pod is being replaced during a <a href="#rolling-deployments">rolling deployment</a> and resets its connections;</li>
+  <li>a <a href="#load-balancing">load balancer</a> sent the request to an instance that just died;</li>
+  <li>a pooled keep-alive connection was closed by the server a moment before you reused it;</li>
+  <li>a dependency is briefly overloaded and answers <code>503</code> or <code>429</code>.</li>
+</ul>
+<p>Each of these is likely to succeed if you simply try again a moment later, often on a different instance. Without retries, every one of them becomes an error page. With retries, a dependency that fails 1% of requests independently looks, to your users, like one that fails 0.01% (two attempts) or 0.0001% (three).</p>
+<p>That multiplication only works when failures are <strong>independent and short</strong>. When the dependency is down or overloaded, failures are correlated, and every retry is extra load on the thing that is already failing. Most of this page is about telling those two cases apart.</p>
+
+<h2>How it works</h2>
+<p>A good retry loop asks four questions before every new attempt:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="Retry decision flow. After an attempt: if the failure is not transient, return the result. If the request is not safe to repeat, return without retrying. If attempts or the retry budget are used up, return the last error. Otherwise wait using Retry-After or backoff with jitter; if the wait still fits the deadline, make the next attempt, otherwise fail fast.">
+  <defs><marker id="arr-re-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box ok" x="165" y="10" width="160" height="50" rx="8"/><text x="245" y="31" text-anchor="middle" class="title">return it</text><text x="245" y="49" text-anchor="middle" class="small">2xx, 400, 404, most 500s</text>
+  <rect class="box bad" x="350" y="10" width="150" height="50" rx="8"/><text x="425" y="31" text-anchor="middle" class="title">return, no retry</text><text x="425" y="49" text-anchor="middle" class="small">POST without a key</text>
+  <rect class="box bad" x="530" y="10" width="230" height="50" rx="8"/><text x="645" y="31" text-anchor="middle" class="title">return last error</text><text x="645" y="49" text-anchor="middle" class="small">out of attempts or budget</text>
+
+  <rect class="box accent" x="20" y="110" width="120" height="44" rx="8"/><text x="80" y="137" text-anchor="middle" class="title">attempt n</text>
+  <rect class="box" x="170" y="110" width="150" height="44" rx="8"/><text x="245" y="137" text-anchor="middle">transient failure?</text>
+  <rect class="box" x="350" y="110" width="150" height="44" rx="8"/><text x="425" y="137" text-anchor="middle">safe to repeat?</text>
+  <rect class="box" x="530" y="110" width="230" height="44" rx="8"/><text x="645" y="137" text-anchor="middle">attempts and budget left?</text>
+  <path class="line" d="M140 132 H168" marker-end="url(#arr-re-1)"/>
+  <path class="line" d="M320 132 H348" marker-end="url(#arr-re-1)"/><text x="334" y="124" text-anchor="middle" class="small">yes</text>
+  <path class="line" d="M500 132 H528" marker-end="url(#arr-re-1)"/><text x="514" y="124" text-anchor="middle" class="small">yes</text>
+  <path class="line ok" d="M245 110 V62" marker-end="url(#arr-re-1)"/><text x="253" y="90" class="small">no</text>
+  <path class="line bad" d="M425 110 V62" marker-end="url(#arr-re-1)"/><text x="433" y="90" class="small">no</text>
+  <path class="line bad" d="M645 110 V62" marker-end="url(#arr-re-1)"/><text x="653" y="90" class="small">no</text>
+
+  <rect class="box bad" x="170" y="210" width="150" height="44" rx="8"/><text x="245" y="229" text-anchor="middle" class="title">fail fast</text><text x="245" y="246" text-anchor="middle" class="small">would miss deadline</text>
+  <rect class="box" x="350" y="210" width="150" height="44" rx="8"/><text x="425" y="237" text-anchor="middle">fits the deadline?</text>
+  <rect class="box accent" x="530" y="210" width="230" height="44" rx="8"/><text x="645" y="229" text-anchor="middle" class="title">wait</text><text x="645" y="246" text-anchor="middle" class="small">Retry-After, else backoff + jitter</text>
+  <path class="line" d="M645 154 V208" marker-end="url(#arr-re-1)"/><text x="653" y="186" class="small">yes</text>
+  <path class="line" d="M530 232 H502" marker-end="url(#arr-re-1)"/>
+  <path class="line bad" d="M350 232 H322" marker-end="url(#arr-re-1)"/><text x="336" y="224" text-anchor="middle" class="small">no</text>
+  <path class="line accent" d="M425 254 V276 H80 V156" marker-end="url(#arr-re-1)"/><text x="300" y="270" text-anchor="middle" class="small">yes: attempt n + 1</text>
+</svg>
+<figcaption>Retry only what is transient, safe to repeat, within limits and within the deadline. Every other path returns.</figcaption>
+</figure>
+
+<h3>1. Is the failure transient?</h3>
+<p>Retry errors that say "not right now", never errors that say "this request is wrong". A <code>400</code> or <code>404</code> will fail the same way every time; retrying it only adds load and delay.</p>
+<table>
+  <tr><th>Result</th><th>Retry?</th><th>Why</th></tr>
+  <tr><td>connection refused / reset, DNS failure</td><td>yes</td><td>instance gone or restarting; another may answer</td></tr>
+  <tr><td><code>503 Service Unavailable</code></td><td>yes, honour <code>Retry-After</code></td><td>the server says it is temporarily unable to handle the request</td></tr>
+  <tr><td><code>429 Too Many Requests</code></td><td>yes, honour <code>Retry-After</code></td><td>you hit a <a href="#rate-limiting">rate limit</a>; retrying sooner just gets another 429</td></tr>
+  <tr><td><code>502</code>, <code>504</code></td><td>yes, if idempotent</td><td>a proxy couldn't reach or wait for the backend; the backend may have done the work</td></tr>
+  <tr><td>your own timeout</td><td>maybe, if idempotent and time is left</td><td>the outcome is unknown, see <a href="#timeouts">Timeouts</a></td></tr>
+  <tr><td>context cancelled / deadline exceeded</td><td>no</td><td>the caller has given up; nobody is waiting for the answer</td></tr>
+  <tr><td><code>500 Internal Server Error</code></td><td>usually no</td><td>often a bug that fails deterministically; retry only if you know that service's 500s are transient</td></tr>
+  <tr><td><code>400</code>, <code>401</code>, <code>403</code>, <code>404</code>, <code>409</code>, <code>422</code></td><td>no</td><td>the request itself is wrong; it will fail the same way</td></tr>
+  <tr><td>gRPC <code>UNAVAILABLE</code></td><td>yes</td><td>the gRPC equivalent of "try again"; most other codes are not retryable by default</td></tr>
+</table>
+<p><code>Retry-After</code> (RFC 9110) is either a number of seconds or an HTTP date. When the server sends it, it knows more about its own recovery than your formula does, so use it.</p>
+
+<h3>2. Is it safe to repeat?</h3>
+<p>A retry after a timeout or a <code>502</code> may run the operation <strong>twice</strong>: the first attempt might have succeeded and only the response was lost. That is harmless for reads and for <strong>idempotent</strong> operations, where doing it twice has the same effect as once. HTTP defines <code>GET</code>, <code>HEAD</code>, <code>OPTIONS</code>, <code>TRACE</code>, <code>PUT</code> and <code>DELETE</code> as idempotent. <code>POST</code> and <code>PATCH</code> are not, unless the server deduplicates them with an <a href="#idempotency">idempotency key</a>. "Charge the card" without a key is the classic double-billing bug.</p>
+
+<h3>3. Are there attempts and budget left?</h3>
+<ul>
+  <li><strong>Max attempts</strong>: 2 or 3 total attempts is typical. Beyond that you rarely recover anything, and you hold the caller longer.</li>
+  <li><strong>A retry budget</strong> limits retries across <em>all</em> calls to a dependency, not per call. When a dependency is healthy, failures are rare and retries are cheap. When it is down, nearly every call fails, and per-call limits still triple the traffic. A budget notices that "most calls are failing" and stops retrying. gRPC's <em>retry throttling</em> is a token bucket: each failure costs 1 token, each success earns back <code>tokenRatio</code>, and retries stop while the bucket is at or below half full. The AWS SDKs have used a similar local token bucket since 2016, according to the AWS Builders' Library.</li>
+</ul>
+
+<h3>4. Does the wait fit the deadline?</h3>
+<p>Wait between attempts, using <code>Retry-After</code> or an exponentially growing, randomised delay (see <a href="#exponential-backoff">Exponential Backoff</a> for the formula and why jitter matters). Before sleeping, check the remaining <a href="#timeouts">deadline</a>: if the next attempt can't finish in time, return the error now instead of sleeping just to fail later.</p>
+
+<h3>Retry amplification: retry at one layer</h3>
+<p>Retries multiply across layers. If every layer in a call chain retries 3 times, the bottom of the chain sees 3<sup>depth</sup> attempts for one user request, exactly when it is weakest:</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Retry amplification. Top row: retrying at every layer, one client request becomes 3 calls to orders, 9 calls to inventory and 27 queries on the database. Bottom row: retrying only at the gateway, the database sees at most 3 queries.">
+  <defs><marker id="arr-re-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="20" y="22" class="title">Every layer retries, 3 attempts each</text>
+  <rect class="box" x="20" y="36" width="120" height="50" rx="8"/><text x="80" y="57" text-anchor="middle" class="title">client</text><text x="80" y="75" text-anchor="middle" class="small">1 request</text>
+  <rect class="box accent" x="180" y="36" width="120" height="50" rx="8"/><text x="240" y="57" text-anchor="middle" class="title">gateway</text><text x="240" y="75" text-anchor="middle" class="small">retries ×3</text>
+  <rect class="box accent" x="340" y="36" width="120" height="50" rx="8"/><text x="400" y="57" text-anchor="middle" class="title">orders</text><text x="400" y="75" text-anchor="middle" class="small">3 calls, retries ×3</text>
+  <rect class="box accent" x="500" y="36" width="120" height="50" rx="8"/><text x="560" y="57" text-anchor="middle" class="title">inventory</text><text x="560" y="75" text-anchor="middle" class="small">9 calls, retries ×3</text>
+  <rect class="box bad" x="660" y="36" width="100" height="50" rx="8"/><text x="710" y="57" text-anchor="middle" class="title">database</text><text x="710" y="75" text-anchor="middle" class="small">27 queries</text>
+  <path class="line" d="M140 61 H178" marker-end="url(#arr-re-2)"/>
+  <path class="line bad" d="M300 61 H338" marker-end="url(#arr-re-2)"/>
+  <path class="line bad" d="M460 61 H498" marker-end="url(#arr-re-2)"/>
+  <path class="line bad" d="M620 61 H658" marker-end="url(#arr-re-2)"/>
+
+  <text x="20" y="140" class="title">Only the gateway retries</text>
+  <rect class="box" x="20" y="154" width="120" height="50" rx="8"/><text x="80" y="175" text-anchor="middle" class="title">client</text><text x="80" y="193" text-anchor="middle" class="small">1 request</text>
+  <rect class="box accent" x="180" y="154" width="120" height="50" rx="8"/><text x="240" y="175" text-anchor="middle" class="title">gateway</text><text x="240" y="193" text-anchor="middle" class="small">retries ×3</text>
+  <rect class="box" x="340" y="154" width="120" height="50" rx="8"/><text x="400" y="175" text-anchor="middle" class="title">orders</text><text x="400" y="193" text-anchor="middle" class="small">3 calls, no retry</text>
+  <rect class="box" x="500" y="154" width="120" height="50" rx="8"/><text x="560" y="175" text-anchor="middle" class="title">inventory</text><text x="560" y="193" text-anchor="middle" class="small">3 calls, no retry</text>
+  <rect class="box ok" x="660" y="154" width="100" height="50" rx="8"/><text x="710" y="175" text-anchor="middle" class="title">database</text><text x="710" y="193" text-anchor="middle" class="small">3 queries</text>
+  <path class="line" d="M140 179 H178" marker-end="url(#arr-re-2)"/>
+  <path class="line ok" d="M300 179 H338" marker-end="url(#arr-re-2)"/>
+  <path class="line ok" d="M460 179 H498" marker-end="url(#arr-re-2)"/>
+  <path class="line ok" d="M620 179 H658" marker-end="url(#arr-re-2)"/>
+  <text x="390" y="236" text-anchor="middle" class="small">the inner layers fail fast and report; one layer decides whether to try again</text>
+</svg>
+<figcaption>Three layers of 3 attempts turn one request into 27 database queries. The AWS Builders' Library gives a five-layer example: 3<sup>5</sup> = 243× the load on the database.</figcaption>
+</figure>
+<p>Pick <strong>one</strong> layer to retry, usually the one closest to the failure that still knows whether the call is safe to repeat (often the immediate caller, or the service mesh), and make the others fail fast. Watch for retries you didn't write: client libraries, SDKs, service meshes and load balancers often retry by default. Even Go's <code>http.Transport</code> silently retries a request once when a <em>reused</em> keep-alive connection fails before any response arrives, if the request is replayable (<code>GET</code>, <code>HEAD</code>, <code>OPTIONS</code>, <code>TRACE</code>, or one carrying an <code>Idempotency-Key</code> header).</p>
+
+<h3>Hedged requests</h3>
+<p>A different use of "send it again": instead of waiting for a failure, send a <strong>second copy</strong> of a slow request to another replica and use whichever answers first. In <em>The Tail at Scale</em> (2013), Dean and Barroso describe waiting until the first request has been outstanding longer than the 95th-percentile latency before hedging. Only about 5% of requests ever wait that long, so the extra load stays small while the <a href="#tail-latency">latency tail</a> shrinks. Hedge only reads or idempotent calls, and cancel the loser. gRPC supports it with a <code>hedgingPolicy</code> (<code>maxAttempts</code>, <code>hedgingDelay</code>, <code>nonFatalStatusCodes</code>) as an alternative to <code>retryPolicy</code>.</p>
+
+<h3>Retries in gRPC</h3>
+<p>gRPC clients can retry transparently from a <strong>service config</strong>. The retry design (gRFC A6) caps <code>maxAttempts</code> at 5, waits <code>min(initialBackoff × backoffMultiplier<sup>n−1</sup>, maxBackoff)</code> multiplied by a random factor between 0.8 and 1.2, retries only the listed status codes, and honours server pushback sent as <code>grpc-retry-pushback-ms</code> response metadata. <code>retryThrottling</code> is the token-bucket budget described above:</p>
+<pre><code>{
+  "methodConfig": [{
+    "name": [{"service": "inventory.Inventory", "method": "GetStock"}],
+    "retryPolicy": {
+      "maxAttempts": 3,
+      "initialBackoff": "0.1s",
+      "maxBackoff": "1s",
+      "backoffMultiplier": 2,
+      "retryableStatusCodes": ["UNAVAILABLE"]
+    }
+  }],
+  "retryThrottling": {"maxTokens": 10, "tokenRatio": 0.1}
+}</code></pre>
+<pre><code>conn, err := grpc.NewClient("dns:///inventory:50051",
+	grpc.WithTransportCredentials(creds),
+	grpc.WithDefaultServiceConfig(serviceConfigJSON),
+)</code></pre>
+<p>gRPC only retries a call if no response headers have arrived yet, and calls that keep failing still count against the overall <a href="#timeouts">deadline</a>.</p>
+
+<h2>Example</h2>
+<p><strong>A retry loop for <code>net/http</code></strong> that classifies errors, refuses to repeat non-idempotent calls, honours <code>Retry-After</code>, respects the context deadline, and shares a retry budget per dependency. Backoff uses full jitter (explained in <a href="#exponential-backoff">Exponential Backoff</a>):</p>
+<pre><code>package retries
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+)
+
+type Policy struct {
+	MaxAttempts int           // including the first try
+	Base, Cap   time.Duration // backoff range, see Exponential Backoff
+	Budget      *Budget       // shared by every call to this dependency
+}
+
+// Do sends the request built by newReq, retrying transient failures.
+// newReq must build a fresh request each time: a body can only be read once.
+func Do(
+	ctx context.Context, c *http.Client, p Policy,
+	newReq func(context.Context) (*http.Request, error),
+) (*http.Response, error) {
+	for attempt := 1; ; attempt++ {
+		req, err := newReq(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !idempotent(req) {
+			return c.Do(req) // never retry what might charge a card twice
+		}
+		resp, err := c.Do(req)
+		if !retryable(resp, err) {
+			p.Budget.Success()
+			return resp, err
+		}
+		if !p.Budget.Failure() || attempt == p.MaxAttempts {
+			return resp, err // out of attempts or budget: return the last result as is
+		}
+		wait := backoff(p.Base, p.Cap, attempt)
+		if resp != nil {
+			if ra, ok := retryAfter(resp); ok {
+				wait = ra // the server knows better than our formula
+			}
+			io.Copy(io.Discard, resp.Body) // drain so the connection can be reused
+			resp.Body.Close()
+		}
+		if d, ok := ctx.Deadline(); ok &amp;&amp; time.Until(d) &lt; wait {
+			return nil, fmt.Errorf("attempt %d: %w (no time left to retry)",
+				attempt, errOrStatus(resp, err))
+		}
+		select {
+		case &lt;-time.After(wait):
+		case &lt;-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func idempotent(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
+		return true
+	}
+	return r.Header.Get("Idempotency-Key") != "" // the server deduplicates for us
+}
+
+func retryable(resp *http.Response, err error) bool {
+	if err != nil {
+		// Our own deadline or cancellation: the caller gave up, so stop.
+		return !errors.Is(err, context.Canceled) &amp;&amp; !errors.Is(err, context.DeadlineExceeded)
+	}
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false // 2xx, 3xx, other 4xx (a bad request stays bad), 500 (often a bug)
+}
+
+// retryAfter reads the delay-seconds form; the HTTP-date form is left out.
+func retryAfter(resp *http.Response) (time.Duration, bool) {
+	s, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || s &lt; 0 {
+		return 0, false
+	}
+	return time.Duration(s) * time.Second, true
+}
+
+// Full jitter: a random wait between 0 and min(cap, base*2^(attempt-1)).
+func backoff(base, cap time.Duration, attempt int) time.Duration {
+	d := cap
+	if attempt &lt; 31 &amp;&amp; base&lt;&lt;(attempt-1) &lt; cap {
+		d = base &lt;&lt; (attempt - 1)
+	}
+	return rand.N(d)
+}
+
+func errOrStatus(resp *http.Response, err error) error {
+	if err != nil {
+		return err
+	}
+	return errors.New(resp.Status)
+}
+
+// Budget is a retry token bucket in the style of gRPC retry throttling:
+// failures cost 1 token, successes earn back ratio, and retries stop
+// while the bucket is at or below half full.
+type Budget struct {
+	mu                 sync.Mutex
+	tokens, max, ratio float64
+}
+
+func NewBudget(max, ratio float64) *Budget {
+	return &amp;Budget{tokens: max, max: max, ratio: ratio}
+}
+
+// Failure records a failed attempt and reports whether a retry is allowed.
+func (b *Budget) Failure() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tokens = max(b.tokens-1, 0)
+	return b.tokens &gt; b.max/2
+}
+
+func (b *Budget) Success() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tokens = min(b.tokens+b.ratio, b.max)
+}</code></pre>
+<p>The test runs it against <code>httptest</code> servers. The first <code>503</code> carries <code>Retry-After: 1</code>, so the loop waits a full second; the second <code>503</code> has no header, so it backs off for a few milliseconds (base 20 ms in the test). Real output:</p>
+<pre><code>$ go test -v
+=== RUN   TestRetries
+GET, two 503s then 200:
+  server: GET attempt 1 at t=0.0s -&gt; 503
+  server: GET attempt 2 at t=1.0s -&gt; 503
+  server: GET attempt 3 at t=1.0s -&gt; 200
+  result: 200 OK
+GET, 400 Bad Request:
+  server: GET attempt 1 at t=0.0s -&gt; 400
+  result: 400 Bad Request
+POST without Idempotency-Key, 503:
+  server: POST attempt 1 at t=0.0s -&gt; 503
+  result: 503 Service Unavailable
+POST with Idempotency-Key, 503:
+  server: POST attempt 1 at t=0.0s -&gt; 503
+  server: POST attempt 2 at t=1.0s -&gt; 200
+  result: 200 OK
+--- PASS: TestRetries (2.03s)
+=== RUN   TestBudget
+20 calls to a dead dependency, max 3 attempts each:
+  server saw 23 requests (60 without a budget)
+--- PASS: TestBudget (0.01s)</code></pre>
+<p>The <code>400</code> is returned at once, the <code>POST</code> without a key is never repeated, and the same <code>POST</code> with an <code>Idempotency-Key</code> is. Against a dependency that is completely down, the budget lets the first two calls retry and then stops retrying: 23 requests instead of 60.</p>
+
+<p><strong>Real-world scenario.</strong> An inventory service runs on 6 pods behind a load balancer, and the orders service calls it 2,000 times per second. During a deploy, each pod restart resets a few hundred in-flight connections. With a single retry on <code>GET /stock</code>, those requests land on another pod and users never notice. A week later the inventory database runs out of connections at 09:12 and every query fails for 4 minutes. The gateway, the orders service and an SDK inside orders each retry 3 times, so the 2,000 requests per second become up to 2,000 × 27 = 54,000 attempts per second against inventory, and the database can't recover even after the connection leak is fixed. The fix from the postmortem: retries only in orders, at most 3 attempts with jittered backoff, a retry budget, and a <a href="#circuit-breakers">circuit breaker</a> that stops calling inventory while it's failing.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Retrying non-idempotent operations.</strong> A timed-out <code>POST /charges</code> may have succeeded. Retry it only with an <a href="#idempotency">idempotency key</a> the server deduplicates on.</li>
+  <li><strong>Retrying at every layer.</strong> Amplification is exponential in depth. Retry at one layer and make sure libraries, meshes and gateways aren't also retrying.</li>
+  <li><strong>Retrying without a budget.</strong> Per-call limits still multiply traffic when everything fails. Use a budget (gRPC <code>retryThrottling</code>, a token bucket) or a <a href="#circuit-breakers">circuit breaker</a>.</li>
+  <li><strong>Retrying immediately, in sync.</strong> Thousands of clients that failed together retry together. Add exponential backoff with jitter, and honour <code>Retry-After</code>.</li>
+  <li><strong>Retrying permanent errors.</strong> A <code>400</code> or a validation error will never succeed. Retrying it hides the bug and burns capacity.</li>
+  <li><strong>Ignoring the deadline.</strong> Sleeping 2 s before an attempt that has 500 ms left wastes resources and the user's time. Stop when the context is done.</li>
+  <li><strong>Reusing a consumed request body.</strong> An <code>http.Request</code> body is a stream; after the first attempt it is empty. Build a new request per attempt (as above) or set <code>GetBody</code>.</li>
+  <li><strong>Not draining the response.</strong> Close (and ideally drain) the body of a failed response before retrying, or the connection can't go back to the pool.</li>
+  <li><strong>Invisible retries.</strong> Log or count every retry as a <a href="#metrics">metric</a>. A rising retry rate is often the first sign that a dependency is degrading, long before errors reach users.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Retry only transient failures (network errors, <code>429</code>, <code>502</code>–<code>504</code>, gRPC <code>UNAVAILABLE</code>), and only operations that are safe to repeat.</li>
+  <li>Cap attempts per call (2–3) <em>and</em> retries across calls (a budget), and wait with jittered backoff or <code>Retry-After</code>.</li>
+  <li>Retry at one layer only; 3 attempts at 3 layers is 27× load at the bottom.</li>
+  <li>Stay inside the caller's deadline, and stop as soon as the context is done.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#exponential-backoff">Exponential Backoff</a> · <a href="#idempotency">Idempotency</a> · <a href="#timeouts">Timeouts</a> · <a href="#circuit-breakers">Circuit Breakers</a> · <a href="#rate-limiting">Rate Limiting</a> · <a href="#real-world-resilience-playbook">Real-World Resilience Playbook</a></p>
+`;
+
