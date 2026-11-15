@@ -952,3 +952,349 @@ PASS</code></pre>
 
 <p><strong>Related:</strong> <a href="#pub-sub">Pub/Sub</a> · <a href="#message-queues">Message Queues</a> · <a href="#saga-pattern">Saga Pattern</a> · <a href="#idempotency">Idempotency</a> · <a href="#eventual-consistency">Eventual Consistency</a> · <a href="#real-world-async-pipeline">Real-World Async Pipeline</a></p>
 `;
+CONTENT["dead-letter-queues"] = `
+<p class="tldr"><strong>TL;DR</strong>: A dead-letter queue (DLQ) is where messages go after they have failed too many times. Instead of being retried forever, a "poison" message is moved aside with its error and attempt count, the rest of the queue keeps flowing, someone is alerted, and after a fix the message is <strong>redriven</strong> back. It's the post office's undeliverable-mail desk: one bad address doesn't stop the van, and the letter isn't thrown away.</p>
+
+<h2>The problem it solves</h2>
+<p>A <a href="#message-queues">queue</a> redelivers any message that isn't acked. That's what makes it reliable, and also what makes one bad message dangerous. A <strong>poison message</strong> is one that fails every time: a payload your code can't parse, an order for a product that was deleted, an input that hits a bug. Without a limit:</p>
+<ul>
+  <li><strong>It never leaves.</strong> Every visibility timeout, it comes back and fails again. Each one costs a consumer slot, a log line, maybe a call to a downstream service.</li>
+  <li><strong>It piles up.</strong> One poison message per hour is 24 a day, all retrying forever. Soon a real share of consumer capacity goes to work that can never succeed.</li>
+  <li><strong>It blocks ordered queues.</strong> In an SQS FIFO message group, a Kafka partition, or any consumer that processes in order, nothing behind the poison message is delivered. One bad order stops every later order in its group.</li>
+  <li><strong>It hides in the noise.</strong> The error repeats thousands of times in the logs, and the one actionable fact ("order 4411 has a malformed amount") gets lost.</li>
+</ul>
+<p>The fix is simple: count attempts, stop at a limit, move the message somewhere visible, and alert.</p>
+
+<h2>How it works</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 320" role="img" aria-label="The orders stream delivers a message to the billing consumer with an attempt number. On success the consumer acks it. On a transient error it naks, and the broker redelivers it after a delay. On a permanent error, or when attempts reach the maximum, the consumer moves it to the dead-letter queue with the payload, error and attempt count. An alert fires on DLQ depth, and after a fix the message is redriven to the original subject.">
+  <defs><marker id="arr-dlq-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="20" y="110" width="150" height="70" rx="10"/><text x="95" y="140" text-anchor="middle" class="title">orders stream</text><text x="95" y="160" text-anchor="middle" class="small">counts deliveries</text>
+  <rect class="box" x="330" y="110" width="160" height="70" rx="10"/><text x="410" y="140" text-anchor="middle" class="title">billing consumer</text><text x="410" y="160" text-anchor="middle" class="small">classifies the error</text>
+  <path class="line" d="M170 128 H328" marker-end="url(#arr-dlq-1)"/><text x="250" y="120" text-anchor="middle" class="small">deliver (attempt n)</text>
+  <path class="line bad dashed" d="M330 162 H172" marker-end="url(#arr-dlq-1)"/><text x="250" y="180" text-anchor="middle" class="small">transient, n &lt; max:</text><text x="250" y="194" text-anchor="middle" class="small">nak, redeliver after a delay</text>
+
+  <rect class="box ok" x="580" y="20" width="180" height="50" rx="10"/><text x="670" y="42" text-anchor="middle" class="title">ack</text><text x="670" y="59" text-anchor="middle" class="small">done, removed</text>
+  <path class="line ok" d="M490 122 L578 52" marker-end="url(#arr-dlq-1)"/><text x="520" y="76" text-anchor="middle" class="small">success</text>
+
+  <rect class="box bad" x="580" y="196" width="180" height="62" rx="10"/><text x="670" y="218" text-anchor="middle" class="title">Dead-letter queue</text><text x="670" y="234" text-anchor="middle" class="small">payload + error + attempts</text><text x="670" y="248" text-anchor="middle" class="small">+ source + timestamps</text>
+  <path class="line bad" d="M490 168 L578 216" marker-end="url(#arr-dlq-1)"/><text x="555" y="168" text-anchor="middle" class="small">permanent,</text><text x="555" y="182" text-anchor="middle" class="small">or n = max</text>
+
+  <text x="700" y="280" text-anchor="middle" class="small">alert: depth &gt; 0</text>
+  <path class="line accent dashed" d="M610 258 V302 H95 V182" marker-end="url(#arr-dlq-1)"/>
+  <text x="352" y="294" text-anchor="middle" class="small">after a fix: redrive (re-publish to the original subject)</text>
+</svg>
+<figcaption>Three outcomes per delivery: ack, retry later, or dead-letter. The DLQ is not a trash can: it is a queue with an alert and a way back.</figcaption>
+</figure>
+
+<h3>Retryable or not?</h3>
+<p>Not every failure deserves retries. Retrying a malformed payload five times wastes five attempts and delays the alert. Classify the error in the consumer:</p>
+<table>
+  <tr><th></th><th>Transient: retry with backoff</th><th>Permanent: dead-letter now</th></tr>
+  <tr><td>Examples</td><td>timeout, connection refused, HTTP 503 / 429, deadlock or lock timeout, a dependency briefly down</td><td>can't parse the payload, schema validation fails, unknown customer, HTTP 400 / 404 / 422 from a downstream</td></tr>
+  <tr><td>Will the same input succeed later?</td><td>probably, once the dependency recovers</td><td>no, not without a code or data fix</td></tr>
+  <tr><td>Action</td><td>nak with a growing delay (<a href="#exponential-backoff">exponential backoff</a> + jitter), up to a max</td><td>move to the DLQ on the first attempt, with the reason</td></tr>
+  <tr><td>Mistake to avoid</td><td>retrying immediately: the dependency is still down</td><td>treating every error as retryable "just in case"</td></tr>
+</table>
+<p>When you can't tell, treat it as transient: the attempt limit still catches it. A <em>bug</em> in your code looks transient (it might be a blip) but is permanent until you deploy a fix: that's exactly what the max-attempts limit plus redrive is for.</p>
+
+<h3>What each broker gives you</h3>
+<table>
+  <tr><th>Broker</th><th>How a message gets dead-lettered</th><th>Attempt counter</th><th>Things to know</th></tr>
+  <tr><td>Amazon SQS</td><td>redrive policy on the source queue: after <code>maxReceiveCount</code> receives, the message moves to <code>deadLetterTargetArn</code></td><td><code>Approximate<wbr>ReceiveCount</code> attribute</td><td>the DLQ must be the same type (FIFO for FIFO); redrive back with <code>StartMessageMoveTask</code> (up to 500 msg/s); retention gotcha below</td></tr>
+  <tr><td>RabbitMQ</td><td>dead-letter exchange (DLX) set by policy: on reject/nack with <code>requeue=false</code>, TTL expiry, queue length overflow, or a quorum queue's delivery limit</td><td><code>x-delivery-count</code> (quorum queues), <code>x-death</code> header</td><td>quorum queues default to a delivery limit of 20 since 4.0; dead-lettering is at-most-once unless you enable the at-least-once strategy; a missing DLX silently drops messages</td></tr>
+  <tr><td>Kafka</td><td>no built-in DLQ: the consumer publishes to a retry or dead-letter topic itself, then commits the offset</td><td>your own header</td><td>Kafka Connect sink connectors can do it with <code>errors.tolerance=all</code> and <code>errors.deadletterqueue.topic.name</code></td></tr>
+  <tr><td>NATS JetStream</td><td><code>MaxDeliver</code> stops redelivery (default -1: unlimited); <code>Term()</code> stops it at once. No DLQ stream is created for you</td><td><code>NumDelivered</code> in message metadata</td><td>the server publishes an advisory on <code>$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.&lt;stream&gt;.&lt;consumer&gt;</code>; the message stays in the stream</td></tr>
+  <tr><td>Google Pub/Sub</td><td>dead-letter topic on the subscription, after max delivery attempts (5 to 100, default 5)</td><td><code>CloudPubSubDeadLetter<wbr>SourceDeliveryCount</code> attribute</td><td>the count is best effort; Pub/Sub's service account needs publish and subscribe permissions</td></tr>
+</table>
+
+<div class="callout warn"><strong>SQS: the DLQ clock doesn't restart.</strong> For standard queues, a message's expiry is based on its <em>original</em> enqueue time, which is unchanged when it moves to the DLQ. With 4-day retention on both queues, a message that spent 3 days failing has only 1 day left in the DLQ. AWS recommends a DLQ retention longer than the source queue's; 14 days, the maximum, is a common choice. (FIFO queues do reset the timestamp on the move.)</div>
+
+<h3>Retry topics: delays without blocking</h3>
+<p>Some systems, notably Kafka, can't "nak with a delay": a partition is read in order, so pausing for one message pauses all of them. The common pattern is a chain of topics, each consumed after a fixed delay:</p>
+<p><code>orders</code> &rarr; <code>orders.retry.1m</code> &rarr; <code>orders.retry.10m</code> &rarr; <code>orders.dlq</code></p>
+<p>On failure, the main consumer publishes the message to the first retry topic with an attempt header and commits its offset, so the main topic keeps moving. The retry consumer waits until the message is old enough, then tries again, and so on. The cost: the retried message is now out of order with the rest of its partition. Brokers with per-message delays (SQS visibility timeouts, JetStream's <code>NakWithDelay</code> and <code>BackOff</code>, Google Pub/Sub retry policies) don't need this.</p>
+
+<h3>What to store with a dead letter</h3>
+<ul>
+  <li><strong>The original payload, unchanged</strong>, and its headers. You will redrive it, so don't store a summary.</li>
+  <li><strong>Where it came from</strong>: source queue or subject, partition and offset or sequence number.</li>
+  <li><strong>Why it failed</strong>: the last error message and class (transient or permanent), ideally the error of each attempt.</li>
+  <li><strong>How many attempts</strong>, and when: first-seen and dead-lettered timestamps.</li>
+  <li><strong>Correlation IDs</strong>: order ID, trace ID, so you can jump to the <a href="#distributed-tracing">trace</a> and the logs.</li>
+</ul>
+
+<h3>Ordering consequences</h3>
+<p>Dead-lettering removes a message from the sequence. If <code>OrderPlaced</code> for order 42 goes to the DLQ and <code>OrderCancelled</code> for order 42 succeeds, the consumer has seen a cancel for an order it never placed. Redriving later replays <code>OrderPlaced</code> <em>after</em> the cancel. AWS's own docs say not to use a DLQ with a FIFO queue if breaking the exact order isn't acceptable. Options: make consumers tolerate out-of-order events (versions, "ignore if older"), or when one message for a key is dead-lettered, park the following messages for that key too.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Timeline of an ordered message group with a poison message P at the head. Without a DLQ, P is redelivered every 30 seconds for the whole 5 minutes, and messages m2 to m5 behind it are never delivered. With a limit of 3 attempts, P is moved to the DLQ after about one minute and m2 to m5 are processed right after.">
+  <text x="20" y="54" class="title">no limit</text>
+  <text x="20" y="70" class="small">poison retried forever</text>
+  <rect class="box bad" x="170" y="40" width="36" height="28" rx="4"/><text x="188" y="59" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="228" y="40" width="36" height="28" rx="4"/><text x="246" y="59" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="286" y="40" width="36" height="28" rx="4"/><text x="304" y="59" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="344" y="40" width="36" height="28" rx="4"/><text x="362" y="59" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="402" y="40" width="36" height="28" rx="4"/><text x="420" y="59" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="460" y="40" width="36" height="28" rx="4"/><text x="478" y="59" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="518" y="40" width="36" height="28" rx="4"/><text x="536" y="59" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="576" y="40" width="36" height="28" rx="4"/><text x="594" y="59" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="634" y="40" width="36" height="28" rx="4"/><text x="652" y="59" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="692" y="40" width="36" height="28" rx="4"/><text x="710" y="59" text-anchor="middle" class="small">P</text>
+  <rect class="box muted" x="170" y="78" width="558" height="24" rx="4"/><text x="449" y="94" text-anchor="middle" class="small">m2, m3, m4, m5 wait behind P: never delivered, depth and age keep growing</text>
+
+  <text x="20" y="144" class="title">max 3 attempts</text>
+  <text x="20" y="160" class="small">then dead-letter</text>
+  <rect class="box bad" x="170" y="130" width="36" height="28" rx="4"/><text x="188" y="149" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="228" y="130" width="36" height="28" rx="4"/><text x="246" y="149" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="286" y="130" width="36" height="28" rx="4"/><text x="304" y="149" text-anchor="middle" class="small">P</text>
+  <rect class="box bad" x="330" y="168" width="56" height="26" rx="4"/><text x="358" y="186" text-anchor="middle" class="small">to DLQ</text>
+  <path class="line bad" d="M304 158 L340 168"/>
+  <rect class="box ok" x="350" y="130" width="36" height="28" rx="4"/><text x="368" y="149" text-anchor="middle" class="small">m2</text>
+  <rect class="box ok" x="392" y="130" width="36" height="28" rx="4"/><text x="410" y="149" text-anchor="middle" class="small">m3</text>
+  <rect class="box ok" x="434" y="130" width="36" height="28" rx="4"/><text x="452" y="149" text-anchor="middle" class="small">m4</text>
+  <rect class="box ok" x="476" y="130" width="36" height="28" rx="4"/><text x="494" y="149" text-anchor="middle" class="small">m5</text>
+  <text x="524" y="149" class="small">group flows again; alert fires</text>
+
+  <path class="line" d="M170 220 H740"/>
+  <text x="170" y="238" text-anchor="middle" class="small">0:00</text>
+  <text x="286" y="238" text-anchor="middle" class="small">1:00</text>
+  <text x="402" y="238" text-anchor="middle" class="small">2:00</text>
+  <text x="518" y="238" text-anchor="middle" class="small">3:00</text>
+  <text x="634" y="238" text-anchor="middle" class="small">4:00</text>
+  <text x="740" y="238" text-anchor="middle" class="small">min</text>
+</svg>
+<figcaption>An ordered group (SQS FIFO message group, Kafka partition) with a 30-second redelivery. In an unordered queue the poison message doesn't block others, but it never leaves and keeps eating consumer time.</figcaption>
+</figure>
+
+<h2>Example</h2>
+<p><strong>Scenario.</strong> A billing consumer handles about 3,000 orders an hour. After a release, orders shipping to one new region fail tax calculation, about 1 in 2,000, so roughly 1.5 orders an hour. On a queue with a 30-second visibility timeout and no redrive policy, each bad order is retried twice a minute forever: after a day, 36 bad orders cause 72 failing attempts a minute, and nobody is paged because the error rate looks "small". With a limit of 3 attempts and a DLQ, each bad order costs 3 attempts, lands in the DLQ with its error, and the first one pages the team. After the fix ships, they redrive the DLQ and the 36 orders are billed.</p>
+<p><strong>Code.</strong> NATS JetStream, embedded in the test. JetStream has no DLQ of its own, so the consumer builds one: it reads the delivery count from the message metadata, sends permanent errors straight to a <code>DLQ</code> stream, retries transient errors with a growing delay, and dead-letters after 3 attempts. <code>MaxDeliver</code> is set a little higher as a backstop in case the consumer's own logic fails. The message is acked only <em>after</em> the DLQ publish succeeds, so a failure in between can't lose it.</p>
+<pre><code>package dlq
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+const MaxAttempts = 3
+
+// ErrPermanent marks failures that no retry can fix (bad payload, unknown
+// customer). They skip the retries and go straight to the DLQ.
+var ErrPermanent = errors.New("permanent")
+
+type Handler func(data []byte, attempt uint64) error
+
+// Work processes the "billing" consumer until nothing is left in flight.
+func Work(ctx context.Context, js jetstream.JetStream, handle Handler, log func(string)) error {
+	cons, err := js.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+		Durable:    "billing",
+		AckPolicy:  jetstream.AckExplicitPolicy,
+		AckWait:    30 * time.Second,
+		MaxDeliver: MaxAttempts + 2, // backstop only; the code below decides first
+	})
+	if err != nil {
+		return err
+	}
+	for {
+		batch, err := cons.Fetch(10, jetstream.FetchMaxWait(300*time.Millisecond))
+		if err != nil {
+			return err
+		}
+		n := 0
+		for m := range batch.Messages() {
+			n++
+			if err := process(ctx, js, m, handle, log); err != nil {
+				return err
+			}
+		}
+		if n &gt; 0 {
+			continue
+		}
+		info, err := cons.Info(ctx)
+		if err != nil {
+			return err
+		}
+		if info.NumPending == 0 &amp;&amp; info.NumAckPending == 0 {
+			return nil
+		}
+	}
+}
+
+func process(ctx context.Context, js jetstream.JetStream, m jetstream.Msg, handle Handler, log func(string)) error {
+	meta, err := m.Metadata()
+	if err != nil {
+		return err
+	}
+	attempt := meta.NumDelivered
+	err = handle(m.Data(), attempt)
+	switch {
+	case err == nil:
+		log(fmt.Sprintf("%-4s attempt %d  ok", m.Data(), attempt))
+		return m.Ack()
+	case errors.Is(err, ErrPermanent) || attempt &gt;= MaxAttempts:
+		log(fmt.Sprintf("%-4s attempt %d  %v -&gt; DLQ", m.Data(), attempt, err))
+		dead := nats.NewMsg("dlq.billing")
+		dead.Data = m.Data() // the original payload, unchanged
+		dead.Header.Set("Original-Subject", m.Subject())
+		dead.Header.Set("Original-Seq", strconv.FormatUint(meta.Sequence.Stream, 10))
+		dead.Header.Set("Error", err.Error())
+		dead.Header.Set("Attempts", strconv.FormatUint(attempt, 10))
+		dead.Header.Set("Failed-At", time.Now().UTC().Format(time.RFC3339))
+		if _, err := js.PublishMsg(ctx, dead); err != nil {
+			return m.Nak() // DLQ unavailable: keep the message, try again later
+		}
+		return m.Ack() // only after the DLQ has stored it
+	default:
+		delay := time.Duration(attempt) * 50 * time.Millisecond // short for the demo
+		log(fmt.Sprintf("%-4s attempt %d  %v -&gt; retry in %v", m.Data(), attempt, err, delay))
+		return m.NakWithDelay(delay)
+	}
+}
+
+// Redrive moves every dead letter back to the subject it came from.
+func Redrive(ctx context.Context, js jetstream.JetStream, log func(string)) error {
+	cons, err := js.CreateOrUpdateConsumer(ctx, "DLQ", jetstream.ConsumerConfig{
+		Durable: "redrive", AckPolicy: jetstream.AckExplicitPolicy,
+	})
+	if err != nil {
+		return err
+	}
+	batch, err := cons.Fetch(100, jetstream.FetchMaxWait(300*time.Millisecond))
+	if err != nil {
+		return err
+	}
+	for m := range batch.Messages() {
+		h := m.Headers()
+		log(fmt.Sprintf("redrive %s (seq %s, attempts=%s, error=%q)",
+			m.Data(), h.Get("Original-Seq"), h.Get("Attempts"), h.Get("Error")))
+		if _, err := js.Publish(ctx, h.Get("Original-Subject"), m.Data()); err != nil {
+			return err
+		}
+		if err := m.Ack(); err != nil {
+			return err
+		}
+	}
+	return batch.Error()
+}</code></pre>
+<p>The test publishes five orders: <code>o-2</code> is malformed, <code>o-3</code> hits one timeout, <code>o-4</code> hits a bug until the "fix" flag is set. Then it redrives the DLQ and runs the consumer again:</p>
+<pre><code>package dlq
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+func Example() {
+	ctx := context.Background()
+	dir, _ := os.MkdirTemp("", "dlq")
+	defer os.RemoveAll(dir)
+	ns, _ := server.NewServer(&amp;server.Options{Port: -1, JetStream: true, StoreDir: dir})
+	ns.Start()
+	ns.ReadyForConnections(5 * time.Second)
+	defer ns.Shutdown()
+	nc, _ := nats.Connect(ns.ClientURL())
+	defer nc.Close()
+	js, _ := jetstream.New(nc)
+	js.CreateStream(ctx, jetstream.StreamConfig{Name: "ORDERS", Subjects: []string{"orders.&gt;"}})
+	// Work-queue retention: a dead letter is deleted once the redrive acks it.
+	js.CreateStream(ctx, jetstream.StreamConfig{Name: "DLQ", Subjects: []string{"dlq.&gt;"},
+		Retention: jetstream.WorkQueuePolicy})
+
+	taxBugFixed := false
+	handle := func(data []byte, attempt uint64) error {
+		switch string(data) {
+		case "o-2": // malformed payload: retrying cannot help
+			return fmt.Errorf("parse amount %q: %w", "12,50", ErrPermanent)
+		case "o-3": // a blip: the tax service times out once
+			if attempt == 1 {
+				return errors.New("tax service timeout")
+			}
+		case "o-4": // a bug: every attempt fails until a fix is deployed
+			if !taxBugFixed {
+				return errors.New("tax rule missing for region XY")
+			}
+		}
+		return nil
+	}
+	log := func(s string) { fmt.Println(s) }
+
+	for i := 1; i &lt;= 5; i++ {
+		js.Publish(ctx, "orders.placed", []byte(fmt.Sprintf("o-%d", i)))
+	}
+	if err := Work(ctx, js, handle, log); err != nil {
+		panic(err)
+	}
+	dlq, _ := js.Stream(ctx, "DLQ")
+	info, _ := dlq.Info(ctx)
+	fmt.Println("--- DLQ depth:", info.State.Msgs, "-&gt; alert fires; a fix for the tax rule ships")
+
+	taxBugFixed = true
+	if err := Redrive(ctx, js, log); err != nil {
+		panic(err)
+	}
+	if err := Work(ctx, js, handle, log); err != nil {
+		panic(err)
+	}
+
+	info, _ = dlq.Info(ctx)
+	fmt.Println("--- DLQ depth:", info.State.Msgs)
+}</code></pre>
+<p>Real output from <code>go test</code> (pinned as the example's expected output; also passes under <code>-race</code> and with <code>-count=5</code>):</p>
+<pre><code>o-1  attempt 1  ok
+o-2  attempt 1  parse amount "12,50": permanent -&gt; DLQ
+o-3  attempt 1  tax service timeout -&gt; retry in 50ms
+o-4  attempt 1  tax rule missing for region XY -&gt; retry in 50ms
+o-5  attempt 1  ok
+o-3  attempt 2  ok
+o-4  attempt 2  tax rule missing for region XY -&gt; retry in 100ms
+o-4  attempt 3  tax rule missing for region XY -&gt; DLQ
+--- DLQ depth: 2 -&gt; alert fires; a fix for the tax rule ships
+redrive o-2 (seq 2, attempts=1, error="parse amount &#92;"12,50&#92;": permanent")
+redrive o-4 (seq 4, attempts=3, error="tax rule missing for region XY")
+o-2  attempt 1  parse amount "12,50": permanent -&gt; DLQ
+o-4  attempt 1  ok
+--- DLQ depth: 1</code></pre>
+<ul>
+  <li><strong>Good messages keep flowing.</strong> <code>o-5</code> was processed while <code>o-3</code> and <code>o-4</code> were waiting for their retry.</li>
+  <li><strong>Permanent errors skip the retries.</strong> <code>o-2</code> went to the DLQ on attempt 1.</li>
+  <li><strong>Transient errors recover.</strong> <code>o-3</code> failed once and succeeded on attempt 2. Nothing was dead-lettered and nobody was paged.</li>
+  <li><strong>The bug is capped.</strong> <code>o-4</code> was tried 3 times with growing delays, then dead-lettered with its error and attempt count.</li>
+  <li><strong>Redrive doesn't fix bad data.</strong> After the fix, both dead letters were re-published. <code>o-4</code> now succeeds. <code>o-2</code> is still malformed and goes straight back to the DLQ. It needs a human, a corrected payload, or a decision to discard it.</li>
+</ul>
+<p>Note that the redriven messages are new messages (a new sequence number, attempt 1 again). The consumer must still be <a href="#idempotency">idempotent</a>: if <code>o-4</code> had partly succeeded before failing, the redrive runs it again.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>A DLQ nobody watches.</strong> The most common failure. Messages pile up for weeks, then expire (see the SQS retention warning). Alert on DLQ depth above zero, or on any new message, and route it to the team that owns the consumer (see <a href="#alerts">alerts</a>).</li>
+  <li><strong>Max attempts too low.</strong> <code>maxReceiveCount: 1</code> dead-letters on the first timeout during a 30-second blip. Allow enough attempts, with backoff, to ride out a short outage: 3 to 5 attempts spread over a few minutes is a reasonable start.</li>
+  <li><strong>Max attempts too high, or none.</strong> RabbitMQ classic queues and JetStream (by default) have no limit, and RabbitMQ quorum queues before 4.0 didn't either. Always set one explicitly.</li>
+  <li><strong>Retrying permanent errors.</strong> Five attempts on a malformed payload just delay the alert by the whole backoff schedule. Classify errors and dead-letter permanent ones at once.</li>
+  <li><strong>Losing context.</strong> A DLQ that holds only the payload means someone must reproduce the error from scratch. Store the error, attempts, source position and correlation IDs with it.</li>
+  <li><strong>Blind redrive.</strong> Redriving everything before the fix ships just cycles the messages back into the DLQ. Redriving 50,000 at once can overload the consumer. Redrive after the fix, rate-limited (SQS lets you set messages per second), and check what comes back.</li>
+  <li><strong>The DLQ as a trash can.</strong> Some messages will never be valid. Decide explicitly: fix and redrive, discard with a record of why, or handle manually. Don't leave them to expire silently.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Without an attempt limit, one poison message retries forever, wastes consumers, and blocks ordered queues.</li>
+  <li>Retry transient errors with backoff up to a limit; dead-letter permanent errors immediately.</li>
+  <li>Store the original payload with its error, attempt count, source position and IDs, and ack the original only after the DLQ has it.</li>
+  <li>Alert on DLQ depth, fix the cause, then redrive at a controlled rate. Remember that a dead letter breaks ordering.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#message-queues">Message Queues</a> · <a href="#retries">Retries</a> · <a href="#exponential-backoff">Exponential Backoff</a> · <a href="#idempotency">Idempotency</a> · <a href="#alerts">Alerts</a> · <a href="#real-world-async-pipeline">Real-World Async Pipeline</a></p>
+`;
