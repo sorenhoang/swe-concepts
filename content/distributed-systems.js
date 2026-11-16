@@ -3117,3 +3117,502 @@ after UTC():           false</code></pre>
 
 <p><strong>Related:</strong> <a href="#eventual-consistency">Eventual Consistency</a> · <a href="#distributed-locks">Distributed Locks</a> · <a href="#distributed-transactions">Distributed Transactions</a> · <a href="#replication">Replication</a> · <a href="#cap-theorem">CAP Theorem</a> · <a href="#distributed-tracing">Distributed Tracing</a></p>
 `;
+CONTENT["real-world-distributed-design"] = `
+<p class="tldr"><strong>TL;DR</strong>: A real multi-region service doesn't pick "CP" or "AP" once. It picks per operation. Booking a seat must never double-sell, so it goes to one leader database and fails during a partition. Showing which seats are free can be a few seconds stale, so every region reads its own replica. Payment, seat and ticket are glued together by a <strong>saga</strong>, not a distributed transaction. One background worker runs at a time thanks to a <strong>lease</strong>, and the database rejects a deposed leader's late writes with a <strong>fencing token</strong>. Order comes from version numbers, never from wall clocks. Think of a theatre box office with branches in two cities: either branch can tell you what looks free, but only the main office can sell you a seat.</p>
+
+<h2>The problem it solves</h2>
+<p>The nine pages before this one each describe one tool. Real systems need most of them at once, and the hard part is knowing which tool goes where. This page builds one system and shows every tool doing one job.</p>
+<p>The system: an event-ticketing service with customers in North America and Europe. It runs in two regions, <code>us-east</code> and <code>eu-west</code>. A booking takes a seat, charges a card through an external payment provider and issues a ticket through a separate ticketing service. Requirements, as the business states them:</p>
+<ul>
+  <li><strong>Never sell the same seat twice.</strong> A double sale means a refund, an angry customer at the door and a support ticket.</li>
+  <li><strong>The seat map must load fast everywhere</strong>, including when something is broken. A seat shown as free that is actually taken is fine, as long as the booking step catches it.</li>
+  <li><strong>A customer is never charged without getting a ticket</strong>, even if the ticketing service is down.</li>
+  <li><strong>Abandoned holds are freed.</strong> A customer who opens the payment page holds a seat for a few minutes. If they leave, a background job must free it, exactly once.</li>
+</ul>
+<p>Each of these, done naively, breaks in a known way. A database per region that accepts writes double-sells during a partition. A single global transaction across payment, seats and tickets doesn't exist, because the payment provider won't join your transaction. A cron job on every replica frees holds twice, sometimes after the seat was re-sold. And "last write wins by timestamp" quietly picks the wrong winner when clocks disagree.</p>
+
+<h2>How it works: the architecture</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 370" role="img" aria-label="Two regions. us-east holds the booking API, saga orchestrator, seats database leader, an etcd lease store and the active hold expirer. eu-west holds a booking API that reads a local async replica and forwards bookings to us-east, plus a standby expirer. The saga calls an external payment provider and a ticketing service. A dashed red line marks the inter-region link.">
+  <defs><marker id="arr-rwdd-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box muted" x="10" y="20" width="460" height="250" rx="12"/>
+  <text x="24" y="40" class="title">us-east (primary region)</text>
+  <rect class="box muted" x="500" y="20" width="270" height="250" rx="12"/>
+  <text x="514" y="40" class="title">eu-west</text>
+  <path class="line bad dashed" d="M485 14 V280"/>
+  <rect class="box" x="30" y="80" width="120" height="60" rx="10"/>
+  <text x="90" y="104" text-anchor="middle" class="title">Booking API</text>
+  <text x="90" y="124" text-anchor="middle" class="small">reads + writes</text>
+  <path class="line" d="M150 110 H178" marker-end="url(#arr-rwdd-1)"/>
+  <rect class="box accent" x="180" y="80" width="130" height="60" rx="10"/>
+  <text x="245" y="104" text-anchor="middle" class="title">Saga orchestrator</text>
+  <text x="245" y="124" text-anchor="middle" class="small">hold → charge → ticket</text>
+  <path class="line" d="M310 110 H338" marker-end="url(#arr-rwdd-1)"/>
+  <rect class="box accent" x="340" y="80" width="115" height="60" rx="10"/>
+  <text x="397" y="100" text-anchor="middle" class="title">Seats DB</text>
+  <text x="397" y="116" text-anchor="middle" class="small">LEADER</text>
+  <text x="397" y="130" text-anchor="middle" class="small">version + fence</text>
+  <rect class="box" x="30" y="190" width="120" height="60" rx="10"/>
+  <text x="90" y="214" text-anchor="middle" class="title">etcd</text>
+  <text x="90" y="234" text-anchor="middle" class="small">lease + token</text>
+  <rect class="box ok" x="340" y="190" width="115" height="60" rx="10"/>
+  <text x="397" y="210" text-anchor="middle" class="title">Expirer</text>
+  <text x="397" y="226" text-anchor="middle" class="small">active, holds lease</text>
+  <text x="397" y="240" text-anchor="middle" class="small">writes with token</text>
+  <path class="line ok" d="M397 190 V142" marker-end="url(#arr-rwdd-1)"/>
+  <path class="line" d="M245 140 V282 M170 282 H330"/>
+  <path class="line" d="M170 282 V293" marker-end="url(#arr-rwdd-1)"/>
+  <path class="line" d="M330 282 V293" marker-end="url(#arr-rwdd-1)"/>
+  <rect class="box" x="100" y="295" width="140" height="60" rx="10"/>
+  <text x="170" y="319" text-anchor="middle" class="title">Payment provider</text>
+  <text x="170" y="339" text-anchor="middle" class="small">Idempotency-Key</text>
+  <rect class="box" x="260" y="295" width="140" height="60" rx="10"/>
+  <text x="330" y="319" text-anchor="middle" class="title">Ticketing service</text>
+  <text x="330" y="339" text-anchor="middle" class="small">can fail → compensate</text>
+  <rect class="box" x="520" y="80" width="230" height="60" rx="10"/>
+  <text x="635" y="100" text-anchor="middle" class="title">Booking API</text>
+  <text x="635" y="116" text-anchor="middle" class="small">seat map: local replica (AP)</text>
+  <text x="635" y="130" text-anchor="middle" class="small">bookings: forwarded (CP)</text>
+  <path class="line" d="M560 80 V58 H245 V78" marker-end="url(#arr-rwdd-1)"/>
+  <text x="330" y="52" text-anchor="middle" class="small">eu bookings go to the leader</text>
+  <rect class="box" x="520" y="158" width="230" height="44" rx="10"/>
+  <text x="635" y="178" text-anchor="middle" class="title">Seats replica</text>
+  <text x="635" y="194" text-anchor="middle" class="small">async follower, lag in seconds</text>
+  <path class="line accent dashed" d="M455 125 H470 V180 H518" marker-end="url(#arr-rwdd-1)"/>
+  <text x="464" y="165" text-anchor="end" class="small">log</text>
+  <path class="line" d="M635 158 V142" marker-end="url(#arr-rwdd-1)"/>
+  <rect class="box muted" x="520" y="214" width="230" height="44" rx="10"/>
+  <text x="635" y="234" text-anchor="middle" class="title">Expirer (standby)</text>
+  <text x="635" y="250" text-anchor="middle" class="small">campaigns for the lease</text>
+  <text x="520" y="300" class="small">Red dashed line: the us-east ↔ eu-west link.</text>
+  <text x="520" y="316" class="small">Everything that crosses it can be cut.</text>
+  <text x="520" y="340" class="small">Only the leader DB decides who owns a seat.</text>
+</svg>
+<figcaption>One writer for seats (the leader in us-east), one copy per region for reading, one orchestrator that owns the booking flow, and one active background worker chosen by a lease. Every arrow that crosses the red line is a place where the partition in the next section bites.</figcaption>
+</figure>
+
+<p>Each piece has its own page with the details. This page only shows how they fit together:</p>
+<ol>
+  <li><strong>One leader for seats, async followers for reading</strong>: <a href="#replication">Replication</a>. Writes go to one node, so there is one order of events per seat. The follower in eu-west makes the seat map fast and keeps it up during a partition, at the cost of lag.</li>
+  <li><strong>Pick the guarantee per operation</strong>: <a href="#cap-theorem">CAP Theorem</a>. During a partition, eu-west can either answer from its stale copy or refuse. The answer is different for "show the seat map" and "book this seat".</li>
+  <li><strong>Make stale reads harmless</strong>: <a href="#eventual-consistency">Eventual Consistency</a>. The seat map shows "as of" data. After you book, your own page reads from the leader (read-your-writes), so you never see your own seat as free.</li>
+  <li><strong>No global transaction</strong>: <a href="#distributed-transactions">Distributed Transactions</a>. The payment provider won't take part in a two-phase commit, and 2PC blocks when its coordinator dies. So the booking is a sequence of local steps.</li>
+  <li><strong>The sequence with undo steps</strong>: <a href="#saga-pattern">Saga Pattern</a>. Hold the seat, charge the card, issue the ticket. If ticketing fails, refund and release, in reverse order.</li>
+  <li><strong>The seat hold is a lock with a timeout</strong>: <a href="#distributed-locks">Distributed Locks</a>. A <code>HELD</code> row with a deadline, set by a conditional write on the leader. It lives in the same database as the seat, so the lock and the data can't disagree.</li>
+  <li><strong>One expirer at a time</strong>: <a href="#leader-election">Leader Election</a>. The expirer that frees abandoned holds runs only while it holds an etcd lease. A new holder gets a bigger token, and the database refuses writes with an older one.</li>
+  <li><strong>Assume the link will drop</strong>: <a href="#network-partitions">Network Partitions</a>. Majority-based stores (etcd, and the database's own failover) keep working on the side with the majority. The other side stops writing.</li>
+  <li><strong>Order without clocks</strong>: <a href="#clock-skew">Clock Skew</a>. Seat changes are ordered by the leader's commit version. Events merged from both regions (an audit trail, say) carry hybrid logical clock timestamps, not raw <code>time.Now()</code>.</li>
+</ol>
+<p>The glue is the same as in the <a href="#real-world-async-pipeline">async pipeline</a> and the <a href="#real-world-resilience-playbook">resilience playbook</a>: every cross-region call has a <a href="#timeouts">timeout</a>, and every step that can be retried is <a href="#idempotency">idempotent</a>. The saga charges the card with the order ID as the idempotency key, so a retried charge doesn't charge twice.</p>
+
+<h3>Decisions per operation</h3>
+<p>This table is the heart of the design. Write it down for your own system before you pick databases. Product names in the last column are examples of where each setting lives; the behaviour is what matters.</p>
+<table>
+  <tr><th>Operation</th><th>Guarantee</th><th>During a partition</th><th>Why</th><th>How you'd configure it</th></tr>
+  <tr><td>Book a seat (hold, then confirm)</td><td>Linearizable on the seat (CP)</td><td>Only the leader's side books. eu-west returns 503 "try again".</td><td>A double sale costs more than a lost sale. A customer can retry in a minute.</td><td>Single leader + conditional update on a version column. In Cassandra, a lightweight transaction (<code>IF</code>, Paxos). In DynamoDB, an MRSC global table, or a single-region table for this data.</td></tr>
+  <tr><td>Show the seat map</td><td>Eventual (AP), with an "as of" version</td><td>Each region serves its own copy, which gets staler.</td><td>A stale map only costs a "sorry, just taken" at booking time.</td><td>Read from the local follower or cache. DynamoDB: eventually consistent read; Cassandra: <code>LOCAL_ONE</code>.</td></tr>
+  <tr><td>"My bookings" right after paying</td><td>Read-your-writes</td><td>Served from the leader if reachable; otherwise shows "confirming…".</td><td>Users panic if a seat they just bought vanishes.</td><td>Route the user's reads to the leader for a short time, or until the replica has the version token returned by the write.</td></tr>
+  <tr><td>Charge the card</td><td>Exactly-once effect</td><td>Global provider; retry with the same key.</td><td>A double charge is worse than a slow one.</td><td>Idempotency key = order ID.</td></tr>
+  <tr><td>Free abandoned holds</td><td>One active worker, fenced</td><td>The side that keeps the etcd majority runs it.</td><td>Two workers can free a seat that was just re-sold.</td><td>etcd lease (or a Kubernetes Lease) + token checked by the database.</td></tr>
+  <tr><td>Audit trail across regions</td><td>Causal order</td><td>Each region appends locally, merged later.</td><td>Support needs "what happened first" to be right.</td><td>Hybrid logical clock on each event; never sort by wall clock alone.</td></tr>
+</table>
+<div class="callout warn"><strong>Where the lease store's majority lives decides who keeps working.</strong> In the example, the etcd group has its majority in us-east, so eu-west can never hold the lease during a partition. If us-east itself goes down, nobody can elect a new expirer either. Production setups put an odd number of members across three regions (for example 2 + 2 + 1) so any single region can fail. DynamoDB's multi-Region strong consistency uses the same idea: it must be deployed in exactly three Regions, where the third can be a "witness" that stores data but serves no reads or writes.</div>
+
+<h3>Which tool answers which problem</h3>
+<table>
+  <tr><th>Problem</th><th>Tool</th><th>What it costs</th><th>Depth</th></tr>
+  <tr><td>Two regions sell the same seat</td><td>Single leader for seats; conditional writes on a version</td><td>eu-west bookings pay a cross-region round trip, and stop during a partition</td><td><a href="#replication">Replication</a>, <a href="#cap-theorem">CAP</a></td></tr>
+  <tr><td>The seat map is slow or down in eu-west</td><td>Async follower in each region</td><td>Stale reads; lag must be measured and shown</td><td><a href="#eventual-consistency">Eventual Consistency</a></td></tr>
+  <tr><td>Charged but no ticket</td><td>Orchestrated saga with compensations</td><td>No isolation: others can see a seat as HELD mid-saga</td><td><a href="#saga-pattern">Saga Pattern</a></td></tr>
+  <tr><td>Wanting one ACID transaction over payment + seats</td><td>Don't. 2PC needs every party to support it and blocks on coordinator failure</td><td>Design for compensation instead</td><td><a href="#distributed-transactions">Distributed Transactions</a></td></tr>
+  <tr><td>Two customers grab the last seat at once</td><td>A hold row with a deadline (a lock on the seat)</td><td>Holds must expire, so you need an expirer</td><td><a href="#distributed-locks">Distributed Locks</a>, <a href="#optimistic-locking">Optimistic Locking</a></td></tr>
+  <tr><td>The expirer runs twice</td><td>Lease-based election</td><td>Failover waits for the lease to run out</td><td><a href="#leader-election">Leader Election</a></td></tr>
+  <tr><td>A paused or cut-off old leader writes late</td><td>Fencing token checked by the resource</td><td>Every protected write must carry and check it</td><td><a href="#distributed-locks">Distributed Locks</a></td></tr>
+  <tr><td>Split brain after the link drops</td><td>Majority quorums; minority side refuses writes</td><td>The minority side loses write availability</td><td><a href="#network-partitions">Network Partitions</a></td></tr>
+  <tr><td>Events ordered wrong across regions</td><td>Leader's commit version; HLC for merged logs</td><td>Extra metadata on every record</td><td><a href="#clock-skew">Clock Skew</a></td></tr>
+</table>
+
+<h2>The incident: the link drops for 90 seconds</h2>
+<p>At t = 18 s the link between us-east and eu-west drops. Both regions are healthy and serving their own users. They just can't talk to each other. The link comes back at t = 108 s. This is exactly the run in the Go example below, so every event on this timeline is printed there.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 360" role="img" aria-label="Timeline from 0 to 120 seconds. The link is down from 18 to 108 seconds. During that time eu-west bookings fail with 503, eu-west serves a stale seat map, the eu-west expirer's lease runs out at 30 seconds and the us-east expirer takes over at 31 with token 2. us-east users book normally. At 108 seconds the old leader's delayed write with token 1 is rejected and the replica catches up.">
+    <defs><marker id="arr-rwdd-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="160" y="22" class="small">t = seconds since the start of the run (same clock as the Go example)</text>
+  <text x="10" y="58" class="title">Link us ↔ eu</text>
+  <rect class="box ok" x="160" y="40" width="90" height="28" rx="6"/>
+  <rect class="box bad" x="250" y="40" width="450" height="28" rx="6"/>
+  <text x="475" y="59" text-anchor="middle" class="small">DOWN for 90 s</text>
+  <rect class="box ok" x="700" y="40" width="60" height="28" rx="6"/>
+  <text x="10" y="102" class="title">eu bookings (CP)</text>
+  <rect class="box ok" x="160" y="84" width="90" height="28" rx="6"/>
+  <rect class="box bad" x="250" y="84" width="450" height="28" rx="6"/>
+  <text x="475" y="103" text-anchor="middle" class="small">503 "try again in a minute": nothing is held or charged</text>
+  <rect class="box ok" x="700" y="84" width="60" height="28" rx="6"/>
+  <text x="10" y="146" class="title">eu seat map (AP)</text>
+  <rect class="box ok" x="160" y="128" width="90" height="28" rx="6"/>
+  <rect class="box accent" x="250" y="128" width="450" height="28" rx="6"/>
+  <text x="475" y="147" text-anchor="middle" class="small">served from the replica, stale: shows 12D as HELD, lag grows to 90 s</text>
+  <rect class="box ok" x="700" y="128" width="60" height="28" rx="6"/>
+  <text x="10" y="190" class="title">Expirer lease</text>
+  <rect class="box muted" x="160" y="172" width="150" height="28" rx="6"/>
+  <text x="235" y="191" text-anchor="middle" class="small">eu-west, token 1</text>
+  <rect class="box accent" x="315" y="172" width="445" height="28" rx="6"/>
+  <text x="537" y="191" text-anchor="middle" class="small">us-east, token 2: frees 12D at t=31</text>
+  <text x="10" y="234" class="title">us-east users</text>
+  <rect class="box ok" x="160" y="216" width="600" height="28" rx="6"/>
+  <text x="460" y="235" text-anchor="middle" class="small">book normally: O-4 gets the freed seat 12D at t=50</text>
+  <text x="10" y="278" class="title">Late write</text>
+  <path class="line bad dashed" d="M255 270 H698" marker-end="url(#arr-rwdd-2)"/>
+  <text x="475" y="262" text-anchor="middle" class="small">eu expirer's "free 12D, token 1" from t=19, retried until the link is back</text>
+  <rect class="box bad" x="640" y="280" width="120" height="36" rx="6"/>
+  <text x="700" y="302" text-anchor="middle" class="small">rejected: 1 &lt; 2</text>
+  <path class="line" d="M160 330 H760"/>
+  <path class="line" d="M160 326 V334 M250 326 V334 M310 326 V334 M410 326 V334 M460 326 V334 M700 326 V334"/>
+  <text x="160" y="350" text-anchor="middle" class="small">0</text>
+  <text x="250" y="350" text-anchor="middle" class="small">18</text>
+  <text x="310" y="350" text-anchor="middle" class="small">30</text>
+  <text x="410" y="350" text-anchor="middle" class="small">50</text>
+  <text x="460" y="350" text-anchor="middle" class="small">60</text>
+  <text x="700" y="350" text-anchor="middle" class="small">108</text>
+  <text x="760" y="350" text-anchor="end" class="small">t (s)</text>
+</svg>
+<figcaption>Booking stops in eu-west, the seat map keeps working but goes stale, the lease moves to the side with the etcd majority, and us-east never notices a thing. The only dangerous moment is the bottom row: a write the old leader started before it lost the lease.</figcaption>
+</figure>
+<p>What users see:</p>
+<ul>
+  <li><strong>European users</strong> can browse but not book for 90 seconds. The page says "booking is temporarily unavailable, please retry", which is honest and costs at most a sale.</li>
+  <li><strong>North American users</strong> notice nothing.</li>
+  <li><strong>Nobody</strong> is charged without a ticket, and no seat is sold twice.</li>
+</ul>
+<p>The bottom row is the reason fencing exists. At t = 19 the eu-west expirer decided that hold 12D had expired (it had) and sent "free 12D". The request couldn't cross the link, and its client kept retrying it. Meanwhile its lease ran out, us-east took over with token 2, freed 12D itself, and customer O-4 bought it. At t = 108 the old request finally arrived. Without a fence, it would have marked O-4's seat as free, and the next customer would have bought it again. The database had already seen token 2, so it refused token 1. The old worker stopping at its own lease deadline was not enough: the write was already in flight. That is the general lesson from <a href="#distributed-locks">Distributed Locks</a>: only the resource can tell a stale holder apart, because only the resource sees every write.</p>
+
+<h2>Example</h2>
+<p><strong>A slice of the system, end to end, in one Go package.</strong> It uses only the standard library. The network is a flag that cuts us-east ↔ eu-west. Time is simulated seconds, so the output is the same on every run. <code>World</code> holds the leader seats table (with a commit version and a fence), an etcd-like lease with a token, an async eu-west replica, and a payment provider keyed by order ID. <code>Book</code> is the orchestrated saga; <code>Availability</code> is the AP read; <code>Acquire</code> and <code>FreeSeat</code> are the lease and the fenced write.</p>
+<pre><code>// Package distdesign simulates a two-region booking service in one process.
+// Time is simulated seconds, so every run prints the same thing.
+package distdesign
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+const East, West = "us-east", "eu-west"
+
+var (
+	ErrPartition = errors.New("us-east unreachable")
+	ErrHeld      = errors.New("lease held by another node")
+	ErrStale     = errors.New("stale fencing token")
+)
+
+type Seat struct {
+	State, Order string
+	HeldUntil    int   // for HELD seats
+	Version      int64 // primary's commit number, not a wall-clock time
+}
+
+type change struct {
+	Name string
+	Seat Seat
+}
+
+type World struct {
+	Now         int
+	Partitioned bool // the us-east &lt;-&gt; eu-west link
+
+	// us-east: the leader database and the lease store
+	// (think: a 3-node etcd group with its majority in us-east).
+	seats   map[string]Seat
+	log     []change // committed changes, in version order
+	names   []string
+	version int64
+	fence   int64 // highest fencing token the database has accepted
+	lease   struct {
+		holder string
+		until  int
+		token  int64
+	}
+
+	// eu-west: an async follower of the seats table.
+	replica   map[string]Seat
+	applied   int64
+	appliedAt int
+
+	charged map[string]bool // the payment provider, keyed by order ID
+}
+
+func NewWorld(seats ...string) *World {
+	w := &amp;World{seats: map[string]Seat{}, replica: map[string]Seat{}, charged: map[string]bool{}}
+	for _, s := range seats {
+		w.seats[s] = Seat{State: "FREE"}
+		w.replica[s] = Seat{State: "FREE"}
+	}
+	w.names = seats
+	return w
+}
+
+func (w *World) logf(region, format string, a ...any) {
+	fmt.Printf("t=%3ds %-7s %s&#92;n", w.Now, region, fmt.Sprintf(format, a...))
+}
+
+// reach models the network: within a region always works, across regions
+// only while the link is up.
+func (w *World) reach(from, to string) error {
+	if w.Partitioned &amp;&amp; from != to {
+		return ErrPartition
+	}
+	return nil
+}
+
+// At moves the clock and ships the primary's log to eu-west if the link is up.
+func (w *World) At(t int) {
+	w.Now = t
+	if w.Partitioned {
+		return
+	}
+	for _, c := range w.log {
+		if c.Seat.Version &gt; w.applied {
+			w.replica[c.Name] = c.Seat
+		}
+	}
+	w.applied, w.appliedAt = w.version, w.Now
+}
+
+// commit is the only way to change a seat. It runs on the primary.
+func (w *World) commit(name string, s Seat) {
+	w.version++
+	s.Version = w.version
+	w.seats[name] = s
+	w.log = append(w.log, change{name, s})
+}
+
+// ---- CP operation: booking. Must reach the primary or fail. ----
+
+func (w *World) hold(from, order, seat string) error {
+	if err := w.reach(from, East); err != nil {
+		return err
+	}
+	if s := w.seats[seat]; s.State != "FREE" {
+		return fmt.Errorf("seat %s is %s", seat, s.State)
+	}
+	w.commit(seat, Seat{State: "HELD", Order: order, HeldUntil: w.Now + 8})
+	return nil
+}
+
+func (w *World) release(seat, order string) error {
+	if s := w.seats[seat]; s.Order == order &amp;&amp; s.State == "HELD" {
+		w.commit(seat, Seat{State: "FREE"})
+	}
+	return nil
+}
+
+type step struct {
+	name     string
+	do, undo func() error
+}
+
+// Book is an orchestrated saga: hold seat -&gt; charge card -&gt; issue ticket.
+// A failed step runs the earlier steps' compensations in reverse order.
+func (w *World) Book(from, order, seat string, ticketFails bool) error {
+	steps := []step{
+		{"hold " + seat,
+			func() error { return w.hold(from, order, seat) },
+			func() error { return w.release(seat, order) }},
+		{"charge card",
+			func() error { w.charged[order] = true; return nil }, // idempotent: keyed by order
+			func() error { delete(w.charged, order); return nil }},
+		{"issue ticket",
+			func() error {
+				if ticketFails {
+					return errors.New("ticketing service 500")
+				}
+				w.commit(seat, Seat{State: "BOOKED", Order: order})
+				return nil
+			}, nil},
+	}
+	var done []string
+	for i, s := range steps {
+		if err := s.do(); err != nil {
+			w.logf(from, "%s: %s FAILED (%v)", order, s.name, err)
+			for j := i - 1; j &gt;= 0; j-- {
+				// Real compensations are retried until they succeed.
+				_ = steps[j].undo()
+				w.logf(from, "%s:   compensate %q", order, steps[j].name)
+			}
+			return err
+		}
+		done = append(done, s.name)
+	}
+	w.logf(from, "%s: %s -&gt; BOOKED", order, strings.Join(done, ", "))
+	return nil
+}
+
+// ---- AP operation: show availability from the local copy, stale is OK. ----
+
+func (w *World) Availability(region string) string {
+	src, v, age := w.seats, w.version, 0
+	if region == West {
+		src, v, age = w.replica, w.applied, w.Now-w.appliedAt
+	}
+	var b strings.Builder
+	for _, n := range w.names {
+		fmt.Fprintf(&amp;b, "%s=%s ", n, src[n].State)
+	}
+	return fmt.Sprintf("%s(as of v%d, %ds old)", b.String(), v, age)
+}
+
+// ---- Lease + fencing for the single "hold expirer" worker. ----
+
+// Acquire takes or renews the lease. A new holder gets a bigger token.
+func (w *World) Acquire(from, who string, ttl int) (int64, error) {
+	if err := w.reach(from, East); err != nil {
+		return 0, err
+	}
+	if w.lease.holder != who &amp;&amp; w.Now &lt; w.lease.until {
+		return 0, ErrHeld
+	}
+	if w.lease.holder != who {
+		w.lease.holder = who
+		w.lease.token++
+	}
+	w.lease.until = w.Now + ttl
+	return w.lease.token, nil
+}
+
+// ExpiredHolds is what the expirer scans for, in its own region's copy.
+func (w *World) ExpiredHolds(region string) []string {
+	src := w.seats
+	if region == West {
+		src = w.replica
+	}
+	var out []string
+	for n, s := range src {
+		if s.State == "HELD" &amp;&amp; s.HeldUntil &lt;= w.Now {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// FreeSeat is the expirer's write. The database, not the worker, checks
+// the fencing token: anything older than the newest token seen is refused.
+func (w *World) FreeSeat(from, seat string, token int64) error {
+	if err := w.reach(from, East); err != nil {
+		return err
+	}
+	if token &lt; w.fence {
+		return fmt.Errorf("%w: %d &lt; %d", ErrStale, token, w.fence)
+	}
+	w.fence = token
+	w.commit(seat, Seat{State: "FREE"})
+	return nil
+}</code></pre>
+<p>The scenario is an <code>Example</code> test. It runs the same story as the timeline: two normal bookings (the second one's ticketing fails), an abandoned hold, then the 90-second partition.</p>
+<pre><code>package distdesign
+
+func Example() {
+	w := NewWorld("12A", "12B", "12C", "12D")
+	tok, _ := w.Acquire(West, "expirer@eu-west", 15)
+	w.logf(West, "expirer@eu-west is leader, token %d", tok)
+
+	w.At(5)
+	_ = w.Book(West, "O-1", "12A", false)
+	w.At(8)
+	_ = w.Book(West, "O-2", "12B", true) // ticketing fails: saga compensates
+	w.At(10)
+	_ = w.hold(East, "O-3", "12D") // O-3 abandons checkout; hold ends at t=18
+	w.At(15)
+	_, _ = w.Acquire(West, "expirer@eu-west", 15) // renew: lease until t=30
+
+	w.At(18)
+	w.Partitioned = true
+	w.logf("", "=== link us-east &lt;-&gt; eu-west DOWN for 90 s ===")
+	w.At(19)
+	// The old leader sends its release. The client retries it until the link is back.
+	pending := w.ExpiredHolds(West)[0]
+	w.logf(West, "expirer@eu-west: free %s (token %d) -&gt; %v, will retry", pending, tok, w.FreeSeat(West, pending, tok))
+	w.At(20)
+	_, err := w.Acquire(West, "expirer@eu-west", 15)
+	w.logf(West, "expirer@eu-west: renew -&gt; %v", err)
+	w.At(30)
+	w.logf(West, "expirer@eu-west: lease deadline passed, stops scanning")
+
+	w.At(31)
+	tok2, _ := w.Acquire(East, "expirer@us-east", 15)
+	w.logf(East, "expirer@us-east is leader, token %d", tok2)
+	for _, s := range w.ExpiredHolds(East) {
+		w.logf(East, "expirer@us-east: free %s (token %d) -&gt; %v", s, tok2, w.FreeSeat(East, s, tok2))
+	}
+	w.At(50)
+	_ = w.Book(East, "O-4", "12D", false)
+
+	w.At(60)
+	w.logf(East, "availability: %s", w.Availability(East))
+	w.logf(West, "availability: %s", w.Availability(West))
+	_ = w.Book(West, "O-5", "12C", false) // CP: refuse rather than risk a double sale
+
+	w.At(108)
+	w.Partitioned = false
+	w.logf("", "=== link back up ===")
+	w.logf(West, "expirer@eu-west: retried free %s (token %d) -&gt; %v", pending, tok, w.FreeSeat(West, pending, tok))
+	w.At(109)
+	w.logf(West, "availability: %s", w.Availability(West))
+	w.logf(West, "charged: O-1=%v O-2=%v O-4=%v", w.charged["O-1"], w.charged["O-2"], w.charged["O-4"])
+}</code></pre>
+<p>Real output of <code>go test -v</code> (the <code>// Output:</code> block is pinned, so the test fails if any line changes):</p>
+<pre><code>t=  0s eu-west expirer@eu-west is leader, token 1
+t=  5s eu-west O-1: hold 12A, charge card, issue ticket -&gt; BOOKED
+t=  8s eu-west O-2: issue ticket FAILED (ticketing service 500)
+t=  8s eu-west O-2:   compensate "charge card"
+t=  8s eu-west O-2:   compensate "hold 12B"
+t= 18s         === link us-east &lt;-&gt; eu-west DOWN for 90 s ===
+t= 19s eu-west expirer@eu-west: free 12D (token 1) -&gt; us-east unreachable, will retry
+t= 20s eu-west expirer@eu-west: renew -&gt; us-east unreachable
+t= 30s eu-west expirer@eu-west: lease deadline passed, stops scanning
+t= 31s us-east expirer@us-east is leader, token 2
+t= 31s us-east expirer@us-east: free 12D (token 2) -&gt; &lt;nil&gt;
+t= 50s us-east O-4: hold 12D, charge card, issue ticket -&gt; BOOKED
+t= 60s us-east availability: 12A=BOOKED 12B=FREE 12C=FREE 12D=BOOKED (as of v8, 0s old)
+t= 60s eu-west availability: 12A=BOOKED 12B=FREE 12C=FREE 12D=HELD (as of v5, 42s old)
+t= 60s eu-west O-5: hold 12C FAILED (us-east unreachable)
+t=108s         === link back up ===
+t=108s eu-west expirer@eu-west: retried free 12D (token 1) -&gt; stale fencing token: 1 &lt; 2
+t=109s eu-west availability: 12A=BOOKED 12B=FREE 12C=FREE 12D=BOOKED (as of v8, 0s old)
+t=109s eu-west charged: O-1=true O-2=false O-4=true</code></pre>
+<p>Things to notice:</p>
+<ul>
+  <li><strong>The saga undid what it did, in reverse.</strong> O-2's ticket step failed, so the charge was refunded first and the seat released second. At the end <code>O-2=false</code>: no money kept, and 12B shows <code>FREE</code>.</li>
+  <li><strong>The seat map was stale but available.</strong> At t = 60 eu-west showed 12D as <code>HELD</code> at version 5, 42 s old, while the leader was at version 8 with 12D <code>BOOKED</code>. That's the AP choice working as designed. The version number tells the UI exactly how stale it is.</li>
+  <li><strong>The booking refused rather than guessed.</strong> O-5's hold failed in eu-west with "us-east unreachable". Nothing was held and nothing was charged, because the hold is the first step and the saga stopped there.</li>
+  <li><strong>The lease moved only after it ran out.</strong> eu-west's lease ran to t = 30. us-east got token 2 at t = 31. Real systems leave a bigger gap than 1 s, because the two sides' clocks and timers disagree (see <a href="#clock-skew">Clock Skew</a>).</li>
+  <li><strong>The late write died at the database.</strong> At t = 108 the retried <code>free 12D (token 1)</code> got <code>stale fencing token: 1 &lt; 2</code>. One second later the replica caught up to version 8, and every region agreed on the same seat map.</li>
+</ul>
+<p>What the simulation leaves out, on purpose: the lease store is one struct, not a 3-node Raft group (see <a href="#leader-election">Leader Election</a> for a real one); the saga's state isn't persisted, and its compensations aren't retried (see <a href="#saga-pattern">Saga Pattern</a>); the hold's release doesn't check a fence because only the saga that took the hold can release it.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Calling the whole system "CP" or "AP".</strong> The same service has both behaviours, chosen per operation. Write the decisions table, and test each row with the link cut.</li>
+  <li><strong>Multi-leader for data that must not conflict.</strong> Letting both regions take seat writes and merging later means the merge picks a winner after both customers were told "booked". DynamoDB's default global tables (MREC) resolve concurrent writes to the same item with last writer wins, which is fine for a profile picture and wrong for a seat.</li>
+  <li><strong>Reading your own write from a lagging replica.</strong> The customer pays, the confirmation page reads from eu-west's replica, and the seat looks free. Route that read to the leader, or wait until the replica has the write's version.</li>
+  <li><strong>Treating a saga like a transaction.</strong> Between steps, other requests see the half-done state (a seat <code>HELD</code> by an order that will fail). Design for it: show held seats as unavailable, and give holds a deadline.</li>
+  <li><strong>Compensations that can fail for good.</strong> A refund that errors once and is never retried leaves a charged customer without a ticket. Compensations must be idempotent and retried until they succeed, with an alert if they keep failing.</li>
+  <li><strong>Trusting the lease holder to stop itself.</strong> Its timer can be wrong, its process can pause, and its requests can be queued in a retrying client. Put the token on every write and have the resource check it.</li>
+  <li><strong>An even number of voters.</strong> Two regions with two etcd members each can't elect anyone when the link drops. Use an odd count, with a tie-breaker in a third place.</li>
+  <li><strong>Ordering by <code>time.Now()</code> across machines.</strong> Two regions' clocks can be milliseconds apart (or much more when NTP breaks). Use the leader's version for one item, and logical or hybrid clocks for merged logs.</li>
+  <li><strong>Never having seen the partition happen.</strong> The failure path is code too. Cut the link in staging (see <a href="#chaos-engineering">Chaos Engineering</a>) and check the decisions table row by row.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Decide consistency per operation: bookings go to one leader and fail during a partition; the seat map reads locally and may be stale.</li>
+  <li>Span services with a saga of local steps and idempotent compensations, not a distributed transaction.</li>
+  <li>Use a lease to pick one worker, and a fencing token checked by the resource to stop the old one.</li>
+  <li>Order events with versions and logical clocks, place quorum members so a majority survives a region loss, and rehearse the partition.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#saga-pattern">Saga Pattern</a> · <a href="#replication">Replication</a> · <a href="#cap-theorem">CAP Theorem</a> · <a href="#distributed-locks">Distributed Locks</a> · <a href="#network-partitions">Network Partitions</a> · <a href="#multi-region-deployment">Multi-Region Deployment</a></p>
+`;
+
