@@ -2485,3 +2485,382 @@ B release, still owner? true</code></pre>
 <p><strong>Related:</strong> <a href="#leader-election">Leader Election</a> · <a href="#pessimistic-locking">Pessimistic Locking</a> · <a href="#optimistic-locking">Optimistic Locking</a> · <a href="#clock-skew">Clock Skew</a> · <a href="#network-partitions">Network Partitions</a> · <a href="#cron-jobs">Cron Jobs</a></p>
 `;
 
+CONTENT["network-partitions"] = `
+<p class="tldr"><strong>TL;DR</strong>: A network partition is any situation where some nodes can't exchange messages with others while all of them keep running. It's not only a cut cable: a long GC pause, a broken switch port, a NIC that drops incoming packets or an overloaded node all look the same from the outside. A node can't tell "the other side is dead" from "the other side is fine but I can't hear it". The standard defense is a <strong>majority quorum</strong>: only the side with more than half of the nodes may act, so two sides never act at once.</p>
+
+<h2>The problem it solves</h2>
+<p>The first of the "fallacies of distributed computing" is "the network is reliable". It isn't. In their ACM Queue article "The Network is Reliable" (2014), Peter Bailis and Kyle Kingsbury collected public reports of real partitions. A few of the data points they cite:</p>
+<ul>
+  <li>A Microsoft study of its data center networks (Gill et al., 2011) found an average of <strong>5.2 device failures and 40.8 link failures per day</strong>, with a median of about <strong>59,000 packets lost per failure</strong>. Redundant network paths improved median traffic during failures by only 43%.</li>
+  <li>A study of the CENIC wide-area research network found hundreds of isolating partitions over five years, lasting from minutes to hours.</li>
+  <li>GitHub (2012): a Pacemaker crash during maintenance left the MySQL cluster manager partitioned, followed by a messy failover.</li>
+  <li>A NIC (a Broadcom BCM5709) dropped <em>inbound</em> packets but kept sending. The node's heartbeats still went out, so the spare thought the primary was alive and never took over. The service was down for five hours until a reboot.</li>
+  <li>Elasticsearch clusters elected two primaries at once after long GC pauses, which led to lost and inconsistent writes.</li>
+</ul>
+<p>So the question isn't whether your cluster will be partitioned. It's what the cluster does when it is. Without a plan, the typical outcome is <strong>split brain</strong>: both sides believe they're in charge, both accept writes, and when the network heals one side's work is thrown away or must be merged by hand.</p>
+
+<h2>How it works</h2>
+<h3>What a partition really looks like</h3>
+<p>Textbooks draw a clean line through the cluster. Real partitions are often messier:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Four kinds of partition. Clean split: two groups that can't talk. Partial: A talks to B and B talks to C, but A can't reach C. Asymmetric: A's messages reach B, but B's replies to A are lost. Paused process: B is frozen by a GC pause or VM stall, so it looks dead and later wakes up believing nothing happened.">
+  <defs><marker id="arr-np-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="97" y="20" text-anchor="middle" class="title">Clean split</text>
+  <ellipse class="box" cx="55" cy="80" rx="22" ry="18"/><text x="55" y="85" text-anchor="middle">A</text>
+  <ellipse class="box" cx="55" cy="150" rx="22" ry="18"/><text x="55" y="155" text-anchor="middle">B</text>
+  <ellipse class="box" cx="145" cy="80" rx="22" ry="18"/><text x="145" y="85" text-anchor="middle">C</text>
+  <ellipse class="box" cx="145" cy="150" rx="22" ry="18"/><text x="145" y="155" text-anchor="middle">D</text>
+  <path class="line" d="M55 98 V132"/><path class="line" d="M145 98 V132"/>
+  <path class="line bad dashed" d="M100 50 V185"/>
+  <text x="97" y="210" text-anchor="middle" class="small">two groups, no link</text>
+  <text x="97" y="226" text-anchor="middle" class="small">between them</text>
+
+  <text x="292" y="20" text-anchor="middle" class="title">Partial</text>
+  <ellipse class="box" cx="235" cy="80" rx="22" ry="18"/><text x="235" y="85" text-anchor="middle">A</text>
+  <ellipse class="box" cx="292" cy="150" rx="22" ry="18"/><text x="292" y="155" text-anchor="middle">B</text>
+  <ellipse class="box" cx="349" cy="80" rx="22" ry="18"/><text x="349" y="85" text-anchor="middle">C</text>
+  <path class="line ok" d="M247 95 L280 135"/><path class="line ok" d="M337 95 L304 135"/>
+  <path class="line bad dashed" d="M257 80 H327"/>
+  <text x="292" y="72" text-anchor="middle" class="small">A to C lost</text>
+  <text x="292" y="210" text-anchor="middle" class="small">B sees both; A and C</text>
+  <text x="292" y="226" text-anchor="middle" class="small">each think the other died</text>
+
+  <text x="487" y="20" text-anchor="middle" class="title">Asymmetric</text>
+  <ellipse class="box" cx="430" cy="110" rx="22" ry="18"/><text x="430" y="115" text-anchor="middle">A</text>
+  <ellipse class="box" cx="544" cy="110" rx="22" ry="18"/><text x="544" y="115" text-anchor="middle">B</text>
+  <path class="line ok" d="M452 100 H520" marker-end="url(#arr-np-1)"/>
+  <path class="line bad dashed" d="M522 122 H454" marker-end="url(#arr-np-1)"/>
+  <text x="487" y="90" text-anchor="middle" class="small">A to B works</text>
+  <text x="487" y="142" text-anchor="middle" class="small">B to A lost</text>
+  <text x="487" y="210" text-anchor="middle" class="small">B gets heartbeats from A</text>
+  <text x="487" y="226" text-anchor="middle" class="small">but A never hears B</text>
+
+  <text x="682" y="20" text-anchor="middle" class="title">Paused process</text>
+  <ellipse class="box" cx="625" cy="110" rx="22" ry="18"/><text x="625" y="115" text-anchor="middle">A</text>
+  <ellipse class="box muted" cx="739" cy="110" rx="22" ry="18"/><text x="739" y="115" text-anchor="middle">B</text>
+  <path class="line dashed" d="M647 110 H715" marker-end="url(#arr-np-1)"/>
+  <text x="682" y="100" text-anchor="middle" class="small">no reply</text>
+  <text x="739" y="148" text-anchor="middle" class="small">GC / VM stall</text>
+  <text x="682" y="210" text-anchor="middle" class="small">B wakes up 20 s later and</text>
+  <text x="682" y="226" text-anchor="middle" class="small">acts on stale beliefs</text>
+</svg>
+<figcaption>From inside a node, all four look identical: messages from some peers stopped arriving. A timeout can't tell a dead peer from a slow, paused or unreachable one.</figcaption>
+</figure>
+<p>The partial and asymmetric cases are the dangerous ones. Algorithms that assume "if I can't hear you, you can't hear me" make bad decisions there: a node that receives heartbeats but whose replies are lost keeps being considered healthy by one side and dead by the other. The paused process is sneaky in another way. A node that froze for 20 s doesn't know it froze. It resumes mid-operation, still believing it holds a lease or leads the cluster.</p>
+
+<h3>Detecting a partition: you only have timeouts</h3>
+<p>There's no message that says "you are partitioned". Nodes notice missing heartbeats or failed requests and declare a peer dead after a timeout (see <a href="#timeouts">Timeouts</a> and <a href="#health-checks">Health Checks</a>). The timeout is always a guess:</p>
+<ul>
+  <li><strong>Too short</strong>, and a GC pause or a burst of packet loss triggers a failover the cluster didn't need. Failovers aren't free: leaders change, caches go cold, clients retry. A flapping detector can cause more downtime than it prevents.</li>
+  <li><strong>Too long</strong>, and a dead node keeps its role for that long, so writes stall.</li>
+</ul>
+<p>The <strong>phi accrual failure detector</strong> (Hayashibara et al., 2004) replaces a fixed timeout with a suspicion level φ computed from the recent distribution of heartbeat gaps. A node with jittery heartbeats needs a longer silence before it's suspected. Cassandra and Akka use it. Cassandra's <code>phi_convict_threshold</code> defaults to 8, and its docs suggest raising it to 10 or 12 on networks with frequent congestion, such as some cloud environments.</p>
+
+<h3>Split brain, and the majority rule that prevents it</h3>
+<p>Say a five-node cluster splits into {n1, n2} and {n3, n4, n5}, and n1 was the leader. If every side that loses sight of the leader may elect its own, the majority side elects n3. Now n1 and n3 both accept writes. When the network heals, one of them must give way, and its writes are lost or must be merged by hand.</p>
+<p>The fix is a rule both sides can apply without talking: <strong>you may elect a leader or commit a write only with votes or acks from a majority of the full cluster</strong>, more than half of all nodes, not of the nodes you can see. Two disjoint groups can't both hold a majority, so at most one side makes progress.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 330" role="img" aria-label="Five nodes split 2 and 3. Top row, without quorum: n1 stays leader in term 1 and accepts write b; n3 becomes leader in term 2 and accepts write c. Two leaders, split brain, write b is lost on heal. Bottom row, with majority quorum: n1 still thinks it leads but write b fails with 2 of 5 acks; n3 wins term 2 with 3 votes and commits c. On heal n1 sees term 2 and steps down; nothing is lost.">
+  <text x="390" y="20" text-anchor="middle" class="title">Without a quorum rule: split brain</text>
+  <rect class="box bad" x="20" y="32" width="300" height="110" rx="10"/>
+  <rect class="box ok" x="360" y="32" width="400" height="110" rx="10"/>
+  <path class="line bad dashed" d="M340 30 V145"/>
+  <ellipse class="box accent" cx="90" cy="72" rx="34" ry="18"/><text x="90" y="77" text-anchor="middle">n1 L</text>
+  <ellipse class="box" cx="200" cy="72" rx="34" ry="18"/><text x="200" y="77" text-anchor="middle">n2</text>
+  <text x="170" y="112" text-anchor="middle" class="small">leader in term 1, accepts write b</text>
+  <text x="170" y="128" text-anchor="middle" class="small">(only 2 of 5 nodes have it)</text>
+  <ellipse class="box accent" cx="440" cy="72" rx="34" ry="18"/><text x="440" y="77" text-anchor="middle">n3 L</text>
+  <ellipse class="box" cx="560" cy="72" rx="34" ry="18"/><text x="560" y="77" text-anchor="middle">n4</text>
+  <ellipse class="box" cx="680" cy="72" rx="34" ry="18"/><text x="680" y="77" text-anchor="middle">n5</text>
+  <text x="560" y="112" text-anchor="middle" class="small">new leader in term 2, accepts write c</text>
+  <text x="560" y="128" text-anchor="middle" class="small">on heal, n1 yields and write b is lost</text>
+
+  <text x="390" y="180" text-anchor="middle" class="title">With a majority quorum (3 of 5)</text>
+  <rect class="box muted" x="20" y="192" width="300" height="110" rx="10"/>
+  <rect class="box ok" x="360" y="192" width="400" height="110" rx="10"/>
+  <path class="line bad dashed" d="M340 190 V305"/>
+  <ellipse class="box" cx="90" cy="232" rx="34" ry="18"/><text x="90" y="237" text-anchor="middle">n1 L?</text>
+  <ellipse class="box" cx="200" cy="232" rx="34" ry="18"/><text x="200" y="237" text-anchor="middle">n2</text>
+  <text x="170" y="272" text-anchor="middle" class="small">n1 still thinks it leads, but write b</text>
+  <text x="170" y="288" text-anchor="middle" class="small">gets 2 of 5 acks: not committed</text>
+  <ellipse class="box accent" cx="440" cy="232" rx="34" ry="18"/><text x="440" y="237" text-anchor="middle">n3 L</text>
+  <ellipse class="box" cx="560" cy="232" rx="34" ry="18"/><text x="560" y="237" text-anchor="middle">n4</text>
+  <ellipse class="box" cx="680" cy="232" rx="34" ry="18"/><text x="680" y="237" text-anchor="middle">n5</text>
+  <text x="560" y="272" text-anchor="middle" class="small">n3 wins term 2 with 3 votes, commits c</text>
+  <text x="560" y="288" text-anchor="middle" class="small">on heal n1 sees term 2, steps down; nothing lost</text>
+  <text x="390" y="322" text-anchor="middle" class="small">This is exactly what the Go example below prints.</text>
+</svg>
+<figcaption>The quorum rule doesn't stop the old leader from <em>believing</em> it leads. It stops that belief from doing damage: without a majority of acks, nothing it does is committed.</figcaption>
+</figure>
+<p>This is how Raft, Zab (ZooKeeper), Paxos and MongoDB replica set elections behave. The <strong>term</strong> (Raft), <strong>epoch</strong> (Zab) or <strong>ballot</strong> (Paxos) number matters as much as the majority. Every message carries the sender's term. A node that sees a higher term knows its own view is stale, so an old leader that wakes up and contacts anyone from the new majority learns it has been replaced and steps down. See <a href="#leader-election">Leader Election</a>.</p>
+
+<h3>Cluster size: why odd numbers</h3>
+<table>
+  <tr><th>Nodes</th><th>Majority</th><th>Failures or cut-off nodes tolerated</th><th>Note</th></tr>
+  <tr><td>1</td><td>1</td><td>0</td><td>No partition possible, no fault tolerance either.</td></tr>
+  <tr><td>2</td><td>2</td><td>0</td><td>Worse than 1: either node failing stops writes. Needs a witness or external tie-breaker.</td></tr>
+  <tr><td>3</td><td>2</td><td>1</td><td>The usual minimum.</td></tr>
+  <tr><td>4</td><td>3</td><td>1</td><td>Same tolerance as 3, one more node to pay for; a 2/2 split stops everything.</td></tr>
+  <tr><td>5</td><td>3</td><td>2</td><td>Common for etcd, ZooKeeper and Consul servers.</td></tr>
+  <tr><td>7</td><td>4</td><td>3</td><td>More replicas means more votes per write, so writes slow down.</td></tr>
+</table>
+<p>Placement matters as much as count. Three nodes in two data centers (2 + 1) won't survive losing the data center with two. Three sites with one node each will survive losing any one site. When you only have two sites, a small <strong>witness</strong> (or arbiter) in a third location supplies the tie-breaking vote without storing data. MongoDB arbiters and the witness Region option in DynamoDB global tables with strong consistency are examples of this idea.</p>
+
+<h3>Fencing: stopping the node that didn't get the memo</h3>
+<p>Majority quorums protect state stored <em>inside</em> the consensus system. A deposed leader can still talk to things outside it: a shared disk, a payment API, a storage bucket. Two defenses:</p>
+<ul>
+  <li><strong>Fencing tokens.</strong> Every new leader or lock holder gets a number that increases (the term, or a lock revision). The downstream resource remembers the highest number it has seen and rejects requests carrying a smaller one. The old leader's late writes bounce. See <a href="#distributed-locks">Distributed Locks</a>.</li>
+  <li><strong>STONITH</strong> ("shoot the other node in the head"). Before taking over, the new primary makes sure the old one is really off: power it down through a managed power switch or the cloud API, or cut its access to shared storage. High-availability cluster managers such as Pacemaker do this. It's blunt, and it works even when the old node is frozen and can't be asked.</li>
+</ul>
+
+<h3>Defenses at a glance</h3>
+<table>
+  <tr><th>Technique</th><th>What it prevents</th><th>Cost or limit</th></tr>
+  <tr><td>Majority quorum for elections and commits</td><td>Two sides both committing (split brain)</td><td>Minority side is unavailable; every write waits for a majority</td></tr>
+  <tr><td>Terms / epochs on every message</td><td>A stale leader being obeyed after it was replaced</td><td>Only helps when the stale node talks to someone who knows the new term</td></tr>
+  <tr><td>Fencing tokens checked by the resource</td><td>Late writes from a paused or deposed leader to external systems</td><td>The resource must store and compare the token</td></tr>
+  <tr><td>STONITH / power fencing</td><td>An old primary still touching shared storage</td><td>Needs an out-of-band control path; a wrong kill is an outage</td></tr>
+  <tr><td>Witness / arbiter in a third site</td><td>Ties in two-site deployments</td><td>One more location to run</td></tr>
+  <tr><td>Adaptive failure detection (phi accrual)</td><td>Needless failovers from jitter and short pauses</td><td>Slower to declare a node that really died</td></tr>
+</table>
+
+<h3>Testing for partitions</h3>
+<p>Partition bugs hide in rare timings, so test them on purpose. <strong>Jepsen</strong>, Kyle Kingsbury's test framework, runs a real cluster, injects partitions, clock jumps and crashes, and checks the recorded history against the model (for example, linearizability). Its reports have found lost or stale writes in many well-known databases. For your own services, Shopify's <strong>Toxiproxy</strong> sits between a service and its dependencies and can add latency, cut connections or drop data. On Linux, <code>iptables</code> and <code>tc netem</code> create partitions and lossy links on a test host. Run these as regular game days (see <a href="#chaos-engineering">Chaos Engineering</a>).</p>
+<pre><code># Linux, as root, on a test box only (not executed here).
+# Drop all traffic to and from one peer: a clean partition.
+iptables -A INPUT  -s 10.0.0.12 -j DROP
+iptables -A OUTPUT -d 10.0.0.12 -j DROP
+# Asymmetric: drop only what we receive from it; our packets still arrive there.
+iptables -A INPUT  -s 10.0.0.13 -j DROP
+# A slow, lossy link instead of a dead one.
+tc qdisc add dev eth0 root netem delay 300ms 100ms loss 5%</code></pre>
+
+<h2>Example</h2>
+<p><strong>Five nodes, one leader, a 2/3 split, in Go.</strong> The simulation keeps a term, a leader flag and a committed log on each node. <code>Elect</code> collects votes from reachable nodes. <code>Write</code> replicates through the leader and, in quorum mode, commits only with acks from a majority of all five nodes. <code>Heal</code> reconnects everyone: the highest-term leader wins, the rest step down and copy its log, and it reports any committed entry that got thrown away.</p>
+<pre><code>// Package partition simulates a replicated log on 5 nodes with a leader,
+// terms, and a network that can split. Quorum mode needs a majority for
+// elections and commits; naive mode lets any side carry on alone.
+package partition
+
+import (
+	"fmt"
+	"slices"
+)
+
+type Node struct {
+	Name   string
+	Term   int
+	Leader bool
+	Log    []string // committed entries, as this node knows them
+}
+
+type Cluster struct {
+	Quorum bool
+	nodes  []*Node
+	side   map[string]int
+}
+
+func New(quorum bool, names ...string) *Cluster {
+	c := &amp;Cluster{Quorum: quorum, side: map[string]int{}}
+	for _, n := range names {
+		c.nodes = append(c.nodes, &amp;Node{Name: n})
+	}
+	return c
+}
+
+func (c *Cluster) node(name string) *Node {
+	for _, n := range c.nodes {
+		if n.Name == name {
+			return n
+		}
+	}
+	panic("unknown node " + name)
+}
+
+func (c *Cluster) Partition(groups ...[]string) {
+	for i, g := range groups {
+		for _, n := range g {
+			c.side[n] = i
+		}
+	}
+}
+
+func (c *Cluster) peers(from string) []*Node {
+	var out []*Node
+	for _, n := range c.nodes {
+		if c.side[n.Name] == c.side[from] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func (c *Cluster) majority() int { return len(c.nodes)/2 + 1 }
+
+// Elect asks every reachable node for a vote in a new term.
+func (c *Cluster) Elect(name string) error {
+	peers := c.peers(name)
+	term := 0
+	for _, p := range peers {
+		term = max(term, p.Term)
+	}
+	term++
+	if c.Quorum &amp;&amp; len(peers) &lt; c.majority() {
+		return fmt.Errorf("%s lost election for term %d: %d of %d votes, needs %d",
+			name, term, len(peers), len(c.nodes), c.majority())
+	}
+	for _, p := range peers {
+		p.Term, p.Leader = term, false
+	}
+	c.node(name).Leader = true
+	return nil
+}
+
+// Write appends an entry through the leader. In quorum mode the entry
+// commits only if a majority of all nodes acknowledged it.
+func (c *Cluster) Write(leader, entry string) error {
+	l := c.node(leader)
+	if !l.Leader {
+		return fmt.Errorf("%s is not leader", leader)
+	}
+	var acks []*Node
+	for _, p := range c.peers(leader) {
+		if p.Term &lt;= l.Term { // a node that saw a newer term rejects us
+			acks = append(acks, p)
+		}
+	}
+	if c.Quorum &amp;&amp; len(acks) &lt; c.majority() {
+		return fmt.Errorf("not committed: %d of %d acks, needs %d",
+			len(acks), len(c.nodes), c.majority())
+	}
+	for _, p := range acks {
+		p.Log = append(p.Log, entry)
+	}
+	return nil
+}
+
+func (c *Cluster) Leaders() []string {
+	var out []string
+	for _, n := range c.nodes {
+		if n.Leader {
+			out = append(out, fmt.Sprintf("%s(term %d)", n.Name, n.Term))
+		}
+	}
+	return out
+}
+
+// Heal reconnects the network. The leader with the highest term wins; every
+// other leader steps down and every node copies the winner's log. It returns
+// committed entries that existed somewhere but are not in the winner's log.
+func (c *Cluster) Heal() (lost []string) {
+	c.side = map[string]int{}
+	var win *Node
+	for _, n := range c.nodes {
+		if n.Leader &amp;&amp; (win == nil || n.Term &gt; win.Term) {
+			win = n
+		}
+	}
+	for _, n := range c.nodes {
+		for _, e := range n.Log {
+			if !slices.Contains(win.Log, e) &amp;&amp; !slices.Contains(lost, e) {
+				lost = append(lost, e)
+			}
+		}
+		n.Leader = n == win
+		n.Term = win.Term
+		n.Log = slices.Clone(win.Log)
+	}
+	return lost
+}</code></pre>
+
+<p>The same script runs with and without the quorum rule. A third example shows the minority side failing to elect anyone.</p>
+<pre><code>func ok(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "ok"
+}
+
+func scenario(quorum bool) {
+	c := New(quorum, "n1", "n2", "n3", "n4", "n5")
+	c.Elect("n1")
+	fmt.Println("write a via n1:", ok(c.Write("n1", "a")))
+
+	c.Partition([]string{"n1", "n2"}, []string{"n3", "n4", "n5"})
+	fmt.Println("-- partition {n1 n2} | {n3 n4 n5}")
+	fmt.Println("write b via n1:", ok(c.Write("n1", "b")))
+	fmt.Println("n3 runs for leader:", ok(c.Elect("n3")))
+	fmt.Println("write c via n3:", ok(c.Write("n3", "c")))
+	fmt.Println("leaders now:", c.Leaders())
+
+	lost := c.Heal()
+	fmt.Println("-- heal")
+	fmt.Println("leaders now:", c.Leaders())
+	fmt.Println("log on every node:", c.node("n1").Log, "lost:", lost)
+}
+
+func Example_quorum() {
+	scenario(true)
+}
+
+func Example_noQuorum() {
+	scenario(false)
+}
+
+func ExampleCluster_Elect() {
+	c := New(true, "n1", "n2", "n3", "n4", "n5")
+	c.Partition([]string{"n1", "n2"}, []string{"n3", "n4", "n5"})
+	fmt.Println(ok(c.Elect("n1")))
+	fmt.Println(ok(c.Elect("n4")))
+}</code></pre>
+
+<p>Output of <code>Example_quorum</code>, checked exactly by <code>go test</code>:</p>
+<pre><code>write a via n1: ok
+-- partition {n1 n2} | {n3 n4 n5}
+write b via n1: not committed: 2 of 5 acks, needs 3
+n3 runs for leader: ok
+write c via n3: ok
+leaders now: [n1(term 1) n3(term 2)]
+-- heal
+leaders now: [n3(term 2)]
+log on every node: [a c] lost: []</code></pre>
+<p>Output of <code>Example_noQuorum</code>:</p>
+<pre><code>write a via n1: ok
+-- partition {n1 n2} | {n3 n4 n5}
+write b via n1: ok
+n3 runs for leader: ok
+write c via n3: ok
+leaders now: [n1(term 1) n3(term 2)]
+-- heal
+leaders now: [n3(term 2)]
+log on every node: [a c] lost: [b]</code></pre>
+<p>Output of <code>ExampleCluster_Elect</code>:</p>
+<pre><code>n1 lost election for term 1: 2 of 5 votes, needs 3
+ok</code></pre>
+<p>Both runs have two nodes calling themselves leader during the partition: n1 never heard that it was replaced. With the quorum rule that's harmless, because n1's write <code>b</code> got only 2 of 5 acks and was never committed, so its client got an error and can retry against the new leader. Without the rule, <code>b</code> was acknowledged to the client and then silently dropped on heal. That's split brain in three lines of output.</p>
+
+<p><strong>Real-world scenario.</strong> A five-node etcd cluster runs across three zones: two nodes in zone 1, two in zone 2, one in zone 3. A switch failure cuts zone 1 off for 90 s, and the leader happened to be there. Zones 2 and 3 hold 3 of 5 nodes. They notice missing heartbeats after the election timeout (around a second with default settings), elect a new leader in a higher term, and keep serving reads and writes. Clients connected to the two zone 1 nodes see errors or timeouts for 90 s, and clients built to retry other endpoints move over. When zone 1 comes back, its nodes see the higher term, drop their stale state and catch up. If the operators had instead run two nodes in two zones "to save money", the same failure would have stopped all writes, because 1 of 2 isn't a majority.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Assuming partitions are rare enough to ignore.</strong> Device and link failures happen daily at scale, and GC pauses, VM migrations and overloaded nodes create partitions with no network fault at all. Design and test the partition path like any other code path.</li>
+  <li><strong>Counting majority from what you can see.</strong> "More than half of the nodes I can reach" is always true for a lone node. The majority must be of the configured cluster size, and membership changes must themselves go through consensus.</li>
+  <li><strong>Even-sized clusters and two-site deployments.</strong> Four nodes tolerate no more failures than three, and a 2/2 split stops everything. Two sites can't break a tie on their own; add a witness in a third place.</li>
+  <li><strong>Trusting your own leadership.</strong> A node that was paused or cut off may still think it leads or holds a lease. Check the term on every request, let leases expire before acting on them, and fence external resources with tokens.</li>
+  <li><strong>Failover on every hiccup.</strong> Aggressive timeouts turn a 3 s GC pause into a leader change, cold caches and a retry storm. Tune detection to your real pause and jitter profile, and alert on election rate.</li>
+  <li><strong>Ignoring partial and asymmetric failures.</strong> A node that can send but not receive may keep its role forever if health checks only test one direction. Prefer checks that need a full round trip, and test one-way drops explicitly.</li>
+  <li><strong>"Auto-merge" after split brain.</strong> Last-writer-wins reconciliation after both sides took writes drops data without telling anyone. If you allow writes on both sides, choose a merge strategy deliberately (see <a href="#eventual-consistency">Eventual Consistency</a>).</li>
+</ul>
+
+<div class="callout warn"><strong>A timeout is a guess, not a fact.</strong> When a node stops answering, it may be dead, slow, paused or perfectly fine on the other side of a broken link. Any action you take on "it's dead", such as promoting a replica or reassigning a lock, must be safe even if it isn't. That's what quorums, terms and fencing tokens are for.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Partitions include GC pauses, partial and one-way link failures, and overloaded nodes, not just cut cables. They happen regularly.</li>
+  <li>Split brain happens when both sides keep acting. A majority quorum of the full cluster lets only one side commit.</li>
+  <li>Use odd cluster sizes across at least three failure domains. Add a witness when you only have two sites.</li>
+  <li>A deposed leader can still act on stale beliefs. Terms, fencing tokens and STONITH stop it from doing damage. Test all of it with injected faults.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#cap-theorem">CAP Theorem</a> · <a href="#leader-election">Leader Election</a> · <a href="#distributed-locks">Distributed Locks</a> · <a href="#replication">Replication</a> · <a href="#chaos-engineering">Chaos Engineering</a> · <a href="#timeouts">Timeouts</a></p>
+`;
