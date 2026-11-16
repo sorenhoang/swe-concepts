@@ -1502,3 +1502,350 @@ PASS</code></pre>
 
 <p><strong>Related:</strong> <a href="#distributed-locks">Distributed Locks</a> · <a href="#network-partitions">Network Partitions</a> · <a href="#replication">Replication</a> · <a href="#failover">Failover</a> · <a href="#clock-skew">Clock Skew</a> · <a href="#cron-jobs">Cron Jobs</a></p>
 `;
+CONTENT["cap-theorem"] = `
+<p class="tldr"><strong>TL;DR</strong>: The CAP theorem says that when the network splits your replicas into groups that can't talk, each replica that gets a request must choose: answer now, possibly with stale data (<strong>A</strong>vailable), or refuse or wait until it can be sure it has the latest value (<strong>C</strong>onsistent). You don't get to skip the <strong>P</strong>: partitions happen whether you plan for them or not. It's like two bank branches whose phone line is cut. Each can keep paying out cash and risk an overdraft, or stop paying out until the line is back.</p>
+
+<h2>The problem it solves</h2>
+<p>Any system with more than one copy of its data has to decide what happens when those copies can't reach each other. Before CAP, vendors could promise "always consistent, always up, and fault tolerant" at once. CAP shows that this promise can't be kept for the strong meaning of "consistent". It gives you a precise question to ask of every database and every operation you design: <em>during a partition, does this request get an answer, or does it get a guaranteed-fresh answer?</em></p>
+<p>The theorem started as a conjecture in Eric Brewer's PODC keynote in 2000. Seth Gilbert and Nancy Lynch proved a formal version in 2002 ("Brewer's conjecture and the feasibility of consistent, available, partition-tolerant web services"). The proof uses narrow definitions, and most confusion about CAP comes from using the letters with looser meanings.</p>
+
+<h2>How it works</h2>
+<h3>The three letters, precisely</h3>
+<ul>
+  <li><strong>C, consistency, means linearizability.</strong> The system behaves as if there were one copy of the data, and every operation takes effect at a single instant between its start and its end. Once a write has completed, every later read, from any client and any node, sees that write or a newer one. This is much stronger than the "C" in ACID, which is about keeping invariants.</li>
+  <li><strong>A, availability, means every request to a non-failing node gets a non-error response.</strong> Not "most requests" and not "the service is up". Every node that hasn't crashed must answer. CAP puts no limit on how long the answer takes, which is one reason it says little about real latency.</li>
+  <li><strong>P, partition tolerance, means the system keeps its guarantees even when the network drops or delays messages between nodes.</strong> In the proof's model, any number of messages can be lost. A real network does this: see <a href="#network-partitions">Network Partitions</a>.</li>
+</ul>
+
+<h3>Why you can't have both C and A during a partition</h3>
+<p>The proof needs only two nodes and one value. Both nodes start with <code>x = 0</code>. The link between them is down. A client writes <code>x = 1</code> to N1, and N1 acknowledges it. Now another client asks N2 for <code>x</code>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Two nodes, N1 and N2, with the link between them cut. Client 1 writes x equals 1 to N1. Client 2 reads x from N2, which still has x equals 0. N2 has two options: reply with the stale value 0, which breaks consistency, or refuse or wait, which breaks availability.">
+  <defs><marker id="arr-cap-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="60" y="20" width="120" height="36" rx="6"/><text x="120" y="43" text-anchor="middle">Client 1</text>
+  <rect class="box" x="600" y="20" width="120" height="36" rx="6"/><text x="660" y="43" text-anchor="middle">Client 2</text>
+
+  <rect class="box ok" x="130" y="110" width="180" height="60" rx="8"/><text x="220" y="134" text-anchor="middle" class="title">N1</text><text x="220" y="154" text-anchor="middle" class="small">x = 1 (new)</text>
+  <rect class="box" x="470" y="110" width="180" height="60" rx="8"/><text x="560" y="134" text-anchor="middle" class="title">N2</text><text x="560" y="154" text-anchor="middle" class="small">x = 0 (old)</text>
+
+  <path class="line" d="M120 56 L190 108" marker-end="url(#arr-cap-1)"/>
+  <text x="105" y="88" text-anchor="middle" class="small">write x = 1</text>
+  <text x="105" y="102" text-anchor="middle" class="small">(acknowledged)</text>
+  <path class="line" d="M660 56 L590 108" marker-end="url(#arr-cap-1)"/>
+  <text x="685" y="88" text-anchor="middle" class="small">read x</text>
+
+  <path class="line bad dashed" d="M312 140 H468"/>
+  <path class="line bad" d="M380 128 L400 152 M400 128 L380 152"/>
+  <text x="390" y="118" text-anchor="middle" class="small">partition: x = 1</text>
+  <text x="390" y="172" text-anchor="middle" class="small">can't reach N2</text>
+
+  <rect class="box bad" x="320" y="215" width="200" height="50" rx="6"/><text x="420" y="236" text-anchor="middle">Option 1: reply x = 0</text><text x="420" y="254" text-anchor="middle" class="small">stale answer, gives up C</text>
+  <rect class="box bad" x="560" y="215" width="200" height="50" rx="6"/><text x="660" y="236" text-anchor="middle">Option 2: refuse or wait</text><text x="660" y="254" text-anchor="middle" class="small">no answer, gives up A</text>
+  <path class="line" d="M530 170 L450 213" marker-end="url(#arr-cap-1)"/>
+  <path class="line" d="M590 170 L640 213" marker-end="url(#arr-cap-1)"/>
+  <text x="150" y="232" text-anchor="middle" class="small">N2 has no way to learn</text>
+  <text x="150" y="248" text-anchor="middle" class="small">about x = 1 until the link heals.</text>
+  <text x="150" y="264" text-anchor="middle" class="small">There is no third option.</text>
+</svg>
+<figcaption>The whole proof in one picture. If N2 answers, the answer may be stale. If it must be fresh, N2 can't answer. Gilbert and Lynch formalize exactly this argument.</figcaption>
+</figure>
+<p>N2 can't tell "nobody wrote anything" apart from "someone wrote, and the message was lost". So it has two choices. It can answer <code>0</code>, which is available but not linearizable, because a completed write is invisible. Or it can refuse, or wait until the link is back, which keeps the guarantee but means a working node gave no answer. That's the whole theorem.</p>
+
+<h3>Why "pick 2 of 3" is misleading</h3>
+<p>The popular version, "consistency, availability, partition tolerance: pick two", suggests three equal options: CP, AP or CA. It isn't like that:</p>
+<ul>
+  <li><strong>P isn't a choice.</strong> A system that spans more than one machine will see messages dropped or delayed. "CA" only describes a system that never has a partition, which in practice means a single node. If a "CA" cluster does get partitioned, it has to give up C or A anyway; it just never decided which.</li>
+  <li><strong>The choice only applies during a partition.</strong> When the network is healthy, a system can be both linearizable and available. Brewer made this point himself in "CAP Twelve Years Later" (IEEE Computer, 2012): the "2 of 3" framing is misleading because partitions are rare, and the real design work is in detecting them, deciding what to allow during one, and recovering afterwards.</li>
+  <li><strong>Most systems are neither C nor A in the CAP sense.</strong> Martin Kleppmann's 2015 post "Please stop calling databases CP or AP" points out that a single-leader database isn't CAP-available (a client cut off from the leader can't write), and its reads from asynchronous followers aren't linearizable either. Snapshot isolation isn't linearizable by design. ZooKeeper is usually called CP, but its default reads are served locally and aren't linearizable unless you call <code>sync</code> first. Labels hide these details.</li>
+  <li><strong>It's per operation, not per database.</strong> Many stores let you choose for each read or write. One table can serve a CP-style "book this seat" write and an AP-style "show me roughly how many seats are left" read.</li>
+</ul>
+
+<h3>What a CP system does, and what an AP system does</h3>
+<p>A system that keeps C usually requires a <strong>majority quorum</strong>: an operation succeeds only if more than half of the replicas take part. Any two majorities share at least one node, so a read quorum always overlaps the last write quorum. During a partition, the side holding a majority keeps working, and the minority side refuses. That's what Raft-based stores such as etcd and Consul do (see <a href="#leader-election">Leader Election</a>).</p>
+<p>A system that keeps A lets every side keep accepting reads and writes on whatever replicas it can reach. The copies diverge. When the partition heals, the system has to merge them: last-writer-wins (and lose a write), keep both as siblings for the application to resolve, or use data types that merge automatically (CRDTs). That's the territory of <a href="#eventual-consistency">Eventual Consistency</a>.</p>
+
+<h3>PACELC: the part CAP leaves out</h3>
+<p>Partitions are rare. Latency is constant. Daniel Abadi's 2012 paper "Consistency Tradeoffs in Modern Distributed Database System Design: CAP is Only Part of the Story" (IEEE Computer) extends CAP into <strong>PACELC</strong>: if there is a <strong>P</strong>artition, choose <strong>A</strong> or <strong>C</strong>; <strong>E</strong>lse, in normal operation, choose <strong>L</strong>atency or <strong>C</strong>onsistency. Waiting for remote replicas to confirm every write costs a network round trip on every request, even when nothing is broken. Abadi argues that this everyday trade-off shaped real systems more than partition behavior did.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 330" role="img" aria-label="PACELC decision tree. Is there a partition? If yes, choose availability (answer anyway, PA) or consistency (minority refuses, PC). If no, choose latency (reply from a local replica, EL) or consistency (wait for replicas, EC). Examples from Abadi's 2012 paper: PA/EL Dynamo, Cassandra, Riak. PC/EC VoltDB/H-Store, Megastore. PA/EC MongoDB. PC/EL PNUTS.">
+  <defs><marker id="arr-cap-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="280" y="15" width="220" height="40" rx="6"/><text x="390" y="40" text-anchor="middle" class="title">Is there a partition?</text>
+  <rect class="box" x="60" y="100" width="250" height="40" rx="6"/><text x="185" y="125" text-anchor="middle">Availability or Consistency?</text>
+  <rect class="box" x="470" y="100" width="250" height="40" rx="6"/><text x="595" y="125" text-anchor="middle">Latency or Consistency?</text>
+  <path class="line" d="M330 55 L200 98" marker-end="url(#arr-cap-2)"/><text x="245" y="70" text-anchor="middle" class="small">yes (P)</text>
+  <path class="line" d="M450 55 L580 98" marker-end="url(#arr-cap-2)"/><text x="545" y="70" text-anchor="middle" class="small">no (E = else)</text>
+
+  <rect class="box ok" x="30" y="180" width="145" height="50" rx="6"/><text x="102" y="201" text-anchor="middle" class="title">PA</text><text x="102" y="219" text-anchor="middle" class="small">answer, may be stale</text>
+  <rect class="box bad" x="195" y="180" width="145" height="50" rx="6"/><text x="267" y="201" text-anchor="middle" class="title">PC</text><text x="267" y="219" text-anchor="middle" class="small">minority refuses</text>
+  <rect class="box ok" x="440" y="180" width="145" height="50" rx="6"/><text x="512" y="201" text-anchor="middle" class="title">EL</text><text x="512" y="219" text-anchor="middle" class="small">reply from nearest</text>
+  <rect class="box bad" x="605" y="180" width="145" height="50" rx="6"/><text x="677" y="201" text-anchor="middle" class="title">EC</text><text x="677" y="219" text-anchor="middle" class="small">wait for replicas</text>
+  <path class="line" d="M150 140 L110 178" marker-end="url(#arr-cap-2)"/>
+  <path class="line" d="M220 140 L260 178" marker-end="url(#arr-cap-2)"/>
+  <path class="line" d="M560 140 L520 178" marker-end="url(#arr-cap-2)"/>
+  <path class="line" d="M630 140 L670 178" marker-end="url(#arr-cap-2)"/>
+
+  <rect class="box muted" x="30" y="250" width="720" height="70" rx="8"/>
+  <text x="390" y="270" text-anchor="middle" class="small">Abadi's 2012 examples (default settings at the time):</text>
+  <text x="210" y="292" text-anchor="middle">PA/EL: Dynamo, Cassandra, Riak</text>
+  <text x="570" y="292" text-anchor="middle">PC/EC: VoltDB/H-Store, Megastore</text>
+  <text x="210" y="312" text-anchor="middle">PA/EC: MongoDB</text>
+  <text x="570" y="312" text-anchor="middle">PC/EL: PNUTS</text>
+</svg>
+<figcaption>CAP only covers the left branch. Most of the time you're on the right branch, paying (or not paying) a round trip for consistency on every request.</figcaption>
+</figure>
+
+<h3>Real systems let you choose per operation</h3>
+<p>Because the trade-off is per request, modern stores expose it as a setting. A few examples:</p>
+<ul>
+  <li><strong>Cassandra</strong> takes a consistency level on every query. With replication factor N, reading and writing at <code>QUORUM</code> makes R + W &gt; N, so a read overlaps the last quorum write. <code>ONE</code> keeps answering as long as a single replica is reachable. Conflicting writes are still resolved by timestamp (last-writer-wins), so clock skew matters (see <a href="#clock-skew">Clock Skew</a>). For compare-and-set, lightweight transactions (<code>IF NOT EXISTS</code>) run Paxos.</li>
+  <li><strong>DynamoDB</strong> reads are eventually consistent by default. Setting <code>ConsistentRead</code> to true on <code>GetItem</code>, <code>Query</code> or <code>Scan</code> returns the latest successful write, but only on tables and local secondary indexes, not global secondary indexes or streams. Global tables default to multi-Region eventual consistency (MREC), resolving conflicts with last-writer-wins. They can instead be created with multi-Region strong consistency (MRSC), which replicates each write synchronously to another Region before it returns, at the cost of higher write latency. The mode can't be changed after creation.</li>
+  <li><strong>MongoDB</strong> uses one primary per replica set. Write concern <code>w: "majority"</code> acknowledges a write only once a majority has it. Read concern <code>"majority"</code> returns only majority-acknowledged data, and <code>"linearizable"</code> (primary only) also confirms the node is still the primary, because during a partition an old primary can briefly believe it still leads. Writes accepted by that old primary with a weaker write concern are rolled back later.</li>
+</ul>
+<pre><code>-- Cassandra (CQL shell). RF = 3 per data center.
+CONSISTENCY ONE;           -- any single replica answers: stays up, may be stale
+CONSISTENCY QUORUM;        -- 2 of 3 replicas: R + W &gt; N, read sees the last quorum write
+CONSISTENCY LOCAL_QUORUM;  -- quorum inside the local data center only
+-- Lightweight transactions use Paxos; their reads use SERIAL / LOCAL_SERIAL.
+INSERT INTO seats (show_id, seat, holder) VALUES (7, 'A12', 'ana') IF NOT EXISTS;</code></pre>
+<pre><code>// MongoDB driver options (not executed here).
+writeConcern: { w: "majority" }   // ack only after a majority of the replica set has it
+readConcern:  { level: "majority" }      // only data a majority has acknowledged
+readConcern:  { level: "linearizable" }  // primary only; checks it is still primary</code></pre>
+
+<h3>How real systems behave under a partition</h3>
+<table>
+  <tr><th>System</th><th>Minority side during a partition</th><th>Reads</th><th>Knob</th></tr>
+  <tr><td>Single-leader SQL (Postgres, MySQL) with async replicas</td><td>Can't write if cut off from the leader. Promoting a replica there risks two leaders and lost writes.</td><td>Leader reads are fresh; replica reads can lag.</td><td>Synchronous replication trades write latency (and availability) for no data loss on failover.</td></tr>
+  <tr><td>etcd, Consul (Raft); ZooKeeper (Zab)</td><td>Refuses writes. Only the majority side can elect a leader and commit.</td><td>etcd: linearizable by default, serializable (local, maybe stale) on request. ZooKeeper: local by default, <code>sync</code> first for fresh.</td><td>Read mode per request.</td></tr>
+  <tr><td>Cassandra (Dynamo-style)</td><td>Keeps serving if enough replicas for the chosen level are reachable.</td><td>Depends on level; <code>ONE</code> can be stale.</td><td>Consistency level per query; LWT for compare-and-set.</td></tr>
+  <tr><td>DynamoDB</td><td>Managed by AWS inside a Region; global tables (MREC) keep accepting writes in every Region.</td><td>Eventual by default; <code>ConsistentRead</code> for latest.</td><td>Per read; per global table (MREC vs MRSC).</td></tr>
+  <tr><td>MongoDB replica set</td><td>A primary that loses the majority steps down; the majority elects a new one.</td><td>Primary by default; secondaries can lag.</td><td>Write concern, read concern, read preference.</td></tr>
+  <tr><td>Spanner</td><td>Paxos groups need a majority; a minority can't commit.</td><td>Strong reads, or stale reads at a past timestamp.</td><td>Strong vs bounded/exact staleness reads.</td></tr>
+</table>
+<p>Notice the pattern. "CP" or "AP" isn't a property of the product. It's a property of the operation you run, at the settings you chose.</p>
+
+<h2>Example</h2>
+<p><strong>A 3-replica register in Go, in CP mode and in AP mode.</strong> The simulated network can split the replicas into groups. In CP mode, an operation needs a majority (2 of 3) of reachable nodes. In AP mode, every node answers from what its side knows. On heal, both modes run anti-entropy with last-writer-wins and report any acknowledged write that disappeared. Each copy keeps the history of writes it has seen, only so the simulation can report what was lost.</p>
+<pre><code>// Package capsim simulates 3 replicas of one register behind a network that
+// can partition, in either CP mode (majority quorum) or AP mode (local writes).
+package capsim
+
+import (
+	"fmt"
+	"sort"
+)
+
+type Mode string
+
+const (
+	CP Mode = "CP"
+	AP Mode = "AP"
+)
+
+type version struct {
+	n    int    // logical counter
+	node string // tie-breaker: the node that took the write
+}
+
+func (a version) less(b version) bool {
+	return a.n &lt; b.n || (a.n == b.n &amp;&amp; a.node &lt; b.node)
+}
+
+type replica struct {
+	val  string
+	ver  version
+	hist []string // every write this copy has seen, oldest first
+}
+
+type Cluster struct {
+	mode  Mode
+	nodes map[string]*replica
+	side  map[string]int // nodes on the same side can talk
+}
+
+func NewCluster(mode Mode, names ...string) *Cluster {
+	c := &amp;Cluster{mode: mode, nodes: map[string]*replica{}, side: map[string]int{}}
+	for _, n := range names {
+		c.nodes[n] = &amp;replica{}
+	}
+	return c
+}
+
+// Partition splits the network. Nodes in different groups can't exchange messages.
+func (c *Cluster) Partition(groups ...[]string) {
+	for i, g := range groups {
+		for _, n := range g {
+			c.side[n] = i
+		}
+	}
+}
+
+func (c *Cluster) reachable(from string) []string {
+	var out []string
+	for n := range c.nodes {
+		if c.side[n] == c.side[from] {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (c *Cluster) quorum() int { return len(c.nodes)/2 + 1 }
+
+// newest returns the highest-versioned replica among the given nodes.
+func (c *Cluster) newest(names []string) *replica {
+	best := c.nodes[names[0]]
+	for _, n := range names[1:] {
+		if best.ver.less(c.nodes[n].ver) {
+			best = c.nodes[n]
+		}
+	}
+	return best
+}
+
+// Write stores value through node via.
+func (c *Cluster) Write(via, value string) error {
+	peers := c.reachable(via)
+	if c.mode == CP &amp;&amp; len(peers) &lt; c.quorum() {
+		return fmt.Errorf("unavailable: %s reaches %d of %d nodes, needs %d",
+			via, len(peers), len(c.nodes), c.quorum())
+	}
+	// CP: any two majorities overlap, so the max version seen here is the latest.
+	// AP: only this side's versions are visible, so both sides can mint the same n.
+	base := c.newest(peers)
+	r := replica{
+		val:  value,
+		ver:  version{n: base.ver.n + 1, node: via},
+		hist: append(append([]string{}, base.hist...), value),
+	}
+	for _, p := range peers {
+		*c.nodes[p] = r
+	}
+	return nil
+}
+
+// Read returns the value as seen through node via.
+func (c *Cluster) Read(via string) (string, error) {
+	peers := c.reachable(via)
+	if c.mode == CP &amp;&amp; len(peers) &lt; c.quorum() {
+		return "", fmt.Errorf("unavailable: %s reaches %d of %d nodes, needs %d",
+			via, len(peers), len(c.nodes), c.quorum())
+	}
+	if c.mode == CP {
+		return c.newest(peers).val, nil
+	}
+	return c.nodes[via].val, nil // AP: answer locally, possibly stale
+}
+
+// Heal reconnects everyone and runs anti-entropy: the highest version wins
+// everywhere (last-writer-wins). It returns acknowledged writes that the
+// winner never saw, i.e. writes that are now silently gone.
+func (c *Cluster) Heal() (lost []string) {
+	c.side = map[string]int{}
+	all := c.reachable("")
+	win := *c.newest(all)
+	kept := map[string]bool{}
+	for _, v := range win.hist {
+		kept[v] = true
+	}
+	for _, n := range all {
+		for _, v := range c.nodes[n].hist {
+			if !kept[v] {
+				kept[v] = true // report once
+				lost = append(lost, v)
+			}
+		}
+		*c.nodes[n] = win
+	}
+	return lost
+}</code></pre>
+
+<p>Both runs follow the same script: write <code>v1</code>, split <code>{A B} | {C}</code>, write <code>v2</code> via A and <code>v3</code> via C, read from both sides, heal.</p>
+<pre><code>func show(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "ok"
+}
+
+func run(mode Mode) {
+	c := NewCluster(mode, "A", "B", "C")
+	fmt.Printf("== %s ==&#92;n", mode)
+	fmt.Println(&#96;write "v1" via A:&#96;, show(c.Write("A", "v1")))
+
+	c.Partition([]string{"A", "B"}, []string{"C"})
+	fmt.Println("partition: {A B} | {C}")
+	fmt.Println(&#96;write "v2" via A:&#96;, show(c.Write("A", "v2")))
+	fmt.Println(&#96;write "v3" via C:&#96;, show(c.Write("C", "v3")))
+	for _, n := range []string{"A", "C"} {
+		v, err := c.Read(n)
+		if err != nil {
+			fmt.Printf("read via %s: %v&#92;n", n, err)
+		} else {
+			fmt.Printf("read via %s: %s&#92;n", n, v)
+		}
+	}
+
+	lost := c.Heal()
+	v, _ := c.Read("C")
+	fmt.Printf("heal: every node now holds %s, lost: %v&#92;n", v, lost)
+}
+
+func Example_cp() {
+	run(CP)
+}
+
+func Example_ap() {
+	run(AP)
+}</code></pre>
+
+<p>Output of <code>Example_cp</code>, checked exactly by <code>go test</code>:</p>
+<pre><code>== CP ==
+write "v1" via A: ok
+partition: {A B} | {C}
+write "v2" via A: ok
+write "v3" via C: unavailable: C reaches 1 of 3 nodes, needs 2
+read via A: v2
+read via C: unavailable: C reaches 1 of 3 nodes, needs 2
+heal: every node now holds v2, lost: []</code></pre>
+<p>Output of <code>Example_ap</code>:</p>
+<pre><code>== AP ==
+write "v1" via A: ok
+partition: {A B} | {C}
+write "v2" via A: ok
+write "v3" via C: ok
+read via A: v2
+read via C: v3
+heal: every node now holds v3, lost: [v2]</code></pre>
+<p>In CP mode, C said no to both its client's write and its client's read: it was up, but it couldn't prove its data was current. Nothing was lost. In AP mode, every request succeeded, and the two sides diverged. When the network healed, last-writer-wins picked <code>v3</code> (same counter, and node <code>C</code> wins the tie), so <code>v2</code> vanished even though two replicas had acknowledged it. Neither run is wrong. They're different promises.</p>
+
+<p><strong>Real-world scenario.</strong> A ticketing service runs replicas in us-east and eu-west. The link between the regions drops for 90 s during a sale, while both sides keep getting about 200 requests per second. Two operations behave very differently:</p>
+<ul>
+  <li><strong>"Book seat A12"</strong> must never sell one seat twice. It runs as a CP operation against a majority quorum whose replicas mostly live in us-east. For 90 s, buyers routed to eu-west get "try again in a moment" for bookings. That's maybe a few thousand failed attempts, which are retried after the heal. No seat is sold twice.</li>
+  <li><strong>"How many seats are left?"</strong> runs as an AP read from the local replica. Both regions keep showing a number for 90 s; the eu-west number grows stale and may say 40 when the true number is 12. Users see a slightly wrong count. That's acceptable, because booking re-checks.</li>
+</ul>
+<p>If the team had marked the whole database "AP", the 90 s split would have produced double-sold seats to reconcile by hand. If they had marked the whole thing "CP", the seat counter would have shown errors to every eu-west visitor. Choosing per operation is the point.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Calling a database "CP" or "AP".</strong> The label depends on the operation and its settings: Cassandra at <code>ONE</code> and at <code>QUORUM</code> behaves differently, and a "CP" store with follower reads returns stale data. Name the guarantee you need (linearizable, read-your-writes, bounded staleness) and check that the specific call provides it.</li>
+  <li><strong>Thinking you chose "CA".</strong> If data lives on two machines, partitions will happen. A design without a plan for them still makes a choice; it just finds out during an incident which one.</li>
+  <li><strong>Assuming quorums mean linearizable.</strong> R + W &gt; N gives overlap, but with last-writer-wins timestamps, sloppy quorums and no rollback of partially applied writes, Dynamo-style quorum reads can still return results that aren't linearizable. If you need compare-and-set, use the store's consensus path (Cassandra LWT, a Raft store).</li>
+  <li><strong>Forgetting latency (the "ELC" part).</strong> A strongly consistent cross-region write pays at least one inter-region round trip every time, not just during partitions. That's often the cost that hurts, and the one PACELC makes visible.</li>
+  <li><strong>Choosing AP without a merge plan.</strong> Availability during a partition creates conflicting versions. Last-writer-wins silently drops one; that's fine for a "last seen" timestamp and wrong for a shopping cart or a balance. Decide the merge rule before the first partition (see <a href="#eventual-consistency">Eventual Consistency</a>).</li>
+  <li><strong>Treating "available" as "fast" or "up".</strong> CAP-available allows an answer after ten minutes, and a CP system with a healthy majority is up for most users. Measure what users see: error rates and latency per region (see <a href="#slos">SLOs</a>).</li>
+</ul>
+
+<div class="callout warn"><strong>"Unavailable" is a feature on the minority side.</strong> A node that can't reach a majority and still accepts a write isn't being helpful. It's creating a conflict someone has to resolve later, or a write that will be silently lost. If an operation must not be lost or doubled, let it fail fast and retry (see <a href="#retries">Retries</a>).</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>CAP: during a partition, a replica asked for data must either answer (possibly stale) or refuse. C means linearizable, A means every working node answers.</li>
+  <li>P isn't optional, and the choice only matters during a partition. PACELC adds the everyday choice between latency and consistency.</li>
+  <li>CP and AP describe operations at given settings, not products. Choose per operation: CP for "must not double", AP for "stale is fine".</li>
+  <li>Majority quorums keep the larger side working and stop the smaller side. AP needs a merge rule decided in advance.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#network-partitions">Network Partitions</a> · <a href="#eventual-consistency">Eventual Consistency</a> · <a href="#replication">Replication</a> · <a href="#leader-election">Leader Election</a> · <a href="#clock-skew">Clock Skew</a> · <a href="#real-world-distributed-design">Real-World Distributed Design</a></p>
+`;
