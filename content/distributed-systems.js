@@ -1849,3 +1849,340 @@ heal: every node now holds v3, lost: [v2]</code></pre>
 
 <p><strong>Related:</strong> <a href="#network-partitions">Network Partitions</a> · <a href="#eventual-consistency">Eventual Consistency</a> · <a href="#replication">Replication</a> · <a href="#leader-election">Leader Election</a> · <a href="#clock-skew">Clock Skew</a> · <a href="#real-world-distributed-design">Real-World Distributed Design</a></p>
 `;
+CONTENT["eventual-consistency"] = `
+<p class="tldr"><strong>TL;DR</strong>: Eventual consistency means replicas are allowed to disagree for a while, and promise only this: if writes stop, they all end up with the same value. It is how news spreads in a group of friends: not everyone hears at once, some hear it in a different order, but in the end everyone knows. In return you get writes that don't wait for other machines. You pay with stale reads, and with conflicts you must merge on purpose, or lose data by accident.</p>
+
+<h2>The problem it solves</h2>
+<p>Keeping every copy identical at every moment needs coordination on every write: the write has to reach a majority, or every copy, before anyone can read it (see <a href="#replication">Replication</a>). That coordination costs:</p>
+<ul>
+  <li><strong>Latency.</strong> A write that must be confirmed in another region pays a cross-region round trip, often 50–150 ms, every time.</li>
+  <li><strong>Availability.</strong> When replicas can't talk to each other, a strongly consistent system has to refuse some requests, because it can't confirm them. That's the CAP trade-off (see <a href="#cap-theorem">CAP Theorem</a>).</li>
+  <li><strong>Throughput.</strong> Every coordinated write involves several machines.</li>
+</ul>
+<p>For a lot of data, that price buys little. A like counter that is 2 s behind, a shopping cart that shows up on your phone a moment after you add to it on your laptop, a DNS record that updates within its TTL (see <a href="#dns">DNS</a>), a cached product page (see <a href="#caching">Caching</a>): all fine. Eventual consistency lets each replica accept reads and writes on its own, and reconcile later.</p>
+
+<h2>How it works</h2>
+<p>Werner Vogels, Amazon's CTO, gave the definition most people use in "Eventually Consistent" (ACM Queue, 2008): it is a form of weak consistency where, if no new updates are made to an object, eventually all accesses return the last updated value. Notice what it doesn't say. It doesn't say how long "eventually" is, and it promises nothing about a read <em>while</em> updates are flowing.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 275" role="img" aria-label="Three replicas over time. Replica A accepts write x=1. It gossips the change to replica B, which later gossips it to replica C. Until each replica receives it, readers there see the stale value x=0. The span from the write until C has it is the inconsistency window; after that all three agree.">
+  <defs><marker id="arr-evc-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="20" y="75" class="title">Replica A</text>
+  <text x="20" y="145" class="title">Replica B</text>
+  <text x="20" y="215" class="title">Replica C</text>
+
+  <rect class="box muted" x="100" y="58" width="50" height="24" rx="5"/><text x="125" y="75" text-anchor="middle" class="small">x = 0</text>
+  <rect class="box accent" x="150" y="58" width="100" height="24" rx="5"/><text x="200" y="75" text-anchor="middle">write x=1</text>
+  <rect class="box ok" x="250" y="58" width="510" height="24" rx="5"/><text x="505" y="75" text-anchor="middle">x = 1</text>
+
+  <rect class="box muted" x="100" y="128" width="280" height="24" rx="5"/><text x="240" y="145" text-anchor="middle">x = 0 (stale)</text>
+  <rect class="box ok" x="380" y="128" width="380" height="24" rx="5"/><text x="570" y="145" text-anchor="middle">x = 1</text>
+
+  <rect class="box muted" x="100" y="198" width="500" height="24" rx="5"/><text x="350" y="215" text-anchor="middle">x = 0 (stale)</text>
+  <rect class="box ok" x="600" y="198" width="160" height="24" rx="5"/><text x="680" y="215" text-anchor="middle">x = 1</text>
+
+  <path class="line accent dashed" d="M260 82 L383 126" marker-end="url(#arr-evc-1)"/>
+  <text x="300" y="112" text-anchor="middle" class="small">gossip</text>
+  <path class="line accent dashed" d="M480 152 L603 196" marker-end="url(#arr-evc-1)"/>
+  <text x="520" y="182" text-anchor="middle" class="small">gossip</text>
+
+  <path class="line" d="M150 240 H600" style="stroke: var(--line)"/>
+  <path class="line" d="M150 234 V246"/><path class="line" d="M600 234 V246"/>
+  <text x="375" y="262" text-anchor="middle" class="small">inconsistency window: readers on B or C may still see x = 0</text>
+  <text x="690" y="262" text-anchor="middle" class="small">converged</text>
+</svg>
+<figcaption>Replication is asynchronous. A read is only as fresh as the replica that serves it. The window is usually milliseconds, but nothing bounds it: a partition or a backlog can stretch it to minutes.</figcaption>
+</figure>
+<p>Convergence needs two things:</p>
+<ol>
+  <li><strong>Every update reaches every replica.</strong> Async replication streams, gossip between peers, read repair, hinted handoff, and periodic anti-entropy (comparing replicas, often with Merkle trees, and copying what's missing). One mechanism alone usually leaves gaps.</li>
+  <li><strong>Every replica merges updates to the same result</strong>, whatever order they arrive in, and even if some arrive twice. If replica A applies "x=1 then x=2" and replica B applies "x=2 then x=1", a naive "apply as received" leaves them different forever. That's the job of conflict resolution, below.</li>
+</ol>
+
+<h3>The consistency spectrum</h3>
+<p>"Eventual" is the weakest point on a scale. Between it and "acts like a single machine" there are useful levels, and you can often buy just the one you need.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 320" role="img" aria-label="Consistency models from strongest to weakest: linearizable, sequential, causal, session guarantees, eventual. Stronger models need more coordination and are less available during partitions; weaker ones are faster and more available.">
+  <defs><marker id="arr-evc-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <path class="line" d="M70 298 V28" marker-end="url(#arr-evc-2)"/>
+  <text x="70" y="16" text-anchor="middle" class="small">stronger</text>
+  <text x="70" y="314" text-anchor="middle" class="small">weaker</text>
+
+  <rect class="box accent" x="100" y="24" width="200" height="44" rx="6"/><text x="200" y="51" text-anchor="middle" class="title">Linearizable</text>
+  <text x="320" y="42" class="small">behaves like one copy: a read sees every write that finished before it began</text>
+  <text x="320" y="58" class="small">e.g. etcd, Spanner; the "C" in CAP</text>
+
+  <rect class="box" x="100" y="82" width="200" height="44" rx="6"/><text x="200" y="109" text-anchor="middle" class="title">Sequential</text>
+  <text x="320" y="100" class="small">everyone sees all operations in the same order, each client's order kept,</text>
+  <text x="320" y="116" class="small">but that order may lag real time</text>
+
+  <rect class="box" x="100" y="140" width="200" height="44" rx="6"/><text x="200" y="167" text-anchor="middle" class="title">Causal</text>
+  <text x="320" y="158" class="small">if write A could have influenced write B, everyone sees A before B;</text>
+  <text x="320" y="174" class="small">unrelated writes may appear in any order. e.g. MongoDB causal sessions</text>
+
+  <rect class="box ok" x="100" y="198" width="200" height="44" rx="6"/><text x="200" y="225" text-anchor="middle" class="title">Session guarantees</text>
+  <text x="320" y="216" class="small">per client: read-your-writes, monotonic reads, monotonic writes,</text>
+  <text x="320" y="232" class="small">writes-follow-reads. e.g. sticky sessions, log-position tokens</text>
+
+  <rect class="box muted" x="100" y="256" width="200" height="44" rx="6"/><text x="200" y="283" text-anchor="middle" class="title">Eventual</text>
+  <text x="320" y="274" class="small">replicas converge if writes stop; no promise about any single read</text>
+  <text x="320" y="290" class="small">e.g. DNS, DynamoDB default reads, Cassandra at ONE</text>
+</svg>
+<figcaption>Going up costs more coordination; going down buys latency and availability. Each level forbids anomalies the one below allows. Session guarantees are the cheap upgrade most user-facing apps need: they only constrain what one client sees.</figcaption>
+</figure>
+<ul>
+  <li><strong>Linearizable</strong>: once a write completes, every later read, anywhere, returns it or something newer. This is what people mean by "strongly consistent".</li>
+  <li><strong>Causal</strong>: writes that are causally related are seen in order by everyone. A reply never appears before the comment it answers. Concurrent, unrelated writes can still appear in different orders on different replicas. Mahajan, Alvisi &amp; Dahlin (2011) showed that no consistency model stronger than (a variant of) causal can stay available and converge during a partition.</li>
+  <li><strong>Session guarantees</strong>, from Terry et al., "Session Guarantees for Weakly Consistent Replicated Data" (1994), and listed by Vogels:
+    <ul>
+      <li><em>Read-your-writes</em>: after you write, your reads see that write or a newer one.</li>
+      <li><em>Monotonic reads</em>: once you've seen a value, you never see an older one.</li>
+      <li><em>Monotonic writes</em>: your writes are applied in the order you made them.</li>
+      <li><em>Writes-follow-reads</em>: a write you make after reading something is ordered after what you read.</li>
+    </ul></li>
+  <li><strong>Eventual</strong>: only convergence. Two reads in a row may go backwards.</li>
+</ul>
+<p>Products expose these as knobs. DynamoDB reads are eventually consistent by default and cost half as much as reads with <code>ConsistentRead: true</code>, which are strongly consistent on tables and local secondary indexes; global secondary index reads are always eventually consistent. Cassandra lets you pick a consistency level per query. MongoDB offers causally consistent client sessions.</p>
+
+<h3>Conflict resolution</h3>
+<p>When two replicas accept different writes to the same key concurrently (neither knew about the other), convergence needs a rule that every replica applies the same way.</p>
+<ul>
+  <li><strong>Last-writer-wins (LWW).</strong> Every write carries a timestamp; on merge, the highest wins, with a node ID to break ties. It's simple and it converges. But "concurrent" means neither write saw the other, so LWW keeps one and <em>silently throws the other away</em>. It also trusts wall clocks: a node whose clock runs 40 ms fast wins every tie it shouldn't (see <a href="#clock-skew">Clock Skew</a>). Cassandra resolves concurrent writes per column this way. LWW is fine when writes replace a value wholesale and losing a concurrent one is acceptable (a "last seen" timestamp). It is wrong for counters, sets and anything built by read-modify-write.</li>
+  <li><strong>Version vectors and siblings.</strong> Each replica keeps a counter per node. Comparing two vectors tells you whether one version descends from the other (keep the newer) or they are concurrent (a real conflict). Instead of guessing, the store keeps both <em>siblings</em> and the next reader merges them. Amazon's Dynamo merged shopping carts this way, so an "add to cart" was never lost. The Dynamo paper notes the cost: a deleted item could reappear, because a union merge can't tell "removed" from "never added".</li>
+  <li><strong>CRDTs</strong> (conflict-free replicated data types; Shapiro et al., 2011). Data types whose merge is commutative, associative and idempotent, so replicas converge whatever the order, and however often they exchange state. A <strong>G-Counter</strong> keeps one count per replica; each replica increments only its own slot; merge takes the per-slot maximum; the value is the sum. A <strong>PN-Counter</strong> pairs two G-Counters to allow decrements. An <strong>OR-Set</strong> (observed-remove set) tags each add with a unique ID, and a remove deletes only the tags it has seen, so a concurrent add survives. CRDTs power collaborative editors and multi-region active-active stores, at the price of extra metadata and a limited menu of types.</li>
+</ul>
+<table>
+  <tr><th>Strategy</th><th>On concurrent writes</th><th>Loses data?</th><th>Cost</th><th>Seen in</th></tr>
+  <tr><td>Last-writer-wins</td><td>highest timestamp kept</td><td>yes, silently</td><td>trivial; depends on clocks</td><td>Cassandra (per column), many caches and multi-region setups</td></tr>
+  <tr><td>Version vectors + siblings</td><td>both versions kept, app merges on read</td><td>no, but deletes can resurface</td><td>every reader must handle siblings</td><td>Dynamo (vector clocks), Riak</td></tr>
+  <tr><td>CRDT</td><td>merged by the type's rules</td><td>no, within the type's meaning</td><td>metadata per replica or element; only certain types</td><td>Riak data types, collaborative editors (Automerge, Yjs)</td></tr>
+  <tr><td>Avoid conflicts</td><td>can't happen: each key has one home leader</td><td>no</td><td>writes go to the home region, with its latency</td><td>single-leader databases, "home region" routing</td></tr>
+</table>
+
+<h3>Designing APIs and UIs for it</h3>
+<p>Most complaints about eventual consistency are really missing session guarantees. Users don't mind that someone else's change takes a second. They mind not seeing their own.</p>
+<ul>
+  <li><strong>Read-your-writes with a token.</strong> The write returns the log position it was committed at (a PostgreSQL LSN, a MySQL GTID, a MongoDB <code>operationTime</code>). The client sends it back on reads, as a header or cookie. The server reads from any replica that has applied that position (in PostgreSQL, compare with <code>pg_last_wal_replay_lsn()</code> on the replica), else from the leader. The second example below does exactly this.</li>
+  <li><strong>Read-your-writes, simpler.</strong> Send a user's reads to the leader for a few seconds after they write, or pin a session to one replica (which also gives monotonic reads, until that replica fails).</li>
+  <li><strong>Show the user what they did.</strong> Optimistic UI: after a successful <code>POST</code>, render the new item from the response instead of re-fetching a list from a replica that may not have it.</li>
+  <li><strong>Make operations merge-friendly.</strong> Send "add 1 like" or "add item X", not "set likes to 42" or "set cart to [...]". Commutative operations converge; read-modify-write overwrites. Make them idempotent too, because replication and retries deliver twice (see <a href="#idempotency">Idempotency</a>).</li>
+  <li><strong>Be honest about pending states.</strong> "Payment processing", "Syncing…", "Updated a few seconds ago" are better than a value that silently changes later.</li>
+</ul>
+
+<h2>Example</h2>
+<p><strong>LWW losing likes vs a G-Counter converging, in Go.</strong> Three replicas can't reach each other while users like a post: 3 likes land on A, 2 on B, 1 on C. Each replica stores the count twice: once as an LWW register (read the local value, add one, stamp it with the local clock), and once as a G-Counter CRDT. Then they run anti-entropy, pairwise. B's clock runs 40 ms ahead. Standard library only.</p>
+<pre><code>package converge
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// LWW is a last-writer-wins register: on merge, the higher timestamp wins
+// (node name breaks ties so every replica picks the same winner).
+type LWW struct {
+	Val  int
+	TS   int64
+	Node string
+}
+
+func (a LWW) Merge(b LWW) LWW {
+	if b.TS &gt; a.TS || (b.TS == a.TS &amp;&amp; b.Node &gt; a.Node) {
+		return b
+	}
+	return a
+}
+
+// GCounter is a grow-only counter CRDT: one slot per replica, each replica
+// only bumps its own slot, merge takes the max per slot, value is the sum.
+type GCounter map[string]int
+
+func (g GCounter) Inc(node string) { g[node]++ }
+
+func (g GCounter) Merge(o GCounter) {
+	for n, v := range o {
+		g[n] = max(g[n], v)
+	}
+}
+
+func (g GCounter) Value() int {
+	sum := 0
+	for _, v := range g {
+		sum += v
+	}
+	return sum
+}
+
+func (g GCounter) String() string {
+	var parts []string
+	for n, v := range g {
+		parts = append(parts, fmt.Sprintf("%s:%d", n, v))
+	}
+	sort.Strings(parts)
+	return "{" + strings.Join(parts, " ") + "}"
+}
+
+// Replica stores the same "likes" counter two ways.
+type Replica struct {
+	Name  string
+	clock int64 // this node's wall clock, in ms; each node's is a bit off
+	Naive LWW
+	CRDT  GCounter
+}
+
+func NewReplica(name string, clock int64) *Replica {
+	return &amp;Replica{Name: name, clock: clock, Naive: LWW{Node: name}, CRDT: GCounter{}}
+}
+
+// Like is a local write: it succeeds without talking to any other replica.
+func (r *Replica) Like() {
+	r.clock++
+	r.Naive = LWW{Val: r.Naive.Val + 1, TS: r.clock, Node: r.Name} // read-modify-write
+	r.CRDT.Inc(r.Name)
+}
+
+// Gossip is one anti-entropy exchange: both sides merge each other's state.
+func Gossip(a, b *Replica) {
+	n := a.Naive.Merge(b.Naive)
+	a.Naive, b.Naive = n, n
+	a.CRDT.Merge(b.CRDT)
+	b.CRDT.Merge(a.CRDT)
+}</code></pre>
+<pre><code>package converge
+
+import "fmt"
+
+func show(label string, rs []*Replica) {
+	fmt.Println(label)
+	for _, r := range rs {
+		fmt.Printf("  %s  lww=%d  gcounter=%d %v&#92;n", r.Name, r.Naive.Val, r.CRDT.Value(), r.CRDT)
+	}
+}
+
+func Example() {
+	a := NewReplica("A", 1_000)
+	b := NewReplica("B", 1_040) // B's clock runs 40 ms ahead
+	c := NewReplica("C", 980)
+	rs := []*Replica{a, b, c}
+
+	// The replicas can't reach each other; users keep liking the post.
+	for range 3 {
+		a.Like()
+	}
+	for range 2 {
+		b.Like()
+	}
+	c.Like()
+	show("before gossip (6 likes in total):", rs)
+
+	Gossip(a, b)
+	show("after A&lt;-&gt;B:", rs)
+	Gossip(b, c)
+	Gossip(c, a)
+	show("after B&lt;-&gt;C, C&lt;-&gt;A:", rs)
+	// Output:
+	// before gossip (6 likes in total):
+	//   A  lww=3  gcounter=3 {A:3}
+	//   B  lww=2  gcounter=2 {B:2}
+	//   C  lww=1  gcounter=1 {C:1}
+	// after A&lt;-&gt;B:
+	//   A  lww=2  gcounter=5 {A:3 B:2}
+	//   B  lww=2  gcounter=5 {A:3 B:2}
+	//   C  lww=1  gcounter=1 {C:1}
+	// after B&lt;-&gt;C, C&lt;-&gt;A:
+	//   A  lww=2  gcounter=6 {A:3 B:2 C:1}
+	//   B  lww=2  gcounter=6 {A:3 B:2 C:1}
+	//   C  lww=2  gcounter=6 {A:3 B:2 C:1}
+}</code></pre>
+<p>Both representations converge: after the gossip rounds, all three replicas agree. But the LWW counter agreed on <strong>2</strong>, B's value, because B's clock ran ahead, and 4 of the 6 likes are gone with no error anywhere. The G-Counter agreed on <strong>6</strong>, because merging takes the maximum of each replica's own slot, so no increment can overwrite another. Run the gossip in any order, or twice, and the CRDT gives the same answer. Converging is not the same as being right.</p>
+
+<p><strong>Read-your-writes with a session token.</strong> The write returns the log position. A read with that token goes to a replica that has caught up to it, and falls back to the leader otherwise.</p>
+<pre><code>package converge
+
+// Node is a copy of the data plus the position in the write log it has
+// applied (a Postgres LSN, a MySQL GTID set, a MongoDB operationTime...).
+type Node struct {
+	Name    string
+	Applied uint64
+	Data    map[string]string
+}
+
+type Store struct {
+	Leader   *Node
+	Replicas []*Node
+}
+
+// Write goes to the leader and returns a session token: the log position
+// the client must see from now on.
+func (s *Store) Write(key, val string) (token uint64) {
+	s.Leader.Applied++
+	s.Leader.Data[key] = val
+	return s.Leader.Applied
+}
+
+// Read serves from the first replica that has caught up to token and
+// falls back to the leader. That gives read-your-writes without pinning
+// every read to the leader.
+func (s *Store) Read(key string, token uint64) (val, from string) {
+	for _, r := range s.Replicas {
+		if r.Applied &gt;= token {
+			return r.Data[key], r.Name
+		}
+	}
+	return s.Leader.Data[key], s.Leader.Name
+}</code></pre>
+<pre><code>package converge
+
+import "fmt"
+
+func ExampleStore_Read() {
+	leader := &amp;Node{Name: "leader", Applied: 41, Data: map[string]string{"name": "Ana"}}
+	r1 := &amp;Node{Name: "replica-1", Applied: 41, Data: map[string]string{"name": "Ana"}}
+	r2 := &amp;Node{Name: "replica-2", Applied: 40, Data: map[string]string{"name": "Ana"}}
+	s := &amp;Store{Leader: leader, Replicas: []*Node{r1, r2}}
+
+	tok := s.Write("name", "Ana Lima") // the user saves their profile
+	fmt.Println("token:", tok)
+	fmt.Println(s.Read("name", 0))   // no token: any replica will do -&gt; stale
+	fmt.Println(s.Read("name", tok)) // no replica at 42 yet -&gt; leader
+
+	r2.Applied, r2.Data["name"] = 42, "Ana Lima" // replication catches up
+	fmt.Println(s.Read("name", tok))
+	// Output:
+	// token: 42
+	// Ana replica-1
+	// Ana Lima leader
+	// Ana Lima replica-2
+}</code></pre>
+<p>Without a token, the read happily returns the old name from replica-1. With it, the read goes to the leader until a replica reaches position 42, then moves back to replicas. Real output of <code>go test -v</code> (each <code>Example</code> passes only if its printed lines match its <code>// Output:</code> block exactly):</p>
+<pre><code>=== RUN   Example
+--- PASS: Example (0.00s)
+=== RUN   ExampleStore_Read
+--- PASS: ExampleStore_Read (0.00s)
+PASS</code></pre>
+
+<p><strong>Real-world scenario.</strong> A social app runs active-active in two regions with async replication between them, typically under 1 s. Post like counts were stored as a plain integer column, updated with read-modify-write in whichever region the user hit, and replicated with last-writer-wins. A celebrity post gets about 2,000 likes per second, split evenly between the regions. Each region overwrites the other's count every time a change replicates, so the stored count lags far behind the real number, and the gap grows with traffic. Nothing errors. The team noticed when the count went <em>down</em> during a 90 s link outage between the regions. The fix: store likes as a per-region counter (a G-Counter with one slot per region; a PN-Counter if unlikes count), keep the set of who liked as the source of truth for "did I like this?", and use a version token so a user's own like shows up instantly in their region even before the other region hears about it.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>"Eventually" with no number.</strong> Measure the window: replication lag percentiles, time to converge after a partition. If you can't say "99% of reads are less than 1 s stale", you can't tell users or product owners what to expect.</li>
+  <li><strong>LWW on read-modify-write data.</strong> Counters, balances, sets and JSON documents edited by several writers lose updates under LWW, with no error. Use CRDT-style types, commutative operations, or route those writes to one leader.</li>
+  <li><strong>Trusting timestamps to order events.</strong> Clocks on different machines disagree by milliseconds or more and can jump. LWW with skewed clocks keeps the <em>older</em> write. Use logical clocks or version vectors when order matters.</li>
+  <li><strong>Forgetting deletes.</strong> In a merge-by-union world, a delete must be recorded as a tombstone, or old copies bring the data back. Tombstones must also be kept long enough for every replica to see them before they are purged.</li>
+  <li><strong>Invariants that need coordination.</strong> "Never sell more seats than exist" or "balance never below zero" can't be checked by one replica alone. Those operations need a strongly consistent path (a single leader, a quorum, or a reservation scheme). Everything else can stay eventual.</li>
+  <li><strong>Reading back from a replica right after writing.</strong> The classic "save, reload, it's gone" bug. Use a version token, leader reads for a short time, or return the written object in the response.</li>
+  <li><strong>Assuming idempotent delivery.</strong> Anti-entropy and retries apply the same update more than once. A merge that isn't idempotent (like "add the other replica's count to mine") double-counts. The G-Counter uses <code>max</code> for exactly this reason.</li>
+</ul>
+
+<div class="callout warn"><strong>Converged does not mean correct.</strong> Last-writer-wins always converges, and it can converge on a value that drops most of your writes. Choose the merge rule for each piece of data on purpose.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Eventual consistency promises convergence once writes stop, nothing about any single read, and no bound on time.</li>
+  <li>Convergence needs every update to reach every replica and a deterministic merge that tolerates reordering and duplicates.</li>
+  <li>LWW loses concurrent writes; version vectors surface conflicts; CRDTs merge them by design.</li>
+  <li>Give users session guarantees (read-your-writes, monotonic reads) with tokens or sticky reads, and keep strong consistency for the few invariants that need it.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#replication">Replication</a> · <a href="#cap-theorem">CAP Theorem</a> · <a href="#clock-skew">Clock Skew</a> · <a href="#network-partitions">Network Partitions</a> · <a href="#idempotency">Idempotency</a> · <a href="#cache-invalidation">Cache Invalidation</a></p>
+`;
