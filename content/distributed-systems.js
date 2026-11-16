@@ -2186,3 +2186,302 @@ PASS</code></pre>
 
 <p><strong>Related:</strong> <a href="#replication">Replication</a> · <a href="#cap-theorem">CAP Theorem</a> · <a href="#clock-skew">Clock Skew</a> · <a href="#network-partitions">Network Partitions</a> · <a href="#idempotency">Idempotency</a> · <a href="#cache-invalidation">Cache Invalidation</a></p>
 `;
+CONTENT["distributed-locks"] = `
+<p class="tldr"><strong>TL;DR</strong>: A distributed lock lets one process, out of many on different machines, work on a shared resource at a time. The hard part is that a lock in a distributed system is really a <strong>lease</strong>: it expires, so a crashed holder can't block everyone forever. And a holder that is paused (GC, a stalled VM, a slow network) can wake up after its lease expired, still believing it holds the lock. If correctness depends on the lock, the resource itself must reject stale holders using a <strong>fencing token</strong>. Think of a hotel key card: when the next guest checks in, the door must stop accepting your old card, even if you still have it in your pocket.</p>
+
+<h2>The problem it solves</h2>
+<p>Inside one process, a <code>sync.Mutex</code> is enough. Across machines, several replicas of a service may all want to do something only one should do at a time:</p>
+<ul>
+  <li>Generate and send invoice #42, once.</li>
+  <li>Run a scheduled job on one of five replicas (see <a href="#cron-jobs">Cron Jobs</a>).</li>
+  <li>Rebuild a cache entry or a report that's expensive to compute.</li>
+  <li>Update a file in object storage, which has no transactions of its own.</li>
+</ul>
+<p>So you put the lock somewhere every process can reach: Redis, etcd, ZooKeeper, or a database. That raises the question every distributed lock design must answer: <strong>what happens when the holder stops responding?</strong> If the lock never expires, one crashed process blocks the job forever. If it expires, a holder that was merely <em>slow</em> loses the lock without knowing it.</p>
+
+<h3>First question: efficiency or correctness?</h3>
+<p>Martin Kleppmann's 2016 post "How to do distributed locking" draws the line that matters most:</p>
+<ul>
+  <li><strong>Efficiency lock</strong>: it saves you from doing the same work twice. If it fails now and then, the cost is small: an extra computation, a duplicate email. A simple single-node lock is fine.</li>
+  <li><strong>Correctness lock</strong>: it prevents two processes from corrupting shared state. If it fails, you lose data or end up inconsistent. Here "it works most of the time" isn't enough, and you need the resource to enforce safety too.</li>
+</ul>
+
+<h2>How it works</h2>
+<h3>The basic Redis lock</h3>
+<p>The single-instance recipe from the Redis docs:</p>
+<pre><code>SET lock:invoice-42 &lt;random-token&gt; NX PX 30000   # acquire: only if absent, 30 s TTL
+
+# release: delete only if the value is still my token (Lua, atomic on the server)
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+# Redis 8.4+ has this as one command:  DELEX lock:invoice-42 IFEQ &lt;random-token&gt;</code></pre>
+<ul>
+  <li><strong><code>NX</code></strong> makes acquiring atomic: only one client can create the key.</li>
+  <li><strong><code>PX</code></strong> (the TTL) is the lease: if the holder crashes, the key disappears and someone else can take over.</li>
+  <li><strong>The random value</strong> proves ownership. A plain <code>DEL</code> could delete a lock that already expired and now belongs to someone else. The compare-and-delete only removes <em>your</em> lock.</li>
+</ul>
+
+<h3>Why a TTL can't guarantee mutual exclusion</h3>
+<p>The lease runs out on the lock server's clock, while the holder is busy. Nothing stops the holder in the middle of its work when the lease ends. Kleppmann's example:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 420" role="img" aria-label="Sequence: client A acquires the lock with token 33, then pauses for a long GC pause. The lock's TTL expires. Client B acquires the lock with token 34 and writes to storage with token 34; storage records 34 as the highest token seen. Client A wakes up and writes with token 33; storage rejects it because 33 is less than 34.">
+  <defs><marker id="arr-dl-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="40" y="10" width="120" height="34" rx="6"/><text x="100" y="32" text-anchor="middle" class="title">Client A</text>
+  <rect class="box accent" x="240" y="10" width="120" height="34" rx="6"/><text x="300" y="32" text-anchor="middle" class="title">Lock service</text>
+  <rect class="box" x="440" y="10" width="120" height="34" rx="6"/><text x="500" y="32" text-anchor="middle" class="title">Client B</text>
+  <rect class="box" x="630" y="10" width="120" height="34" rx="6"/><text x="690" y="32" text-anchor="middle" class="title">Storage</text>
+  <path class="line dashed" d="M100 44 V385" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M300 44 V385" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M500 44 V385" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M690 44 V385" style="stroke: var(--line)"/>
+
+  <path class="line" d="M100 80 H298" marker-end="url(#arr-dl-1)"/><text x="200" y="72" text-anchor="middle" class="small">acquire, TTL 10 s</text>
+  <path class="line ok dashed" d="M300 106 H102" marker-end="url(#arr-dl-1)"/><text x="200" y="98" text-anchor="middle" class="small">ok, token 33</text>
+
+  <rect class="box bad" x="90" y="120" width="20" height="196" rx="4"/>
+  <text x="48" y="212" text-anchor="middle" class="small">GC</text>
+  <text x="48" y="226" text-anchor="middle" class="small">pause</text>
+
+  <rect class="box muted" x="245" y="140" width="110" height="26" rx="6"/><text x="300" y="158" text-anchor="middle" class="small">TTL expires</text>
+
+  <path class="line" d="M500 196 H302" marker-end="url(#arr-dl-1)"/><text x="400" y="188" text-anchor="middle" class="small">acquire</text>
+  <path class="line ok dashed" d="M300 222 H498" marker-end="url(#arr-dl-1)"/><text x="400" y="214" text-anchor="middle" class="small">ok, token 34</text>
+  <path class="line ok" d="M500 256 H688" marker-end="url(#arr-dl-1)"/><text x="595" y="248" text-anchor="middle" class="small">write, token 34</text>
+  <path class="line dashed" d="M690 282 H502" marker-end="url(#arr-dl-1)"/><text x="595" y="274" text-anchor="middle" class="small">ok, max seen = 34</text>
+
+  <path class="line" d="M100 330 H688" marker-end="url(#arr-dl-1)"/><text x="400" y="322" text-anchor="middle" class="small">A wakes up, still "holds" the lock: write, token 33</text>
+  <path class="line bad dashed" d="M690 360 H102" marker-end="url(#arr-dl-1)"/><text x="400" y="352" text-anchor="middle" class="small">rejected: 33 &lt; 34</text>
+  <text x="390" y="408" text-anchor="middle" class="small">without the token check, A's write silently overwrites B's</text>
+</svg>
+<figcaption>The lock service did its job: only one lease existed at any instant. The bug is that A <em>acted</em> on an expired lease. Only the resource sees both writes, so only the resource can reject the stale one.</figcaption>
+</figure>
+<p>Checking "is my lease still valid?" right before writing doesn't help: the pause can happen between the check and the write. And GC is only one source of pauses. A VM being live-migrated, a container hitting its CPU quota, swapping, a <code>SIGSTOP</code>, or a write sitting in a network buffer for seconds all do the same thing. Clocks are the other half: the Redis docs warn that Redis does not use a monotonic clock for TTL expiry, so a wall-clock jump on the server can expire a lock early (see <a href="#clock-skew">Clock Skew</a>).</p>
+
+<h3>Fencing tokens</h3>
+<p>The fix is to have the lock service hand out a number that increases with every acquisition: the <strong>fencing token</strong>. The holder sends it with every write. The resource remembers the highest token it has accepted and rejects anything lower. Now a stale holder is harmless: its writes bounce.</p>
+<p>This only works if the resource takes part. A database can do it with a conditional write:</p>
+<pre><code>-- Fencing check inside the resource: the write only lands if no newer
+-- lock holder has written already.
+UPDATE invoices
+SET    total = $1, fence = $2
+WHERE  id = $3 AND fence &lt;= $2;      -- 0 rows updated = stale token, reject</code></pre>
+<p>If the resource can't check tokens (a third-party API, an email provider), a lock can't make the operation safe. Use the resource's own protection instead, such as an <a href="#idempotency">idempotency key</a>, or accept the occasional duplicate.</p>
+
+<h3>Redlock and the debate</h3>
+<p>A single Redis instance is a single point of failure, and adding a replica doesn't fix it: replication is asynchronous, so the Redis docs describe the race themselves. Client A locks on the primary, the primary crashes before the key reaches the replica, the replica is promoted, client B locks the same resource. To avoid this, the Redis docs propose <strong>Redlock</strong>: N independent Redis primaries (5 in their example). A client tries to <code>SET NX PX</code> on all of them with a short per-node timeout; it holds the lock if it got a majority (at least 3) and the time spent acquiring is less than the TTL. The remaining validity is the TTL minus the time spent.</p>
+<p>Kleppmann's critique: Redlock's safety depends on timing assumptions (bounded network delay, bounded process pauses, bounded clock error), and it produces no fencing token, so it can't stop a paused client from writing after its lease expired. His advice: for efficiency, a single Redis node is simpler and good enough; for correctness, use a consensus system (ZooKeeper, etcd) and fencing tokens. Redis's author, Salvatore Sanfilippo, published a rebuttal, and the Redis docs link to both. The Redis docs now add their own consistency disclaimer: implement fencing tokens for long-running work, and don't assume a lock is held just because the process that acquired it is alive.</p>
+
+<h3>Consensus-based locks: etcd and ZooKeeper</h3>
+<ul>
+  <li><strong>etcd</strong> (Go client, <code>go.etcd.io/etcd/client/v3/concurrency</code>): a <code>Session</code> holds a lease that the client keeps alive with heartbeats (default TTL 60 s). <code>NewMutex(session, "/locks/invoice-42")</code> creates a key under that prefix, attached to the lease. The key with the lowest create revision owns the lock; the others wait for the keys before them to be deleted. If the client dies, the lease expires and its key is deleted. Every write in etcd gets a revision from one cluster-wide counter that only increases, so the lock key's create revision works as a fencing token.</li>
+  <li><strong>ZooKeeper</strong>: each client creates an <em>ephemeral sequential</em> node under the lock path. The lowest sequence number holds the lock. Every other client watches only the node just before its own, so a release wakes one waiter, not all of them (no herd effect). Ephemeral nodes disappear when the session expires. Kleppmann suggests the <code>zxid</code> or the znode version number as a fencing token. In Java, Apache Curator's lock recipe implements this.</li>
+</ul>
+<p>Both are replicated with consensus (Raft in etcd, Zab in ZooKeeper), so losing a minority of nodes doesn't lose the lock state. They still issue leases, so the pause problem remains; the difference is that they give you a reliable token to fence with.</p>
+
+<h3>Database locks</h3>
+<p>If the protected data is in one relational database, often the simplest correct lock is the database itself. <code>SELECT ... FOR UPDATE</code> locks rows until the transaction ends (see <a href="#pessimistic-locking">Pessimistic Locking</a>). Postgres advisory locks (<code>pg_advisory_lock</code>, <code>pg_try_advisory_lock</code>, <code>pg_advisory_xact_lock</code>) lock an application-chosen number, and are released when the session or transaction ends. Better still, when the work <em>is</em> a write to that database, a conditional update or a version column (<a href="#optimistic-locking">optimistic locking</a>) needs no separate lock at all.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Decision tree. Why do you need the lock? For efficiency (duplicates only waste work): a single Redis SET NX PX is enough. For correctness (duplicates corrupt data): can the resource check a fencing token? Yes: use an etcd or ZooKeeper lock and pass the token on every write. No: if the data is in one database, use its transactions or conditional writes; otherwise make the operation idempotent or redesign.">
+  <defs><marker id="arr-dl-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="275" y="12" width="230" height="40" rx="8"/><text x="390" y="37" text-anchor="middle" class="title">Why do you need the lock?</text>
+
+  <rect class="box" x="20" y="100" width="250" height="44" rx="8"/><text x="145" y="119" text-anchor="middle">efficiency</text><text x="145" y="136" text-anchor="middle" class="small">a duplicate only wastes work</text>
+  <rect class="box" x="450" y="100" width="300" height="44" rx="8"/><text x="600" y="119" text-anchor="middle">correctness</text><text x="600" y="136" text-anchor="middle" class="small">a duplicate corrupts data</text>
+  <path class="line" d="M330 52 L160 98" marker-end="url(#arr-dl-2)"/>
+  <path class="line" d="M450 52 L590 98" marker-end="url(#arr-dl-2)"/>
+
+  <rect class="box ok" x="20" y="200" width="250" height="56" rx="8"/><text x="145" y="222" text-anchor="middle">single Redis SET NX PX</text><text x="145" y="241" text-anchor="middle" class="small">document it as "approximate"</text>
+  <path class="line" d="M145 144 V198" marker-end="url(#arr-dl-2)"/>
+
+  <rect class="box accent" x="450" y="170" width="300" height="34" rx="8"/><text x="600" y="192" text-anchor="middle">Can the resource check a token?</text>
+  <path class="line" d="M600 144 V168" marker-end="url(#arr-dl-2)"/>
+
+  <rect class="box ok" x="300" y="240" width="220" height="52" rx="8"/><text x="410" y="261" text-anchor="middle">etcd / ZooKeeper lock</text><text x="410" y="279" text-anchor="middle" class="small">+ fencing token on every write</text>
+  <rect class="box ok" x="540" y="240" width="230" height="52" rx="8"/><text x="655" y="261" text-anchor="middle">DB transaction / conditional</text><text x="655" y="279" text-anchor="middle" class="small">write, or idempotency + redesign</text>
+  <path class="line ok" d="M530 204 L440 238" marker-end="url(#arr-dl-2)"/><text x="505" y="238" text-anchor="middle" class="small">yes</text>
+  <path class="line bad" d="M640 204 L652 238" marker-end="url(#arr-dl-2)"/><text x="672" y="226" class="small">no</text>
+</svg>
+<figcaption>Following Kleppmann's split. Note that "a lock with fencing" and "a database with transactions" are both ways of letting the resource, not the lock, have the final say.</figcaption>
+</figure>
+
+<table>
+  <tr><th>Option</th><th>Holder crashes</th><th>Fencing token</th><th>Safe for correctness?</th><th>Notes</th></tr>
+  <tr><td><strong>Redis, single node</strong> (<code>SET NX PX</code>)</td><td>TTL expires</td><td>none built in (an <code>INCR</code> counter, as in the example, is lost if a failover loses recent writes)</td><td>no: failover and clock jumps can admit two holders</td><td>fast, simple; the right tool for efficiency locks</td></tr>
+  <tr><td><strong>Redlock</strong> (N independent Redis nodes)</td><td>TTL expires on each node</td><td>none</td><td>disputed: depends on timing assumptions</td><td>more machines than a single node, without giving you fencing</td></tr>
+  <tr><td><strong>etcd</strong> (<code>concurrency.Mutex</code>)</td><td>session lease expires (default 60 s)</td><td>yes: the lock key's create revision</td><td>yes, with fencing at the resource</td><td>Raft-replicated; a natural choice if you run Kubernetes or etcd already</td></tr>
+  <tr><td><strong>ZooKeeper</strong> (ephemeral sequential nodes, Curator)</td><td>session expires, node deleted</td><td>yes: <code>zxid</code> or znode version</td><td>yes, with fencing at the resource</td><td>mature; mostly used from the JVM</td></tr>
+  <tr><td><strong>Postgres</strong> (<code>FOR UPDATE</code>, advisory locks)</td><td>connection closes, lock released</td><td>not needed when the work is in the same DB transaction</td><td>yes, for data in that database</td><td>no extra system; holds a connection while locked (see <a href="#connection-pooling">Connection Pooling</a>)</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>A Redis lock with a fencing token, and a resource that checks it.</strong> Acquiring is one Lua script: <code>SET NX PX</code>, and only if that succeeds, <code>INCR</code> a counter to get the next token. Releasing is the compare-and-delete script. The <code>Storage</code> type stands in for the protected resource.</p>
+<pre><code>package dlock
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+var ErrNotAcquired = errors.New("lock held by someone else")
+
+// acquire: SET key token NX PX ttl, and only if that worked, take the next
+// fencing number. One script, so both happen atomically on the server.
+var acquire = redis.NewScript(&#96;
+if redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
+	return redis.call("INCR", KEYS[2])
+end
+return false&#96;)
+
+// release: delete the key only if it still holds OUR token.
+var release = redis.NewScript(&#96;
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("DEL", KEYS[1])
+end
+return 0&#96;)
+
+type Lock struct {
+	rdb   *redis.Client
+	key   string
+	token string // random, proves ownership on release
+	Fence int64  // increases with every acquisition; send it with every write
+}
+
+func Acquire(ctx context.Context, rdb *redis.Client, key string, ttl time.Duration) (*Lock, error) {
+	b := make([]byte, 16)
+	rand.Read(b)
+	token := hex.EncodeToString(b)
+	fence, err := acquire.Run(ctx, rdb, []string{key, key + ":fence"}, token, ttl.Milliseconds()).Int64()
+	if errors.Is(err, redis.Nil) {
+		return nil, ErrNotAcquired
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &amp;Lock{rdb: rdb, key: key, token: token, Fence: fence}, nil
+}
+
+// Release reports whether we still owned the lock. False means it expired
+// and someone else may have taken it: whatever we did after that is suspect.
+func (l *Lock) Release(ctx context.Context) (bool, error) {
+	n, err := release.Run(ctx, l.rdb, []string{l.key}, l.token).Int64()
+	return n == 1, err
+}
+
+// Storage is the protected resource. With fencing on, it remembers the
+// highest token it has seen and refuses writes that carry an older one.
+type Storage struct {
+	mu      sync.Mutex
+	Fencing bool
+	maxSeen int64
+	Value   string
+}
+
+var ErrStaleToken = errors.New("stale fencing token")
+
+func (s *Storage) Write(fence int64, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Fencing &amp;&amp; fence &lt; s.maxSeen {
+		return ErrStaleToken
+	}
+	s.maxSeen = max(s.maxSeen, fence)
+	s.Value = value
+	return nil
+}</code></pre>
+
+<p>The test uses miniredis (an in-memory Redis server for Go tests). <code>FastForward</code> moves miniredis's clock, which plays the part of client A's 15 s pause. The scenario runs twice: without fencing, then with it.</p>
+<pre><code>func Example() {
+	ctx := context.Background()
+	for _, fencing := range []bool{false, true} {
+		mr := miniredis.NewMiniRedis()
+		mr.Start()
+		rdb := redis.NewClient(&amp;redis.Options{Addr: mr.Addr()})
+		store := &amp;Storage{Fencing: fencing}
+		fmt.Printf("=== fencing=%v&#92;n", fencing)
+
+		a, _ := Acquire(ctx, rdb, "lock:invoice-42", 10*time.Second)
+		fmt.Println("A acquires, fence", a.Fence)
+		_, err := Acquire(ctx, rdb, "lock:invoice-42", 10*time.Second)
+		fmt.Println("B tries:", err)
+
+		mr.FastForward(15 * time.Second) // A is stuck in a 15 s GC pause; the TTL runs out
+
+		b, _ := Acquire(ctx, rdb, "lock:invoice-42", 10*time.Second)
+		fmt.Println("B acquires, fence", b.Fence)
+		fmt.Println("B writes:", store.Write(b.Fence, "total=120 (by B)"))
+
+		// A wakes up, still believing it holds the lock, and writes.
+		fmt.Println("A writes:", store.Write(a.Fence, "total=100 (by A)"))
+		ok, _ := a.Release(ctx)
+		fmt.Println("A release, still owner?", ok)
+		fmt.Println("stored:", store.Value)
+		ok, _ = b.Release(ctx)
+		fmt.Println("B release, still owner?", ok)
+
+		rdb.Close()
+		mr.Close()
+	}
+}</code></pre>
+
+<p>Real output, pinned as the example's <code>// Output:</code> (passes <code>go test -race</code>):</p>
+<pre><code>=== fencing=false
+A acquires, fence 1
+B tries: lock held by someone else
+B acquires, fence 2
+B writes: &lt;nil&gt;
+A writes: &lt;nil&gt;
+A release, still owner? false
+stored: total=100 (by A)
+B release, still owner? true
+=== fencing=true
+A acquires, fence 1
+B tries: lock held by someone else
+B acquires, fence 2
+B writes: &lt;nil&gt;
+A writes: stale fencing token
+A release, still owner? false
+stored: total=120 (by B)
+B release, still owner? true</code></pre>
+<ul>
+  <li>In both runs, the lock behaves "correctly": B can't acquire while A's lease is live, and A's late release doesn't delete B's lock (<code>still owner? false</code>).</li>
+  <li>Without fencing, A's write lands after B's, and the stored value is A's stale <code>total=100</code>. Nothing errored. That silent lost update is the real danger.</li>
+  <li>With fencing, storage has seen token 2, so A's token 1 is rejected and B's value stays.</li>
+</ul>
+<p>The token here comes from Redis <code>INCR</code>, which is fine for showing the mechanism. For a correctness lock in production, take the token from a consensus store (etcd's revision, ZooKeeper's <code>zxid</code>) or a database sequence, so a failover can't hand out the same number twice.</p>
+
+<p><strong>Real-world scenario.</strong> Picture a billing service with 4 replicas. Each night, a worker takes a Redis lock with a 30 s TTL per customer, recomputes the invoice and writes the PDF to object storage. One night, the node running replica 2 is overloaded and its container is CPU-throttled: the worker freezes for 45 s in the middle of writing invoice #42. At second 30 the lock expires, replica 3 takes it and writes the corrected invoice. At second 45 replica 2 wakes up and uploads its older version on top. The customer gets the wrong invoice, and every log line says "lock acquired". The fix had nothing to do with Redis: store a <code>fence</code> number in the invoice row, and make the final "publish invoice" step a conditional <code>UPDATE ... WHERE fence &lt;= $token</code>.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Deleting without checking ownership.</strong> <code>DEL lock</code> after your lease expired deletes someone else's lock and lets a third process in. Always compare-and-delete with your random token.</li>
+  <li><strong>TTL shorter than the work.</strong> If the job sometimes takes 40 s and the TTL is 30 s, two holders are routine, not rare. Renewing the lease on a heartbeat while working helps, but a paused process can't renew either, so it narrows the window without closing it.</li>
+  <li><strong>"I'll check the lock right before writing."</strong> A pause can happen between the check and the write. Only a check done by the resource, atomically with the write, is safe.</li>
+  <li><strong>Trusting Redis replication for correctness.</strong> Asynchronous replication plus failover can admit two holders. That's fine for efficiency locks and not fine for correctness locks.</li>
+  <li><strong>Locking when the resource has its own concurrency control.</strong> If the data is in a database, a transaction, a unique constraint or a conditional update is usually simpler and safer than any external lock.</li>
+  <li><strong>No timeout on acquire.</strong> A client waiting forever for a lock turns one stuck holder into a pile-up. Use <code>TryLock</code> or a context deadline, and decide what to do when you can't get it (skip, retry later, fail).</li>
+  <li><strong>Forgetting partitions.</strong> A holder cut off from the lock service may keep working while the lease expires on the other side (see <a href="#network-partitions">Network Partitions</a>). Fencing handles this case too.</li>
+</ul>
+
+<div class="callout warn"><strong>A distributed lock without fencing is advisory.</strong> It makes collisions rare, not impossible. If a collision would corrupt data, the resource must reject stale writers, or the lock must live inside the same transactional system as the data.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Distributed locks are leases: they expire, and the holder can't tell when that happened during a pause.</li>
+  <li>Decide first: efficiency lock (single Redis <code>SET NX PX</code> is fine) or correctness lock (needs fencing).</li>
+  <li>Fencing tokens increase with every acquisition; the resource rejects writes with an older token.</li>
+  <li>For correctness, use a consensus store (etcd revision, ZooKeeper zxid) or the database's own transactions, not Redlock.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#leader-election">Leader Election</a> · <a href="#pessimistic-locking">Pessimistic Locking</a> · <a href="#optimistic-locking">Optimistic Locking</a> · <a href="#clock-skew">Clock Skew</a> · <a href="#network-partitions">Network Partitions</a> · <a href="#cron-jobs">Cron Jobs</a></p>
+`;
+
