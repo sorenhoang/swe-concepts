@@ -1123,3 +1123,382 @@ PASS</code></pre>
 
 <p><strong>Related:</strong> <a href="#read-replicas">Read Replicas</a> · <a href="#leader-election">Leader Election</a> · <a href="#eventual-consistency">Eventual Consistency</a> · <a href="#failover">Failover</a> · <a href="#cap-theorem">CAP Theorem</a> · <a href="#network-partitions">Network Partitions</a></p>
 `;
+CONTENT["leader-election"] = `
+<p class="tldr"><strong>TL;DR</strong>: Leader election makes a group of nodes agree that exactly one of them does a job: accepts writes, runs the scheduler, owns a partition. When that node dies, the rest pick a new one. Agreeing is the easy part. The hard part is the <em>old</em> leader that doesn't know it was replaced. So every leader carries a number that only goes up (a term, an epoch, a fencing token), and whatever it writes to checks that number. It's like a club chair with a numbered mandate: once mandate #3 is issued, letters signed under #2 are ignored.</p>
+
+<h2>The problem it solves</h2>
+<p>Many jobs must be done by one node at a time, while several copies run for availability:</p>
+<ul>
+  <li><strong>A single writer.</strong> A replicated database with one leader (see <a href="#replication">Replication</a>) needs exactly one node deciding the order of writes. Two leaders means two diverging histories.</li>
+  <li><strong>A singleton worker.</strong> A job that expires unpaid reservations, sends the daily invoice email or compacts a table. Run it on all three pods and customers get three emails (see <a href="#cron-jobs">Cron Jobs</a>).</li>
+  <li><strong>An owner per shard.</strong> One consumer per partition, one controller per resource.</li>
+</ul>
+<p>Running exactly one instance by hand is easy, until that machine dies at 3 a.m. Leader election automates the hand-over. It must give two properties:</p>
+<ul>
+  <li><strong>Safety</strong>: at most one leader acts at any moment.</li>
+  <li><strong>Liveness</strong>: if the leader fails, a new one appears within a bounded time.</li>
+</ul>
+<p>The catch is that a node can't tell "the leader is dead" from "the leader is slow" or "the link to the leader is down" (see <a href="#network-partitions">Network Partitions</a>). Any election based on timeouts will sometimes elect a new leader while the old one is still alive. A correct design accepts that and makes the old leader harmless.</p>
+
+<h2>How it works</h2>
+<p>Every approach has the same three parts: a way to <strong>claim</strong> leadership that only one candidate can win (a majority vote, or an atomic create in a consensus store), a way to <strong>keep</strong> it that needs regular proof of life (heartbeats, lease renewals), and a <strong>number</strong> that increases with each new leader. Raft, the consensus algorithm inside etcd, Consul and many databases, shows all three clearly.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 255" role="img" aria-label="Raft server states. A server starts as Follower. If the election timeout fires, it becomes Candidate, increments the term and votes for itself. A Candidate that receives votes from a majority becomes Leader. On a split vote it times out and starts a new election in a new term. A Candidate that finds a current leader or a higher term goes back to Follower. A Leader that sees a higher term steps down to Follower.">
+  <defs><marker id="arr-le-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="30" y="126" text-anchor="middle" class="small">start</text>
+  <path class="line" d="M10 135 H58" marker-end="url(#arr-le-1)"/>
+  <rect class="box" x="60" y="110" width="140" height="50" rx="8"/><text x="130" y="140" text-anchor="middle" class="title">Follower</text>
+  <rect class="box" x="320" y="110" width="140" height="50" rx="8"/><text x="390" y="140" text-anchor="middle" class="title">Candidate</text>
+  <rect class="box accent" x="580" y="110" width="140" height="50" rx="8"/><text x="650" y="140" text-anchor="middle" class="title">Leader</text>
+
+  <path class="line" d="M200 128 H318" marker-end="url(#arr-le-1)"/>
+  <text x="260" y="104" text-anchor="middle" class="small">election timeout:</text>
+  <text x="260" y="119" text-anchor="middle" class="small">term + 1, vote self</text>
+
+  <path class="line" d="M370 110 C 350 60, 430 60, 410 108" marker-end="url(#arr-le-1)"/>
+  <text x="390" y="50" text-anchor="middle" class="small">split vote: time out, new term</text>
+
+  <path class="line accent" d="M460 135 H578" marker-end="url(#arr-le-1)"/>
+  <text x="520" y="126" text-anchor="middle" class="small">majority votes</text>
+
+  <path class="line" d="M390 160 V195 H160 V162" marker-end="url(#arr-le-1)"/>
+  <text x="275" y="188" text-anchor="middle" class="small">finds a leader or a higher term</text>
+
+  <path class="line bad" d="M650 160 V235 H130 V162" marker-end="url(#arr-le-1)"/>
+  <text x="390" y="228" text-anchor="middle" class="small">sees a higher term: steps down</text>
+
+  <text x="650" y="90" text-anchor="middle" class="small">sends heartbeats to keep</text>
+  <text x="650" y="104" text-anchor="middle" class="small">followers from timing out</text>
+</svg>
+<figcaption>Raft's three states. The term number is the logical clock of the whole cluster: any message carrying a higher term makes the receiver update its own term and step down to follower.</figcaption>
+</figure>
+
+<h3>Raft's election, step by step</h3>
+<p>From the Raft paper (Ongaro &amp; Ousterhout, "In Search of an Understandable Consensus Algorithm", 2014):</p>
+<ol>
+  <li><strong>Terms.</strong> Time is divided into numbered terms. Each term begins with an election, and at most one leader can win a given term. Every message carries the sender's term. A server that sees a higher term adopts it and becomes a follower. A request with a stale term is rejected.</li>
+  <li><strong>Heartbeats.</strong> The leader sends regular (possibly empty) AppendEntries messages. A follower that hears nothing for its <strong>election timeout</strong> assumes the leader is gone.</li>
+  <li><strong>Campaign.</strong> It increments its term, votes for itself, and asks every other server for a vote.</li>
+  <li><strong>Voting.</strong> Each server votes for at most one candidate per term, first come first served. It also refuses if its own log is more up to date than the candidate's (the <em>election restriction</em>), so a leader always has every committed entry.</li>
+  <li><strong>Winning.</strong> A candidate with votes from a <strong>majority</strong> becomes leader. Two majorities of the same cluster always share a member, and that member votes only once per term, so two leaders can't win the same term.</li>
+  <li><strong>Split votes.</strong> If nobody wins, candidates time out and try again in a new term. Raft makes this rare by choosing each timeout <strong>randomly</strong> from a range; the paper's example is 150–300 ms. Usually one server times out first and wins before anyone else starts.</li>
+</ol>
+<p>The paper states the timing requirement as <code>broadcastTime ≪ electionTimeout ≪ MTBF</code>: the timeout must be much longer than a round of messages (or healthy leaders get deposed), and much shorter than the average time between server failures (or the cluster is often leaderless). It gives 0.5–20 ms for broadcast time, so election timeouts land between 10 ms and 500 ms. Across data centers, real deployments use longer timeouts. Some implementations, including the <code>hashicorp/raft</code> library used below, add a <strong>pre-vote</strong> phase: a node first asks whether it <em>could</em> win before raising its term, so a node that was cut off can't disrupt a healthy cluster when it rejoins.</p>
+<p>Because a majority is needed, a 3-node cluster survives 1 failure and a 5-node cluster survives 2. A 4-node cluster also survives only 1, which is why clusters have odd sizes.</p>
+
+<h3>Leader election as a service: leases in a consensus store</h3>
+<p>Your application usually shouldn't implement Raft. It borrows an election from a store that already runs one, by creating a key that is tied to a <strong>lease</strong> or <strong>session</strong> that expires unless renewed.</p>
+<ul>
+  <li><strong>etcd.</strong> The Go client's <code>concurrency</code> package has <code>NewSession</code> (a lease kept alive in the background, TTL 60 s by default, set with <code>WithTTL</code>) and <code>NewElection(session, prefix)</code>. <code>Campaign</code> blocks until you are leader; <code>Resign</code> gives it up; <code>Leader</code> and <code>Observe</code> let others see who leads. <code>Rev()</code> returns the creation revision of your leader key. etcd revisions increase for every write in the cluster, so a newer leader always has a bigger <code>Rev()</code>: a ready-made fencing token.</li>
+  <li><strong>ZooKeeper.</strong> The official recipe: each candidate creates an <code>EPHEMERAL</code> + <code>SEQUENCE</code> znode under <code>/election</code>. The one with the smallest sequence number is leader. Each other candidate watches only the next smaller znode, not the leader's, to avoid a "herd effect" of every node waking at once. Ephemeral znodes disappear when their session dies, which triggers the hand-over.</li>
+  <li><strong>Consul</strong> does the same with sessions and a KV "acquire".</li>
+</ul>
+<pre><code>// Not executed here: needs a running etcd cluster.
+cli, _ := clientv3.New(clientv3.Config{Endpoints: []string{"etcd-0:2379"}})
+sess, _ := concurrency.NewSession(cli, concurrency.WithTTL(10)) // lease, kept alive in the background
+e := concurrency.NewElection(sess, "/jobs/expirer")
+
+if err := e.Campaign(ctx, hostname); err != nil { // blocks until we are leader
+	return err
+}
+token := e.Rev() // creation revision of our leader key: grows with every new leader
+
+for {
+	select {
+	case &lt;-sess.Done(): // lease lost (partition, long pause): stop at once
+		return errors.New("lost leadership")
+	case &lt;-tick.C:
+		expireReservations(ctx, token) // the store rejects tokens older than the newest seen
+	}
+}</code></pre>
+<p>Note the <code>sess.Done()</code> branch. Losing the lease is the normal way leadership ends, and the code must stop doing leader work immediately when it happens.</p>
+
+<h3>Kubernetes Lease objects</h3>
+<p>On Kubernetes, controllers and operators use <code>k8s.io/client-go/tools/leaderelection</code> with a <code>Lease</code> object (<code>coordination.k8s.io/v1</code>) as the lock. The leader writes its identity and a renew time into the Lease. Others take over once the lease is older than <code>LeaseDuration</code>. The config has <code>LeaseDuration</code>, <code>RenewDeadline</code>, <code>RetryPeriod</code> and the callbacks <code>OnStartedLeading</code>, <code>OnStoppedLeading</code> and <code>OnNewLeader</code>. The package docs mention core clients defaulting to 15 s, 10 s and 2 s. They are also honest about the limits: the implementation "does not guarantee that only one client is acting as a leader (a.k.a. fencing)". It tolerates clocks that are <em>offset</em> from each other but not clocks that run at different <em>rates</em>.</p>
+
+<h3>Database advisory locks</h3>
+<p>If every instance already talks to one PostgreSQL, <code>SELECT pg_try_advisory_lock(42)</code> is the cheapest election there is: whoever gets the lock leads until their session ends. It's fine for a cron-like job that also writes to that same database. Remember the lock lives on one connection: a connection pool can hand you a different connection, and when the connection drops, leadership is gone. See <a href="#pessimistic-locking">Pessimistic Locking</a> and <a href="#distributed-locks">Distributed Locks</a>.</p>
+
+<h3>Split brain and the stale leader</h3>
+<p>Every lease-based scheme has the same hole. A leader checks "I still hold the lease", then pauses: a stop-the-world GC, a VM migration, a swap storm, a network cut. While it is frozen, its lease expires and another node is elected. Then it wakes up and finishes its write, still believing it leads. Nothing in the election can prevent this, because the old leader isn't running any code during the pause.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Timeline with three rows. Node A is leader in term 2, then is paused or cut off, then wakes still believing it is leader and writes with token 2. Node B is a follower until it sees no heartbeat, wins term 3 and writes with token 3, which the storage accepts and records as max 3. Node A's late write with token 2 is rejected by the storage because 2 is less than 3.">
+  <defs><marker id="arr-le-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="20" y="75" class="title">Node A</text>
+  <text x="20" y="165" class="title">Storage</text>
+  <text x="20" y="255" class="title">Node B</text>
+  <path class="line" d="M100 70 H760" style="stroke: var(--line)"/>
+  <path class="line" d="M100 160 H760" style="stroke: var(--line)"/>
+  <path class="line" d="M100 250 H760" style="stroke: var(--line)"/>
+
+  <rect class="box ok" x="100" y="58" width="150" height="24" rx="5"/><text x="175" y="75" text-anchor="middle">leader, term 2</text>
+  <rect class="box bad" x="250" y="58" width="270" height="24" rx="5"/><text x="385" y="75" text-anchor="middle">paused (GC) or cut off</text>
+  <rect class="box" x="520" y="58" width="200" height="24" rx="5"/><text x="620" y="75" text-anchor="middle">wakes, still "leader"</text>
+
+  <rect class="box muted" x="100" y="238" width="300" height="24" rx="5"/><text x="250" y="255" text-anchor="middle">follower</text>
+  <rect class="box accent" x="400" y="238" width="360" height="24" rx="5"/><text x="580" y="255" text-anchor="middle">leader, term 3</text>
+  <text x="330" y="228" text-anchor="middle" class="small">no heartbeat: election</text>
+
+  <path class="line accent" d="M460 238 V174" marker-end="url(#arr-le-2)"/>
+  <text x="466" y="210" class="small">write, token 3</text>
+  <rect class="box ok" x="405" y="148" width="110" height="24" rx="5"/><text x="460" y="164" text-anchor="middle" class="small">accepted, max = 3</text>
+
+  <path class="line bad dashed" d="M610 82 V146" marker-end="url(#arr-le-2)"/>
+  <text x="616" y="118" class="small">write, token 2</text>
+  <rect class="box bad" x="545" y="148" width="130" height="24" rx="5"/><text x="610" y="164" text-anchor="middle" class="small">rejected: 2 &lt; 3</text>
+
+  <text x="760" y="292" text-anchor="end" class="small">time →</text>
+</svg>
+<figcaption>The election can't stop node A from waking up and writing. Only the resource can, by remembering the highest token it has seen. This is the same idea as fencing in <a href="#distributed-locks">Distributed Locks</a>.</figcaption>
+</figure>
+<p>The fix is a <strong>fencing token</strong>: a number that is larger for every new leader (Raft's term, etcd's leader key revision, a counter you increment on takeover). The leader attaches it to every write, and the resource rejects any token lower than the highest it has seen. For a database, that can be a <code>WHERE fencing_token &lt;= $1</code> condition, or a column the update compares against. Raft does this internally: followers reject AppendEntries from a leader with a stale term. Your own singleton workers need it explicitly. Old-school clusters solve the same problem with <strong>STONITH</strong> ("shoot the other node in the head"): power off the old leader before the new one starts.</p>
+
+<h3>Choosing an approach</h3>
+<table>
+  <tr><th>Approach</th><th>Held by</th><th>Failure detected by</th><th>Fencing token</th><th>Good for</th></tr>
+  <tr><td>Raft / Paxos inside the system</td><td>majority vote per term</td><td>missing heartbeats, randomized election timeout</td><td>the term, checked on every message</td><td>databases, coordination stores, anything replicating a log</td></tr>
+  <tr><td>etcd <code>concurrency.Election</code></td><td>a key bound to a lease</td><td>lease TTL not renewed</td><td><code>Election.Rev()</code></td><td>Go services that need a singleton worker</td></tr>
+  <tr><td>ZooKeeper recipe</td><td>smallest ephemeral sequential znode</td><td>session timeout</td><td>sequence number or the znode's zxid</td><td>JVM ecosystems already running ZooKeeper</td></tr>
+  <tr><td>Kubernetes <code>Lease</code> + client-go</td><td>holder identity + renew time in a Lease object</td><td>renew time older than <code>LeaseDuration</code></td><td>none built in; the docs say so</td><td>controllers and operators; add your own fencing for side effects</td></tr>
+  <tr><td>DB advisory lock</td><td>a lock on one DB connection</td><td>the connection closes</td><td>none; fine when the work is in that same DB</td><td>simple jobs in apps that already share one database</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>A real Raft election in Go, in one process.</strong> This uses <a href="https://github.com/hashicorp/raft">hashicorp/raft</a> (the library behind Consul and Nomad) with its in-memory transport and store, so there's no network and no disk. Three nodes start; we cut the leader off, watch the others elect a new one in a higher term, and use the term as a fencing token on a tiny "store".</p>
+<pre><code>package election
+
+import (
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/hashicorp/raft"
+)
+
+// Node is one member of an in-memory Raft cluster.
+type Node struct {
+	ID   string
+	Raft *raft.Raft
+	tr   *raft.InmemTransport
+}
+
+type noopFSM struct{}
+
+func (noopFSM) Apply(*raft.Log) any                  { return nil }
+func (noopFSM) Snapshot() (raft.FSMSnapshot, error) { return nil, fmt.Errorf("not needed") }
+func (noopFSM) Restore(io.ReadCloser) error         { return nil }
+
+// NewCluster starts n Raft nodes wired by in-memory transports.
+// Only node-0 is bootstrapped; the others learn the config from it.
+func NewCluster(n int) ([]*Node, error) {
+	nodes := make([]*Node, n)
+	var servers []raft.Server
+	for i := range nodes {
+		id := fmt.Sprintf("node-%d", i)
+		addr, tr := raft.NewInmemTransport(raft.ServerAddress(id))
+		nodes[i] = &amp;Node{ID: id, tr: tr}
+		servers = append(servers, raft.Server{ID: raft.ServerID(id), Address: addr})
+	}
+	for _, a := range nodes {
+		for _, b := range nodes {
+			if a != b {
+				a.tr.Connect(b.tr.LocalAddr(), b.tr)
+			}
+		}
+	}
+	for i, nd := range nodes {
+		cfg := raft.DefaultConfig()
+		cfg.LocalID = raft.ServerID(nd.ID)
+		cfg.HeartbeatTimeout = 100 * time.Millisecond // follower waits this long before campaigning
+		cfg.ElectionTimeout = 100 * time.Millisecond
+		cfg.LeaderLeaseTimeout = 50 * time.Millisecond // leader steps down if it can't reach a majority
+		cfg.CommitTimeout = 10 * time.Millisecond
+		cfg.LogOutput = io.Discard
+		store := raft.NewInmemStore()
+		if i == 0 {
+			if err := raft.BootstrapCluster(cfg, store, store, raft.NewInmemSnapshotStore(),
+				nd.tr, raft.Configuration{Servers: servers}); err != nil {
+				return nil, err
+			}
+		}
+		r, err := raft.NewRaft(cfg, noopFSM{}, store, store, raft.NewInmemSnapshotStore(), nd.tr)
+		if err != nil {
+			return nil, err
+		}
+		nd.Raft = r
+	}
+	return nodes, nil
+}
+
+// WaitLeader polls until exactly one reachable node (not in skip) is Leader.
+func WaitLeader(nodes []*Node, skip *Node, timeout time.Duration) *Node {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, nd := range nodes {
+			if nd != skip &amp;&amp; nd.Raft.State() == raft.Leader {
+				return nd
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil
+}
+
+// WaitCaughtUp waits until every node has the leader's log (and so the
+// cluster config). Nodes that were never told who their peers are can't vote.
+func WaitCaughtUp(nodes []*Node, leader *Node) {
+	want := leader.Raft.LastIndex()
+	for _, nd := range nodes {
+		for nd.Raft.LastIndex() &lt; want {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+// Isolate cuts every link to and from nd: a crash, as far as peers can tell.
+func Isolate(nd *Node, nodes []*Node) {
+	for _, o := range nodes {
+		if o != nd {
+			nd.tr.Disconnect(o.tr.LocalAddr())
+			o.tr.Disconnect(nd.tr.LocalAddr())
+		}
+	}
+}
+
+// Heal reconnects nd to every peer.
+func Heal(nd *Node, nodes []*Node) {
+	for _, o := range nodes {
+		if o != nd {
+			nd.tr.Connect(o.tr.LocalAddr(), o.tr)
+			o.tr.Connect(nd.tr.LocalAddr(), nd.tr)
+		}
+	}
+}
+
+// FencedStore is an external resource (say, a job table) that remembers
+// the highest term it has seen and rejects writes carrying an older one.
+type FencedStore struct {
+	mu      sync.Mutex
+	maxTerm uint64
+	Writes  []string
+}
+
+func (s *FencedStore) Write(term uint64, what string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if term &lt; s.maxTerm {
+		return fmt.Errorf("rejected: term %d &lt; %d", term, s.maxTerm)
+	}
+	s.maxTerm = term
+	s.Writes = append(s.Writes, fmt.Sprintf("term %d: %s", term, what))
+	return nil
+}</code></pre>
+<p>The test plays out the scenario from the timeline above:</p>
+<pre><code>package election
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/hashicorp/raft"
+)
+
+func TestFailover(t *testing.T) {
+	nodes, err := NewCluster(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		for _, nd := range nodes {
+			nd.Raft.Shutdown().Error()
+		}
+	}()
+
+	old := WaitLeader(nodes, nil, 5*time.Second)
+	if old == nil {
+		t.Fatal("no leader")
+	}
+	WaitCaughtUp(nodes, old)
+	oldTerm := old.Raft.CurrentTerm()
+	fmt.Printf("leader: %s, term %d&#92;n", old.ID, oldTerm)
+
+	store := &amp;FencedStore{}
+	fmt.Println("old leader writes:", store.Write(oldTerm, "expire reservations"))
+
+	Isolate(old, nodes) // crash, GC pause or partition: peers just stop hearing heartbeats
+	start := time.Now()
+	nw := WaitLeader(nodes, old, 5*time.Second)
+	if nw == nil {
+		t.Fatal("no new leader")
+	}
+	newTerm := nw.Raft.CurrentTerm()
+	fmt.Printf("new leader is a different node: %v&#92;n", nw != old)
+	fmt.Printf("new term &gt; old term: %v&#92;n", newTerm &gt; oldTerm)
+	fmt.Printf("failover under 1s: %v&#92;n", time.Since(start) &lt; time.Second)
+	fmt.Println("new leader writes:", store.Write(newTerm, "expire reservations"))
+
+	// The isolated node wakes up still holding its old term and tries again.
+	fmt.Println("stale leader writes:", store.Write(oldTerm, "expire reservations"))
+
+	// It cannot reach a majority, so its lease runs out and it steps down.
+	for old.Raft.State() == raft.Leader {
+		time.Sleep(5 * time.Millisecond)
+	}
+	fmt.Println("isolated node still leader:", old.Raft.State() == raft.Leader)
+	err = old.Raft.Apply([]byte("x"), 100*time.Millisecond).Error()
+	fmt.Println("Apply on isolated node:", err)
+
+	Heal(old, nodes)
+	for old.Raft.CurrentTerm() &lt; newTerm || old.Raft.State() != raft.Follower {
+		time.Sleep(5 * time.Millisecond)
+	}
+	_, leaderID := old.Raft.LeaderWithID()
+	fmt.Printf("after heal: rejoined as %v, follows the new leader: %v&#92;n",
+		old.Raft.State(), string(leaderID) == nw.ID)
+	fmt.Println("store kept:", store.Writes)
+}</code></pre>
+<p>Real output of <code>go test -run TestFailover -v</code>. Which of node-1 and node-2 wins term 3 depends on which random timeout fires first, so the test prints facts that hold every time; it passed 40 runs in a row with this exact output:</p>
+<pre><code>=== RUN   TestFailover
+leader: node-0, term 2
+old leader writes: &lt;nil&gt;
+new leader is a different node: true
+new term &gt; old term: true
+failover under 1s: true
+new leader writes: &lt;nil&gt;
+stale leader writes: rejected: term 2 &lt; 3
+isolated node still leader: false
+Apply on isolated node: node is not the leader
+after heal: rejoined as Follower, follows the new leader: true
+store kept: [term 2: expire reservations term 3: expire reservations]
+--- PASS: TestFailover (0.97s)
+PASS</code></pre>
+<p>What happened: node-0 won term 2 and wrote. Once isolated, the other two stopped hearing heartbeats, one of them timed out first and won term 3 with two of three votes. The store then had seen term 3, so node-0's late write with term 2 was rejected even though node-0 had no idea it had been replaced. Shortly after, node-0's own leader lease ran out (it couldn't reach a majority), so it stepped down and refused new writes. After the heal, it saw the higher term and rejoined as a follower.</p>
+
+<p><strong>Real-world scenario.</strong> A booking service runs three replicas of a "reservation expirer" that releases seats held for more than 10 minutes without payment. It uses an etcd election with a 10 s session TTL. One replica becomes leader and scans every 5 s. At 14:02:00 the leader's node is overloaded, its process gets swapped out, and it freezes for 25 s. At 14:02:10 the lease expires; at about 14:02:11 replica 2 wins and starts its own scans. One customer paid for their held seat at 14:02:05, so replica 2 correctly leaves that seat alone. At 14:02:25 the old leader wakes up mid-scan, holding a list it read at 14:01:59, when that seat was still unpaid, and tries to release it. Without fencing, the seat is resold. With the token check (<code>UPDATE seats SET held_by = NULL WHERE id = $1 AND $2 &gt;= last_token</code>), the stale write matches zero rows, the old leader sees <code>sess.Done()</code>, and it stops. Total cost: about 11 s with no expirer running, which nobody noticed.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Treating "I am leader" as a fact.</strong> It's a belief that was true at some recent moment. Check leadership before each unit of work, stop as soon as the session or lease is lost, and fence every side effect that matters.</li>
+  <li><strong>Lease timeouts that are too short.</strong> A 1 s lease on a service with 2 s GC pauses or slow cross-zone links means constant leader churn, each change pausing the work. Size timeouts from measured pause and round-trip times, not hopes.</li>
+  <li><strong>…or too long.</strong> A 60 s lease means up to a minute with no leader after a crash. Pick based on how long the job can safely stop.</li>
+  <li><strong>Even-sized quorums.</strong> Four nodes tolerate one failure, the same as three, and a 2/2 network split leaves neither side with a majority. Use 3 or 5 voters.</li>
+  <li><strong>Rolling your own election on a database row with timestamps.</strong> "Leader if <code>heartbeat_at &gt; now() - 10s</code>" depends on clocks that disagree (see <a href="#clock-skew">Clock Skew</a>) and has races between read and update. Use a consensus store, or at least an atomic compare-and-set with a version column.</li>
+  <li><strong>Forgetting the side effects outside the store.</strong> Fencing protects resources that check the token. An email provider or a payment API doesn't. Make those calls idempotent instead (see <a href="#idempotency">Idempotency</a>).</li>
+  <li><strong>Leader as a bottleneck.</strong> If all work goes through one leader, you've built a single-node system with failover. Split work by key (one leader per shard) when one node isn't enough.</li>
+</ul>
+
+<div class="callout warn"><strong>Two leaders will happen.</strong> Timeouts can't tell a dead leader from a paused one, so for a short window the old and new leader both believe they lead. Design so that this window is harmless: fencing tokens on writes, idempotent side effects, and immediate stop on lost lease.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>An election needs an exclusive claim (majority vote or atomic create), proof of life (heartbeats or leases), and a number that grows with each leader.</li>
+  <li>Raft: random election timeouts, one vote per term, majority wins, any higher term makes a leader step down.</li>
+  <li>For your own services, borrow an election from etcd, ZooKeeper or a Kubernetes Lease rather than inventing one.</li>
+  <li>Fence every write with the term or revision, because a stale leader can always wake up and act.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#distributed-locks">Distributed Locks</a> · <a href="#network-partitions">Network Partitions</a> · <a href="#replication">Replication</a> · <a href="#failover">Failover</a> · <a href="#clock-skew">Clock Skew</a> · <a href="#cron-jobs">Cron Jobs</a></p>
+`;
