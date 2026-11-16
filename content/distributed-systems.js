@@ -764,3 +764,362 @@ order-3 create-shipment ok
 <p><strong>Related:</strong> <a href="#distributed-transactions">Distributed Transactions</a> · <a href="#event-driven-architecture">Event-Driven Architecture</a> · <a href="#idempotency">Idempotency</a> · <a href="#retries">Retries</a> · <a href="#dead-letter-queues">Dead Letter Queues</a> · <a href="#real-world-distributed-design">Real-World Distributed Design</a></p>
 `;
 
+CONTENT["replication"] = `
+<p class="tldr"><strong>TL;DR</strong>: Replication keeps copies of the same data on several machines, so one dead disk doesn't lose data, reads can be spread out, and users can read from a nearby copy. The hard part isn't copying. It is deciding <em>when</em> a write counts as done, and what a reader sees while the copies disagree. Think of a notary who keeps the original register and sends photocopies to branch offices by courier: the branches can serve visitors, but they're always a few pages behind.</p>
+
+<h2>The problem it solves</h2>
+<p>A database on one machine has three limits that more hardware can't fully fix:</p>
+<ul>
+  <li><strong>Durability and availability.</strong> When that machine's disk, power supply or whole zone fails, the data is offline. If the disk is gone, the data is gone too, back to the last backup (see <a href="#backups">Backups</a>).</li>
+  <li><strong>Read throughput.</strong> Most apps read far more than they write. One machine has a fixed number of cores and IOPS for all those reads.</li>
+  <li><strong>Latency.</strong> A user 150 ms of round trip away pays that on every query. A copy in their region removes it for reads.</li>
+</ul>
+<p>Replication answers all three by keeping the same data on several nodes, called <strong>replicas</strong>. If data never changed, that would be easy: copy it once. All the difficulty comes from <em>changes</em>. Every write has to reach every copy, and networks are slow, nodes crash mid-way, and links drop. Each design below is a different answer to "who accepts writes, and how do the others find out?"</p>
+
+<h2>How it works</h2>
+<p>There are three families. Almost every database you'll use picks one of them, and some let you choose.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 295" role="img" aria-label="Three replication topologies. Single leader: all writes go to one leader, which ships its log to two followers that serve reads. Multi-leader: two leaders in two regions both accept writes and replicate to each other asynchronously, so conflicts must be resolved. Leaderless: the client sends the write to all three nodes, the write succeeds when W=2 acknowledge, reads ask R=2 nodes, and since W plus R is greater than N the sets overlap; node C missed the write and is stale.">
+  <defs><marker id="arr-rep-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="130" y="22" text-anchor="middle" class="title">Single leader</text>
+  <text x="390" y="22" text-anchor="middle" class="title">Multi-leader</text>
+  <text x="650" y="22" text-anchor="middle" class="title">Leaderless</text>
+  <path class="line dashed" d="M260 10 V290" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M520 10 V290" style="stroke: var(--line)"/>
+
+  <text x="130" y="46" text-anchor="middle" class="small">all writes</text>
+  <path class="line" d="M130 52 V88" marker-end="url(#arr-rep-1)"/>
+  <rect class="box accent" x="75" y="90" width="110" height="40" rx="6"/><text x="130" y="108" text-anchor="middle" class="title">Leader</text><text x="130" y="123" text-anchor="middle" class="small">reads + writes</text>
+  <path class="line" d="M110 130 L75 198" marker-end="url(#arr-rep-1)"/>
+  <path class="line" d="M150 130 L185 198" marker-end="url(#arr-rep-1)"/>
+  <rect class="box" x="20" y="200" width="100" height="40" rx="6"/><text x="70" y="225" text-anchor="middle">Follower 1</text>
+  <rect class="box" x="140" y="200" width="100" height="40" rx="6"/><text x="190" y="225" text-anchor="middle">Follower 2</text>
+  <text x="130" y="262" text-anchor="middle" class="small">followers replay the leader's log</text>
+  <text x="130" y="280" text-anchor="middle" class="small">reads can go to followers</text>
+
+  <text x="325" y="46" text-anchor="middle" class="small">region 1 writes</text>
+  <text x="455" y="46" text-anchor="middle" class="small">region 2 writes</text>
+  <path class="line" d="M325 52 V88" marker-end="url(#arr-rep-1)"/>
+  <path class="line" d="M455 52 V88" marker-end="url(#arr-rep-1)"/>
+  <rect class="box accent" x="280" y="90" width="90" height="40" rx="6"/><text x="325" y="115" text-anchor="middle" class="title">Leader A</text>
+  <rect class="box accent" x="410" y="90" width="90" height="40" rx="6"/><text x="455" y="115" text-anchor="middle" class="title">Leader B</text>
+  <path class="line accent" d="M373 110 H407" marker-start="url(#arr-rep-1)" marker-end="url(#arr-rep-1)"/>
+  <text x="390" y="155" text-anchor="middle" class="small">async, both ways</text>
+  <path class="line" d="M325 130 V198" marker-end="url(#arr-rep-1)"/>
+  <path class="line" d="M455 130 V198" marker-end="url(#arr-rep-1)"/>
+  <rect class="box" x="280" y="200" width="90" height="40" rx="6"/><text x="325" y="225" text-anchor="middle">Follower</text>
+  <rect class="box" x="410" y="200" width="90" height="40" rx="6"/><text x="455" y="225" text-anchor="middle">Follower</text>
+  <text x="390" y="262" text-anchor="middle" class="small">both accept writes, so conflicts</text>
+  <text x="390" y="280" text-anchor="middle" class="small">must be resolved (LWW, merge)</text>
+
+  <rect class="box" x="600" y="36" width="100" height="34" rx="6"/><text x="650" y="58" text-anchor="middle">Client</text>
+  <path class="line" d="M630 70 L572 148" marker-end="url(#arr-rep-1)"/>
+  <path class="line" d="M650 70 V148" marker-end="url(#arr-rep-1)"/>
+  <path class="line dashed" d="M670 70 L728 148" marker-end="url(#arr-rep-1)"/>
+  <rect class="box ok" x="535" y="150" width="66" height="40" rx="6"/><text x="568" y="175" text-anchor="middle">Node A</text>
+  <rect class="box ok" x="617" y="150" width="66" height="40" rx="6"/><text x="650" y="175" text-anchor="middle">Node B</text>
+  <rect class="box bad" x="699" y="150" width="66" height="40" rx="6"/><text x="732" y="168" text-anchor="middle">Node C</text><text x="732" y="183" text-anchor="middle" class="small">stale</text>
+  <text x="650" y="214" text-anchor="middle" class="small">N=3 copies, W=2 acks = write OK</text>
+  <text x="650" y="232" text-anchor="middle" class="small">R=2 replies = read</text>
+  <text x="650" y="262" text-anchor="middle" class="small">W + R &gt; N: the sets overlap</text>
+  <text x="650" y="280" text-anchor="middle" class="small">read repair fixes stale copies</text>
+</svg>
+<figcaption>Single leader is the default for relational databases. Multi-leader shows up across regions and in offline-first apps. Leaderless comes from Amazon's Dynamo paper and lives on in Cassandra and its relatives.</figcaption>
+</figure>
+
+<h3>Single leader (leader-follower, primary-replica)</h3>
+<p>One node, the <strong>leader</strong>, accepts every write. It records each change in a log, applies it locally, and streams the log to its <strong>followers</strong>. Each follower replays the log in the same order, so it ends up in the same state, just a little later. Reads can go to the leader or to any follower (see <a href="#read-replicas">Read Replicas</a> for routing reads in practice).</p>
+<p>This is the model behind PostgreSQL streaming replication, MySQL replication, MongoDB replica sets and Kafka partitions. It is popular because there are no write conflicts: one node decides the order of all writes. The costs are that write throughput is capped by one machine, and that someone has to pick a new leader when the leader dies (see <a href="#leader-election">Leader Election</a> and <a href="#failover">Failover</a>).</p>
+
+<h3>What exactly gets shipped</h3>
+<ul>
+  <li><strong>Statements.</strong> Send the SQL text (<code>UPDATE … SET seen_at = NOW()</code>) and re-run it on each follower. It's compact, but anything nondeterministic breaks it: <code>NOW()</code>, <code>RAND()</code>, auto-increment under concurrency, triggers. MySQL's old <code>STATEMENT</code> binlog format works this way.</li>
+  <li><strong>Physical log (WAL shipping).</strong> Send the storage engine's own write-ahead log: "these bytes changed in this page". PostgreSQL streaming replication does this. It is exact, but tied to the storage format, so primary and standby must run the same major version and architecture.</li>
+  <li><strong>Logical (row-based) log.</strong> Send "row with id 42 in <code>orders</code> now has status=paid". It is independent of the storage format, so you can replicate across versions, into a different database, or into a stream for change data capture. MySQL's <code>ROW</code> binlog format and PostgreSQL logical replication (publications and subscriptions) work this way.</li>
+</ul>
+
+<h3>Sync, async and semi-sync: when is a write "done"?</h3>
+<p>This is the most important knob, because it decides what you lose when the leader dies.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 320" role="img" aria-label="Three timelines, one per mode. Async: the client gets OK right after the leader commits; until follower 1 has the change, a leader crash loses an acknowledged write. Semi-sync: the client gets OK after follower 1 has it; follower 2 may still lag, and MySQL falls back to async on timeout. Sync: the client gets OK only after every follower has it, so one slow follower stalls every commit.">
+  <text x="20" y="58" class="title">Async</text><text x="20" y="76" class="small">the usual default</text>
+  <path class="line" d="M190 60 H760"/>
+  <path class="line" d="M230 54 V66"/><path class="line" d="M420 54 V66"/><path class="line" d="M620 54 V66"/>
+  <text x="230" y="46" text-anchor="middle" class="small">leader commit</text>
+  <text x="420" y="46" text-anchor="middle" class="small">follower 1 has it</text>
+  <text x="620" y="46" text-anchor="middle" class="small">follower 2 has it</text>
+  <rect class="box bad" x="250" y="56" width="168" height="8"/>
+  <rect class="box ok" x="200" y="72" width="100" height="24" rx="5"/><text x="250" y="88" text-anchor="middle" class="small">client gets OK</text>
+  <text x="312" y="88" class="small">acked, but lost if the leader dies here</text>
+
+  <text x="20" y="153" class="title">Semi-sync</text><text x="20" y="171" class="small">e.g. MySQL semisync</text>
+  <path class="line" d="M190 155 H760"/>
+  <path class="line" d="M230 149 V161"/><path class="line" d="M420 149 V161"/><path class="line" d="M620 149 V161"/>
+  <text x="230" y="141" text-anchor="middle" class="small">leader commit</text>
+  <text x="420" y="141" text-anchor="middle" class="small">follower 1 has it</text>
+  <text x="620" y="141" text-anchor="middle" class="small">follower 2 has it</text>
+  <rect class="box ok" x="420" y="167" width="100" height="24" rx="5"/><text x="470" y="183" text-anchor="middle" class="small">client gets OK</text>
+  <text x="470" y="210" text-anchor="middle" class="small">one copy elsewhere is enough; on timeout MySQL falls back to async</text>
+
+  <text x="20" y="253" class="title">Sync</text><text x="20" y="271" class="small">e.g. Postgres sync standby</text>
+  <path class="line" d="M190 255 H760"/>
+  <path class="line" d="M230 249 V261"/><path class="line" d="M420 249 V261"/><path class="line" d="M620 249 V261"/>
+  <text x="230" y="241" text-anchor="middle" class="small">leader commit</text>
+  <text x="420" y="241" text-anchor="middle" class="small">follower 1 has it</text>
+  <text x="620" y="241" text-anchor="middle" class="small">follower 2 has it</text>
+  <rect class="box ok" x="620" y="267" width="100" height="24" rx="5"/><text x="670" y="283" text-anchor="middle" class="small">client gets OK</text>
+  <text x="560" y="310" text-anchor="middle" class="small">nothing acked is lost, but one slow or dead follower stalls every commit</text>
+</svg>
+<figcaption>Moving the "OK" to the right buys durability with latency. The red bar is the window in which a leader crash loses a write the client was already told succeeded.</figcaption>
+</figure>
+<ul>
+  <li><strong>Asynchronous.</strong> The leader commits locally and answers. Followers catch up when they can. Writes are fast and a slow follower can't hurt the leader, but if the leader dies, every write the followers hadn't received yet is lost, even though clients were told "OK". This is the default in PostgreSQL (no <code>synchronous_standby_names</code>), MySQL and most managed read replicas.</li>
+  <li><strong>Synchronous.</strong> The leader waits for followers before answering. In PostgreSQL, <code>synchronous_commit</code> picks how far "has it" goes: <code>remote_write</code> (written to the standby's OS), <code>on</code> (flushed to the standby's disk, the default) or <code>remote_apply</code> (applied, so it is visible to queries there). Waiting for <em>all</em> followers means one sick follower stops all writes, so in practice you wait for some of them: <code>synchronous_standby_names = 'ANY 1 (a, b)'</code> waits for any one of two.</li>
+  <li><strong>Semi-synchronous.</strong> Wait for at least one follower, not all. In MySQL, the source blocks the commit until a replica confirms it has written the transaction to its relay log and flushed it to disk. The replica doesn't have to apply it first. By default (<code>rpl_semi_sync_source_wait_point = AFTER_SYNC</code>) the source waits after syncing its binary log and before committing in the storage engine, so other clients can't see a write that no replica has. If no replica answers within <code>rpl_semi_sync_source_timeout</code> (default 10,000 ms), the source silently falls back to async. Alert on that.</li>
+</ul>
+<pre><code># primary: postgresql.conf  (not executed here)
+wal_level = replica
+synchronous_standby_names = 'ANY 1 (replica_a, replica_b)'
+synchronous_commit = on        # wait until 1 of the 2 has flushed the WAL
+
+-- one transaction that may be lost on failover, by choice:
+BEGIN;
+SET LOCAL synchronous_commit TO off;
+INSERT INTO page_views (page, at) VALUES ('/home', now());
+COMMIT;</code></pre>
+<p>In PostgreSQL the setting is per transaction: pay for durability on payments, skip it for page-view counters.</p>
+
+<h3>Replication lag and what it does to readers</h3>
+<p>With async replication, a follower is always some distance behind: usually milliseconds, sometimes minutes during a bulk import, a long transaction, or a follower under heavy read load. Reading from followers then breaks guarantees that users assume without thinking:</p>
+<ul>
+  <li><strong>Read-your-writes.</strong> A user saves their profile, the page reloads from a follower, and the old profile comes back. They think the save failed, and they save again.</li>
+  <li><strong>Monotonic reads.</strong> Two refreshes hit two followers at different lag. The second shows <em>older</em> data than the first, so a new comment appears and then disappears.</li>
+</ul>
+<p>The fixes (send a user's reads to the leader for a while after they write, carry a log position token, pin a session to one replica) belong to <a href="#eventual-consistency">Eventual Consistency</a>. The example below shows both anomalies happening.</p>
+
+<h3>Failover: where async loses data</h3>
+<p>When the leader dies, a follower is promoted. With async replication the new leader may be missing the last few writes, and they are gone. Clients were told those writes succeeded. Worse, if the old leader comes back and still has them, they now conflict with whatever the new leader accepted. Systems handle that by throwing them away. MongoDB's docs say it plainly: data can be rolled back if the primary steps down before its writes reach a secondary. Its implicit default write concern is <code>w: "majority"</code>, so the write is acknowledged only once a majority has it, which is what survives an election. (Some arbiter setups fall back to <code>w: 1</code>.)</p>
+<p>Kafka makes the same trade explicit. Each partition has a leader and an <strong>in-sync replica set</strong> (ISR). A follower that hasn't caught up within <code>replica.lag.time.max.ms</code> (default 30 s) drops out of the ISR. A producer with <code>acks=all</code> waits for every ISR member, and <code>min.insync.replicas</code> (default 1, commonly set to 2) refuses writes when too few replicas are in sync. If every in-sync replica dies, <code>unclean.leader.election.enable</code> (default <code>false</code>) decides whether an out-of-sync replica may take over and lose data, or the partition stays unavailable. That is the durability-vs-availability choice as a single flag.</p>
+
+<h3>Multi-leader</h3>
+<p>Several nodes accept writes, usually one per region (or one per device, for offline-first apps and collaborative editors), and replicate to each other asynchronously. Users write to a nearby leader with low latency, and each region keeps working when the link between them is down. The price is <strong>write conflicts</strong>: two leaders can change the same row at the same time, and neither knew about the other. You need a rule for every conflict: last-writer-wins (which silently drops one write), merging, or keeping both versions for the app to resolve. Those rules are covered in <a href="#eventual-consistency">Eventual Consistency</a>. Auto-increment keys, unique constraints and triggers all break in surprising ways, so prefer to route each record's writes to one "home" region. If you only need failover, single leader with automatic election is much simpler.</p>
+
+<h3>Leaderless (Dynamo-style)</h3>
+<p>Amazon's Dynamo paper (DeCandia et al., SOSP 2007) dropped the leader altogether. The client, or a coordinator node acting for it, sends each write to all <strong>N</strong> replicas of a key and treats it as successful once <strong>W</strong> of them acknowledge. A read asks <strong>R</strong> replicas and keeps the newest version. When <strong>W + R &gt; N</strong>, every read set overlaps every write set, so at least one replica in any read has the latest acknowledged write. A common setting is N=3, W=2, R=2. Lowering W or R makes operations faster and more available, and lets reads miss writes.</p>
+<p>Replicas that missed a write are repaired three ways:</p>
+<ul>
+  <li><strong>Read repair</strong>: when a read sees an older version on one replica, it writes the newer one back.</li>
+  <li><strong>Hinted handoff</strong>: if a target replica is down, another node stores the write with a "hint" naming the intended owner, and hands it over when the owner returns. Dynamo combines this with a <em>sloppy quorum</em>: it uses the first N <em>healthy</em> nodes rather than a strict fixed set.</li>
+  <li><strong>Anti-entropy</strong>: a background process compares replicas (Dynamo and Cassandra use Merkle trees) and copies over what's missing. Cassandra's docs call read repair and hints best-effort; regular repair is what guarantees convergence.</li>
+</ul>
+<p>Cassandra exposes this per query as a <strong>consistency level</strong>: <code>ONE</code>, <code>TWO</code>, <code>THREE</code>, <code>QUORUM</code>, <code>ALL</code>, <code>LOCAL_QUORUM</code>, <code>EACH_QUORUM</code>, <code>LOCAL_ONE</code> and <code>ANY</code> (writes only). Concurrent writes to the same column are resolved by last-write-wins on timestamps, which is why clock quality matters there (see <a href="#clock-skew">Clock Skew</a>).</p>
+
+<h3>Comparison of real systems</h3>
+<table>
+  <tr><th>System</th><th>Topology</th><th>What is shipped</th><th>Default ack</th><th>Durability knob</th></tr>
+  <tr><td>PostgreSQL streaming</td><td>single leader</td><td>physical WAL</td><td>async</td><td><code>synchronous_standby_names</code> (<code>FIRST n</code> / <code>ANY n</code>) + <code>synchronous_commit</code> per transaction</td></tr>
+  <tr><td>MySQL / MariaDB</td><td>single leader (multi-source and group replication exist)</td><td>binlog: <code>ROW</code>, <code>STATEMENT</code> or <code>MIXED</code></td><td>async</td><td>semi-sync plugin: wait for N replica receipts, fall back to async on timeout</td></tr>
+  <tr><td>MongoDB replica set</td><td>single leader (primary), automatic election</td><td>oplog (logical)</td><td><code>w: "majority"</code> (implicit default; arbiters can change it)</td><td>write concern per operation; read concern and read preference for reads</td></tr>
+  <tr><td>Cassandra / ScyllaDB</td><td>leaderless</td><td>the write itself, to N replicas</td><td>set per query (each driver has its own default; check yours)</td><td>consistency level per query; LWW per column</td></tr>
+  <tr><td>Kafka</td><td>single leader per partition</td><td>log segments (followers fetch)</td><td>producer <code>acks=all</code> (the default since Kafka 3.0)</td><td><code>min.insync.replicas</code>, <code>unclean.leader.election.enable</code></td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>A leader with async followers, in Go.</strong> A real database is too big to show, so this is a small in-process model with the same moving parts: a replication log, followers that apply it in order, and a <code>Ship</code> call whose <code>n</code> argument plays the role of lag. It also contains a Dynamo-style quorum read. It uses only the standard library.</p>
+<pre><code>package replication
+
+import "fmt"
+
+// Mode is when the leader acknowledges a write to the client.
+type Mode int
+
+const (
+	Async    Mode = iota // ack after the leader's own write
+	SemiSync             // ack after at least one follower has it
+	Sync                 // ack after every follower has it
+)
+
+type Op struct {
+	Index    int
+	Key, Val string
+}
+
+type Replica struct {
+	Name    string
+	Data    map[string]string
+	Applied int // index of the last log entry applied
+}
+
+func newReplica(name string) *Replica {
+	return &amp;Replica{Name: name, Data: map[string]string{}}
+}
+
+func (r *Replica) apply(op Op) {
+	r.Data[op.Key] = op.Val
+	r.Applied = op.Index
+}
+
+// Cluster is a single-leader setup: all writes go to the leader, which
+// appends them to its replication log and ships the log to followers.
+type Cluster struct {
+	Mode      Mode
+	Leader    *Replica
+	Followers []*Replica
+	log       []Op
+}
+
+func NewCluster(mode Mode, followers ...string) *Cluster {
+	c := &amp;Cluster{Mode: mode, Leader: newReplica("leader")}
+	for _, f := range followers {
+		c.Followers = append(c.Followers, newReplica(f))
+	}
+	return c
+}
+
+func (c *Cluster) Write(key, val string) {
+	op := Op{Index: len(c.log) + 1, Key: key, Val: val}
+	c.log = append(c.log, op)
+	c.Leader.apply(op)
+	switch c.Mode {
+	case Sync:
+		for _, f := range c.Followers {
+			c.Ship(f, len(c.log))
+		}
+	case SemiSync:
+		c.Ship(c.Followers[0], len(c.log))
+	}
+	// Async: the client is told "OK" now; followers catch up later.
+}
+
+// Ship sends up to n pending log entries to follower f (n models lag).
+func (c *Cluster) Ship(f *Replica, n int) {
+	for n &gt; 0 &amp;&amp; f.Applied &lt; len(c.log) {
+		f.apply(c.log[f.Applied])
+		n--
+	}
+}
+
+// Failover promotes the most up-to-date follower after the leader dies and
+// returns the acknowledged writes that never reached it: they are gone.
+func (c *Cluster) Failover() (promoted *Replica, lost []Op) {
+	promoted = c.Followers[0]
+	for _, f := range c.Followers[1:] {
+		if f.Applied &gt; promoted.Applied {
+			promoted = f
+		}
+	}
+	return promoted, c.log[promoted.Applied:]
+}
+
+// Versioned is a value in a leaderless (Dynamo-style) store.
+type Versioned struct {
+	Val     string
+	Version int
+}
+
+// QuorumRead asks the given replicas and keeps the highest version. With
+// W + R &gt; N, at least one of them is guaranteed to hold the latest write.
+func QuorumRead(replicas []map[string]Versioned, key string) Versioned {
+	var best Versioned
+	for _, r := range replicas {
+		if v, ok := r[key]; ok &amp;&amp; v.Version &gt; best.Version {
+			best = v
+		}
+	}
+	return best
+}
+
+func (op Op) String() string { return fmt.Sprintf("#%d %s=%s", op.Index, op.Key, op.Val) }</code></pre>
+<p>The tests are Go <code>Example</code> functions, so <code>go test</code> fails if the printed output doesn't match the <code>// Output:</code> comment exactly. Every output below is real.</p>
+<pre><code>package replication
+
+import "fmt"
+
+func ExampleCluster_lagAnomalies() {
+	c := NewCluster(Async, "f1", "f2")
+	c.Write("bio", "v1")
+	c.Ship(c.Followers[0], 10)
+	c.Ship(c.Followers[1], 10)
+
+	c.Write("bio", "v2") // the user edits their profile
+	c.Ship(c.Followers[0], 1)
+	// f2 is behind (busy, far away, or replaying a big transaction)
+
+	f1, f2 := c.Followers[0], c.Followers[1]
+	fmt.Println("leader:", c.Leader.Data["bio"])
+	fmt.Println("read 1 via f1:", f1.Data["bio"])
+	fmt.Println("read 2 via f2:", f2.Data["bio"], "&lt;- went back in time (monotonic reads)")
+	fmt.Printf("lag: f1=%d f2=%d entries&#92;n", c.Leader.Applied-f1.Applied, c.Leader.Applied-f2.Applied)
+	// Output:
+	// leader: v2
+	// read 1 via f1: v2
+	// read 2 via f2: v1 &lt;- went back in time (monotonic reads)
+	// lag: f1=0 f2=1 entries
+}
+
+func ExampleCluster_Failover() {
+	for _, mode := range []Mode{Async, SemiSync} {
+		c := NewCluster(mode, "f1", "f2")
+		for i := 1; i &lt;= 5; i++ {
+			c.Write(fmt.Sprintf("order-%d", i), "paid")
+		}
+		c.Ship(c.Followers[1], 2) // background shipping got this far...
+		// ...and then the leader's disk dies. Every write above was acked.
+		promoted, lost := c.Failover()
+		fmt.Printf("%-8s promoted %s at #%d, lost %d acked writes %v&#92;n",
+			[]string{"async", "semisync"}[mode], promoted.Name, promoted.Applied, len(lost), lost)
+	}
+	// Output:
+	// async    promoted f2 at #2, lost 3 acked writes [#3 order-3=paid #4 order-4=paid #5 order-5=paid]
+	// semisync promoted f1 at #5, lost 0 acked writes []
+}
+
+func ExampleQuorumRead() {
+	// N=3 replicas. A write with W=2 reached A and B; C missed it.
+	a := map[string]Versioned{"cart": {"[book, pen]", 2}}
+	b := map[string]Versioned{"cart": {"[book, pen]", 2}}
+	cc := map[string]Versioned{"cart": {"[book]", 1}}
+
+	fmt.Println("R=1 from C:   ", QuorumRead([]map[string]Versioned{cc}, "cart"))
+	fmt.Println("R=2 from B, C:", QuorumRead([]map[string]Versioned{b, cc}, "cart"))
+	fmt.Println("R=2 from A, C:", QuorumRead([]map[string]Versioned{a, cc}, "cart"))
+	// Output:
+	// R=1 from C:    {[book] 1}
+	// R=2 from B, C: {[book, pen] 2}
+	// R=2 from A, C: {[book, pen] 2}
+}</code></pre>
+<p>Real output of <code>go test -v</code>:</p>
+<pre><code>=== RUN   ExampleCluster_lagAnomalies
+--- PASS: ExampleCluster_lagAnomalies (0.00s)
+=== RUN   ExampleCluster_Failover
+--- PASS: ExampleCluster_Failover (0.00s)
+=== RUN   ExampleQuorumRead
+--- PASS: ExampleQuorumRead (0.00s)
+PASS</code></pre>
+<p>Read the results in order. The first example breaks monotonic reads: two reads in a row went from <code>v2</code> back to <code>v1</code>, just because they hit different followers. The second is the important one: the same five acknowledged payments, the same crash. In async mode, three of them vanish on failover. In semi-sync mode none do, because the leader didn't answer until a follower had each write. The third shows the quorum rule: R=1 can land on the stale node, while any R=2 overlaps the W=2 write set and finds version 2.</p>
+
+<p><strong>Real-world scenario.</strong> A ticketing service runs PostgreSQL with a primary in one zone and two async standbys in other zones. Normal lag is under 50 ms. At 20:00 a concert goes on sale and writes jump to 3,000 transactions per second. A standby that is also serving heavy read traffic falls 4 s behind. Two things go wrong. First, buyers who just paid reload "My tickets" from that standby and see nothing, and some pay again. Routing each user's reads to the primary for a short while after a write, or using a log position token, fixes that. Second, at 20:07 the primary's host dies. The automation promotes the standby with the least lag, which is still about 0.3 s behind: roughly 900 acknowledged transactions at that rate, now gone, for tickets people believe they own. The team's fix is <code>synchronous_standby_names = 'ANY 1 (standby_a, standby_b)'</code>. Commits now wait for one of two standbys to flush, which costs a cross-zone round trip of a millisecond or two, and losing one standby doesn't block writes. They also add an alert on replication lag, and on the number of synchronous standbys dropping to zero.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Thinking a replica is a backup.</strong> Replication copies mistakes instantly. A <code>DELETE</code> without a <code>WHERE</code>, or a bad migration, reaches every follower within milliseconds. You still need point-in-time backups (see <a href="#backups">Backups</a>).</li>
+  <li><strong>Forgetting that async failover loses acknowledged writes.</strong> "We have three replicas" doesn't mean "no data loss". With async replication, promotion throws away whatever the new leader hadn't received. Decide per operation which writes must wait for a replica.</li>
+  <li><strong>Synchronous to all followers.</strong> One slow disk or one network blip on any follower now stalls every write in the system. Use quorum-style sync (<code>ANY 1</code>, <code>w: "majority"</code>, <code>min.insync.replicas=2</code> with 3 replicas).</li>
+  <li><strong>Semi-sync that quietly isn't.</strong> MySQL semi-sync falls back to async after the timeout and keeps running. Without an alert on that state, you believe you have a guarantee you lost weeks ago.</li>
+  <li><strong>Reading from followers on every request.</strong> Read-after-write and monotonic read bugs then show up as "the save button doesn't work" tickets. Decide which reads may be stale, and route the rest to the leader or use session guarantees.</li>
+  <li><strong>Not watching lag.</strong> Lag grows silently during bulk jobs and long transactions. Track it (in seconds and in bytes or log position) on every follower, and take lagging replicas out of the read pool. Big lag also makes failover lose more.</li>
+  <li><strong>Assuming W + R &gt; N means linearizable.</strong> Sloppy quorums, concurrent writes resolved by timestamps, and partial write failures still let a reader see an old value after a newer one. Quorums reduce staleness; they don't remove it.</li>
+</ul>
+
+<div class="callout warn"><strong>"OK" from an async leader means "written on one machine".</strong> If that machine dies before shipping the change, the write is gone, and the client was told it succeeded. Know which of your writes are in that state, and make the ones that matter wait for a second copy.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Replication buys durability, read scale and locality. All the complexity comes from changes and from deciding when a write is "done".</li>
+  <li>Single leader avoids conflicts; multi-leader and leaderless trade conflicts for write availability and latency.</li>
+  <li>Async is fast and loses acknowledged writes on failover. Semi-sync or quorum-sync (wait for some, not all) is the usual middle ground.</li>
+  <li>Reading from lagging followers breaks read-your-writes and monotonic reads. Plan which reads tolerate that, and monitor lag.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#read-replicas">Read Replicas</a> · <a href="#leader-election">Leader Election</a> · <a href="#eventual-consistency">Eventual Consistency</a> · <a href="#failover">Failover</a> · <a href="#cap-theorem">CAP Theorem</a> · <a href="#network-partitions">Network Partitions</a></p>
+`;
