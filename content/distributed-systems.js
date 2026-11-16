@@ -2864,3 +2864,256 @@ ok</code></pre>
 
 <p><strong>Related:</strong> <a href="#cap-theorem">CAP Theorem</a> · <a href="#leader-election">Leader Election</a> · <a href="#distributed-locks">Distributed Locks</a> · <a href="#replication">Replication</a> · <a href="#chaos-engineering">Chaos Engineering</a> · <a href="#timeouts">Timeouts</a></p>
 `;
+CONTENT["clock-skew"] = `
+<p class="tldr"><strong>TL;DR</strong>: Every machine's clock is slightly wrong, and each is wrong by a different amount. Clock <strong>skew</strong> is the difference between two clocks at the same moment. That makes wall-clock timestamps unsafe for deciding which of two events on different machines came first: a node whose clock runs fast can make an older write look newer. It's like two people timing a race with watches set a few seconds apart. Use the monotonic clock for durations, and logical clocks (Lamport, vector, hybrid) for ordering.</p>
+
+<h2>The problem it solves</h2>
+<p>Developers reach for timestamps without thinking: "keep the most recent update", "this lease expires at 12:00:05", "sort the log lines by time". On one machine this mostly works. Across machines, each timestamp comes from a different clock, and nothing guarantees those clocks agree.</p>
+<ul>
+  <li><strong>Quartz oscillators drift.</strong> Their rate depends on temperature and on the individual crystal. Google's Spanner paper (2012) assumes a worst-case drift of 200 µs per second for its servers. Left uncorrected, that's about 17 seconds a day.</li>
+  <li><strong>Synchronization is approximate.</strong> NTP typically keeps a host within tens of milliseconds of true time over the public internet, and can reach better than a millisecond on a good local network. Accuracy depends on the path's delay and its asymmetry, and a misconfigured, firewalled or overloaded host can be off by far more without anyone noticing.</li>
+  <li><strong>Clocks jump.</strong> When NTP finds a big offset, it may <em>step</em> the clock instead of slewing it gently, so the wall clock can move backwards. VM pauses and live migrations do the same. And leap seconds insert an extra second at the end of a day.</li>
+</ul>
+<p>Any logic that compares wall-clock timestamps from different machines inherits all of this: lost updates under last-writer-wins, leases that two nodes both believe they hold, tokens rejected as "not yet valid", log lines in the wrong order during an incident.</p>
+
+<h2>How it works</h2>
+<h3>How skew loses a write</h3>
+<p>Last-writer-wins (LWW) resolves conflicting writes by keeping the one with the larger timestamp. Cassandra does this per column, and DynamoDB global tables in their default mode resolve conflicts the same way. It's correct only if timestamps follow real order. Here is what happens when one clock runs 500 ms fast:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 270" role="img" aria-label="Timeline in true time from 1000 to 1200 milliseconds. Node A's clock is 500 milliseconds fast. At true time 1000, A writes price equals 10 and stamps it 1500. The write replicates to node B, arriving at 1150. At true time 1200, B, whose clock is correct, writes price equals 12 and stamps it 1200. Last-writer-wins compares 1500 with 1200 and keeps price equals 10, the older write.">
+  <defs><marker id="arr-cs-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="400" y="18" text-anchor="middle" class="small">true time (ms)</text>
+  <path class="line" d="M150 30 H700" marker-end="url(#arr-cs-1)"/>
+  <path class="line" d="M150 25 V35 M400 25 V35 M525 25 V35 M650 25 V35"/>
+  <text x="150" y="48" text-anchor="middle" class="small">1000</text>
+  <text x="400" y="48" text-anchor="middle" class="small">1100</text>
+  <text x="525" y="48" text-anchor="middle" class="small">1150</text>
+  <text x="650" y="48" text-anchor="middle" class="small">1200</text>
+
+  <text x="60" y="100" text-anchor="middle" class="title">Node A</text>
+  <text x="60" y="116" text-anchor="middle" class="small">clock +500 ms</text>
+  <path class="line" d="M110 105 H740" style="stroke: var(--line)"/>
+  <text x="60" y="190" text-anchor="middle" class="title">Node B</text>
+  <text x="60" y="206" text-anchor="middle" class="small">clock correct</text>
+  <path class="line" d="M110 195 H740" style="stroke: var(--line)"/>
+
+  <rect class="box bad" x="155" y="68" width="190" height="26" rx="5"/><text x="250" y="86" text-anchor="middle" class="small">price=10, stamped 1500</text>
+  <ellipse class="box accent" cx="150" cy="105" rx="6" ry="6"/>
+  <path class="line dashed" d="M155 110 L518 192" marker-end="url(#arr-cs-1)"/>
+  <text x="290" y="174" text-anchor="middle" class="small">replicated to B</text>
+  <ellipse class="box" cx="525" cy="195" rx="6" ry="6"/>
+  <text x="525" y="222" text-anchor="middle" class="small">B now has price=10</text>
+  <ellipse class="box accent" cx="650" cy="195" rx="6" ry="6"/>
+  <rect class="box ok" x="560" y="140" width="190" height="26" rx="5"/><text x="655" y="158" text-anchor="middle" class="small">price=12, stamped 1200</text>
+
+  <rect class="box bad" x="150" y="234" width="600" height="30" rx="6"/>
+  <text x="450" y="254" text-anchor="middle">LWW: 1500 &gt; 1200, so it keeps price=10. The newer write is lost.</text>
+</svg>
+<figcaption>B wrote price=12 <em>after</em> it had seen price=10, so the right answer is obvious. The timestamps say the opposite, and nothing reports an error.</figcaption>
+</figure>
+<p>The lost write isn't even a race between concurrent clients. B saw A's value and deliberately replaced it. This is a <em>causal</em> relationship ("12 was written knowing about 10"), and wall clocks can't capture it. Anything less than the skew apart is ordered at random, and with a big enough skew, even writes seconds apart flip.</p>
+
+<h3>Wall clock vs monotonic clock</h3>
+<p>Operating systems expose two kinds of clock, and they answer different questions:</p>
+<ul>
+  <li>The <strong>wall clock</strong> (time-of-day, <code>CLOCK_REALTIME</code> on Linux) tells you the date and time. NTP adjusts it, and it can jump forward or backward. Use it for showing time to humans and for timestamps that only need to be roughly right.</li>
+  <li>The <strong>monotonic clock</strong> (<code>CLOCK_MONOTONIC</code>) only moves forward. Its absolute value means nothing; only the difference between two readings does. Use it for timeouts, durations, rate limits and latency. It's still only meaningful on one machine.</li>
+</ul>
+<p><strong>Go's <code>time.Time</code> carries both.</strong> According to the <code>time</code> package docs, <code>time.Now()</code> records a wall reading and a monotonic reading. When both values have a monotonic reading, <code>Sub</code>, <code>Since</code>, <code>Until</code>, <code>Before</code>, <code>After</code>, <code>Equal</code> and <code>Compare</code> use only the monotonic readings, so a clock step can't produce a negative duration. <code>Round(0)</code>, <code>Truncate</code>, <code>In</code>, <code>Local</code>, <code>UTC</code> and <code>AddDate</code> strip the monotonic reading (<code>t.Round(0)</code> is the documented way to do it), while <code>Add</code> keeps it. Values that came from outside the process, such as parsed strings, a database or JSON, never have one. Also, <code>==</code> compares the monotonic reading too, so use <code>Equal</code>. Go added this in Go 1.9 (2017), and its design document cites Cloudflare's DNS outage at the 2016-12-31 leap second: a Go program measured a negative elapsed time from two wall-clock readings, and passing it to <code>rand.Int63n</code> caused a panic.</p>
+<pre><code>// Wrong: the wall clock can jump; across machines it's skewed.
+if time.Now().UnixMilli() &gt; lease.ExpiresAtMs { ... }   // ms from another host
+if remote.UpdatedAt.After(local.UpdatedAt) { keep(remote) }  // LWW across nodes
+
+// Right: durations from the monotonic clock, on one machine.
+start := time.Now()
+doWork()
+elapsed := time.Since(start) // immune to NTP steps on this host
+
+// Right: compare time.Time values with Equal, not ==.
+if a.Equal(b) { ... }</code></pre>
+
+<h3>Leap seconds and smearing</h3>
+<p>UTC occasionally inserts a leap second (23:59:60) to stay aligned with the Earth's rotation. The last one was at the end of 2016. A clock that steps back or repeats a second breaks software that assumes time only moves forward. Large providers <strong>smear</strong> the leap second instead: their NTP servers run slightly slow for a while so the extra second is absorbed gradually. Google's public NTP and the Amazon Time Sync Service both use a 24-hour linear smear from noon to noon UTC. During a smear, those clocks disagree with non-smearing servers by up to half a second, so Google advises not to mix smeared and non-smeared sources. In 2022 the General Conference on Weights and Measures (CGPM) resolved to widen the allowed gap between UTC and the Earth's rotation, which in practice ends leap seconds, by 2035 at the latest.</p>
+
+<h3>Logical clocks: order without trusting physical time</h3>
+<p>Leslie Lamport's 1978 paper "Time, Clocks, and the Ordering of Events in a Distributed System" defines <strong>happened-before</strong>: event a happened before b if they are on the same process in that order, or a is a send and b the matching receive, or there's a chain of these. Events with no such chain are <strong>concurrent</strong>. Logical clocks capture this relation without any physical time:</p>
+<ul>
+  <li><strong>Lamport clock.</strong> Each node keeps a counter. Increment it on every local event and send. On receive, set it to <code>max(local, received) + 1</code>. If a happened before b, then <code>L(a) &lt; L(b)</code>. The converse doesn't hold: a smaller number doesn't prove happened-before. Breaking ties by node ID gives a total order that every node agrees on.</li>
+  <li><strong>Vector clock</strong> (Fidge and Mattern, 1988). Each node keeps one counter per node. Now <code>V(a) &lt; V(b)</code> exactly when a happened before b, and if neither vector is ≤ the other, the events are concurrent. That's how a store can detect a real conflict instead of silently picking one write. The cost is one entry per node, carried on every message and version.</li>
+</ul>
+<figure class="diagram">
+<svg viewBox="0 0 780 310" role="img" aria-label="Space-time diagram of three processes. P1 event a has Lamport 1 and vector 1,0,0 and sends to P2. P2 receives it at event c, Lamport 2, vector 1,1,0, then event d, Lamport 3, vector 1,2,0, sends to P3. P1 event b has Lamport 2, vector 2,0,0. P3 event e has Lamport 1, vector 0,0,1. P3 receives d at event f, Lamport 4, vector 1,2,2. Events b and e are concurrent: vector clocks show it, Lamport numbers do not.">
+  <defs><marker id="arr-cs-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="50" y="74" text-anchor="middle" class="title">P1</text>
+  <text x="50" y="154" text-anchor="middle" class="title">P2</text>
+  <text x="50" y="234" text-anchor="middle" class="title">P3</text>
+  <path class="line" d="M90 70 H740" style="stroke: var(--line)" marker-end="url(#arr-cs-2)"/>
+  <path class="line" d="M90 150 H740" style="stroke: var(--line)" marker-end="url(#arr-cs-2)"/>
+  <path class="line" d="M90 230 H740" style="stroke: var(--line)" marker-end="url(#arr-cs-2)"/>
+
+  <path class="line accent" d="M155 74 L284 146" marker-end="url(#arr-cs-2)"/>
+  <path class="line accent" d="M405 154 L554 226" marker-end="url(#arr-cs-2)"/>
+
+  <ellipse class="box accent" cx="150" cy="70" rx="6" ry="6"/><text x="150" y="52" text-anchor="middle" class="small">a  L=1  [1,0,0]</text>
+  <ellipse class="box bad" cx="520" cy="70" rx="6" ry="6"/><text x="520" y="52" text-anchor="middle" class="small">b  L=2  [2,0,0]</text>
+  <ellipse class="box accent" cx="290" cy="150" rx="6" ry="6"/><text x="290" y="174" text-anchor="middle" class="small">c  L=2  [1,1,0]</text>
+  <ellipse class="box accent" cx="400" cy="150" rx="6" ry="6"/><text x="400" y="134" text-anchor="middle" class="small">d  L=3  [1,2,0]</text>
+  <ellipse class="box bad" cx="200" cy="230" rx="6" ry="6"/><text x="200" y="254" text-anchor="middle" class="small">e  L=1  [0,0,1]</text>
+  <ellipse class="box accent" cx="560" cy="230" rx="6" ry="6"/><text x="560" y="254" text-anchor="middle" class="small">f  L=4  [1,2,2]</text>
+
+  <text x="390" y="284" text-anchor="middle" class="small">a → c → d → f is a causal chain: both clocks increase along it.</text>
+  <text x="390" y="302" text-anchor="middle" class="small">b and e are concurrent. Lamport gives e=1 &lt; b=2 anyway; the vectors [2,0,0] and [0,0,1] show neither came first.</text>
+</svg>
+<figcaption>Lamport numbers give a consistent order. Vector clocks also tell you when there is no real order, which is when you have a genuine conflict to merge.</figcaption>
+</figure>
+
+<h3>Hybrid logical clocks and TrueTime</h3>
+<p>Pure logical clocks have no connection to real time, so you can't ask "what was the state at 12:00?". Two designs bridge the gap:</p>
+<ul>
+  <li><strong>Hybrid logical clock (HLC)</strong>, from Kulkarni et al. (2014), "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases". A timestamp is a pair (physical part, logical counter). The physical part is the largest physical time the node has seen, its own or from a message, and the counter breaks ties. It respects happened-before like a Lamport clock, stays within the clock-sync error of real time, and fits in 64 bits. CockroachDB uses HLC timestamps. It also enforces a maximum clock offset (500 ms by default), and a node shuts itself down if its clock is too far off from at least half of the other nodes, because correctness depends on that bound.</li>
+  <li><strong>TrueTime</strong> in Google Spanner doesn't pretend to know the time. <code>TT.now()</code> returns an interval [earliest, latest] that contains true time, built from GPS and atomic-clock time masters in each data center. To commit, Spanner picks a timestamp and then <strong>commit-waits</strong> until that timestamp is definitely in the past everywhere, so timestamp order matches real order. The 2012 paper reported the uncertainty as a sawtooth of roughly 1 to 7 ms. Smaller uncertainty means shorter waits, which is why Google invested in the hardware. See <a href="#distributed-transactions">Distributed Transactions</a>.</li>
+</ul>
+
+<h3>Choosing a clock</h3>
+<table>
+  <tr><th>Clock</th><th>Answers</th><th>Orders events across nodes?</th><th>Size</th><th>Typical use</th></tr>
+  <tr><td>Wall clock</td><td>"What time is it?"</td><td>Only when they're further apart than the skew</td><td>1 number</td><td>Display, logs, rough expiry with a safety margin</td></tr>
+  <tr><td>Monotonic clock</td><td>"How long did it take?"</td><td>No, single machine only</td><td>1 number</td><td>Timeouts, latency, rate limits, local leases</td></tr>
+  <tr><td>Lamport clock</td><td>"Some order consistent with causality"</td><td>Yes (total order with node-ID ties), but can't detect concurrency</td><td>1 number</td><td>Total-order broadcast, versioning</td></tr>
+  <tr><td>Vector clock / version vector</td><td>"Did a happen before b, or are they concurrent?"</td><td>Yes, and detects concurrency</td><td>1 entry per node</td><td>Conflict detection (Dynamo-style stores, Riak)</td></tr>
+  <tr><td>Hybrid logical clock</td><td>Causal order that stays close to real time</td><td>Yes, within the clock-sync bound</td><td>1 number (64 bits)</td><td>MVCC timestamps (CockroachDB), snapshots</td></tr>
+  <tr><td>TrueTime</td><td>"True time is in this interval"</td><td>Yes, by waiting out the uncertainty</td><td>2 numbers</td><td>Externally consistent transactions (Spanner)</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>LWW vs Lamport vs HLC in Go.</strong> The clocks are simulated so the output is exact. Node A's clock runs 500 ms fast. The implementation is small: a skewed physical clock, a Lamport counter, and an HLC that follows the send/receive rules from the Kulkarni paper.</p>
+<pre><code>// Package clocks compares wall-clock last-writer-wins with Lamport clocks and
+// hybrid logical clocks (HLC) on nodes whose clocks disagree.
+package clocks
+
+// Clock is a simulated physical clock: true time plus a fixed skew, in ms.
+type Clock struct{ SkewMs int64 }
+
+func (c Clock) Now(trueMs int64) int64 { return trueMs + c.SkewMs }
+
+// Lamport is a logical counter (Lamport 1978).
+type Lamport struct{ t int64 }
+
+// Tick is called for a local event or before sending a message.
+func (l *Lamport) Tick() int64 { l.t++; return l.t }
+
+// Recv merges the timestamp carried by an incoming message.
+func (l *Lamport) Recv(remote int64) int64 { l.t = max(l.t, remote) + 1; return l.t }
+
+// HLCTime is (physical ms, logical counter), compared lexicographically.
+type HLCTime struct{ Wall, Logical int64 }
+
+func (a HLCTime) Less(b HLCTime) bool {
+	return a.Wall &lt; b.Wall || (a.Wall == b.Wall &amp;&amp; a.Logical &lt; b.Logical)
+}
+
+// HLC follows Kulkarni et al. (2014): stay close to physical time, but never
+// go backwards and always move past any timestamp we have seen.
+type HLC struct{ last HLCTime }
+
+func (h *HLC) Now(physMs int64) HLCTime {
+	if physMs &gt; h.last.Wall {
+		h.last = HLCTime{physMs, 0}
+	} else {
+		h.last.Logical++
+	}
+	return h.last
+}
+
+func (h *HLC) Recv(physMs int64, m HLCTime) HLCTime {
+	wall := max(h.last.Wall, m.Wall, physMs)
+	switch {
+	case wall == h.last.Wall &amp;&amp; wall == m.Wall:
+		h.last.Logical = max(h.last.Logical, m.Logical) + 1
+	case wall == h.last.Wall:
+		h.last.Logical++
+	case wall == m.Wall:
+		h.last.Logical = m.Logical + 1
+	default:
+		h.last.Logical = 0
+	}
+	h.last.Wall = wall
+	return h.last
+}</code></pre>
+
+<p>The scenario from the first diagram: A writes price=10, B receives it, then B writes price=12.</p>
+<pre><code>// Node A's clock runs 500 ms fast; node B's is correct. At true time 1000 ms
+// a user sets the price to 10 on A. A replicates it to B, which receives it
+// at 1150 ms. At 1200 ms an admin on B corrects the price to 12.
+func Example() {
+	a, b := Clock{SkewMs: 500}, Clock{SkewMs: 0}
+
+	fmt.Println("wall-clock LWW:")
+	w1 := a.Now(1000) // price=10 on A
+	w2 := b.Now(1200) // price=12 on B, written after B saw price=10
+	fmt.Printf("  price=10 ts=%d, price=12 ts=%d&#92;n", w1, w2)
+	if w1 &gt; w2 {
+		fmt.Println("  winner: price=10 (the OLDER write)")
+	}
+
+	fmt.Println("Lamport:")
+	var la, lb Lamport
+	l1 := la.Tick() // A writes and sends
+	lb.Recv(l1)     // B receives the replicated write
+	l2 := lb.Tick() // B writes
+	fmt.Printf("  price=10 L=%d, price=12 L=%d -&gt; winner: price=12&#92;n", l1, l2)
+
+	fmt.Println("HLC:")
+	var ha, hb HLC
+	h1 := ha.Now(a.Now(1000))
+	hb.Recv(b.Now(1150), h1)
+	h2 := hb.Now(b.Now(1200))
+	fmt.Printf("  price=10 %v, price=12 %v, ordered: %v&#92;n", h1, h2, h1.Less(h2))
+}</code></pre>
+<p>Output, checked exactly by <code>go test</code>:</p>
+<pre><code>wall-clock LWW:
+  price=10 ts=1500, price=12 ts=1200
+  winner: price=10 (the OLDER write)
+Lamport:
+  price=10 L=1, price=12 L=3 -&gt; winner: price=12
+HLC:
+  price=10 {1500 0}, price=12 {1500 2}, ordered: true</code></pre>
+<p>The wall clock picks the older write. The Lamport clock gets it right because B's receive pushed its counter past A's (1 → 2), so B's write gets 3. The HLC also gets it right, and its timestamp still looks like a time: B's write is stamped <code>{1500 2}</code>, close to (and bounded by) the fast clock's reading, rather than a bare counter. Note that HLC doesn't remove the skew from the physical part; it only stops the skew from breaking causal order.</p>
+
+<p>The monotonic-clock behavior described above, checked against the real <code>time</code> package (no simulation):</p>
+<pre><code>// Go's time.Now carries a monotonic reading for measuring durations.
+func Example_monotonic() {
+	t := time.Now()
+	fmt.Println("has monotonic reading:", strings.Contains(t.String(), "m="))
+	fmt.Println("after Round(0):       ", strings.Contains(t.Round(0).String(), "m="))
+	fmt.Println("after UTC():          ", strings.Contains(t.UTC().String(), "m="))
+}</code></pre>
+<pre><code>has monotonic reading: true
+after Round(0):        false
+after UTC():           false</code></pre>
+
+<p><strong>Real-world scenario.</strong> A six-node Cassandra cluster stores product prices with LWW, and clients set timestamps from their own clocks. After a hypervisor migration, one application server's clock is 3 s ahead and its NTP daemon is blocked by a firewall change, so nobody notices. For the next hour, every price it writes beats any write made within the following 3 s by the five healthy servers. An operator's correction made 2 s after a bad automated update is silently dropped, and the wrong price stays live until someone reads the database by hand. Fixes, cheapest first: alert on clock offset per host (most NTP clients report it); let the database assign timestamps instead of clients; use compare-and-set (a lightweight transaction) or a version number for edits that must not be lost; and don't use LWW for data where "the latest edit wins" really matters.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Using <code>updated_at</code> to merge writes from different nodes.</strong> That's LWW with skew built in. Use a version number that the database increments, or vector clocks if concurrent writes are expected, and keep wall time for display.</li>
+  <li><strong>Measuring durations with the wall clock.</strong> An NTP step makes elapsed time negative or huge. In Go, keep the value from <code>time.Now()</code> and use <code>time.Since</code>. Don't convert to Unix milliseconds and subtract, and don't compare timestamps that crossed a process boundary.</li>
+  <li><strong>Leases and expiry without a margin.</strong> If a lease expires "at 12:00:05" by the holder's clock, a fast or slow clock can make two nodes believe they hold it. Make the holder stop well before expiry, measure lease time with the monotonic clock, and fence the resource (see <a href="#distributed-locks">Distributed Locks</a>). Token checks such as JWT <code>exp</code>/<code>nbf</code> need a few seconds of leeway for the same reason.</li>
+  <li><strong>Not monitoring clock offset.</strong> Clock problems are silent: nothing crashes, data just goes wrong. Export the NTP offset as a metric and alert on it. Systems like CockroachDB refuse to run outside their offset bound for exactly this reason.</li>
+  <li><strong>Mixing smeared and non-smeared time sources.</strong> During a leap second smear they disagree by up to half a second. Pick one family of servers for the whole fleet.</li>
+  <li><strong>Expecting Lamport clocks to detect conflicts.</strong> A larger Lamport number doesn't mean "happened after", only "not happened before". If you need to know that two writes are concurrent so you can merge them, you need version vectors (see <a href="#eventual-consistency">Eventual Consistency</a>).</li>
+  <li><strong>Sorting cross-service logs by timestamp during an incident.</strong> A few milliseconds of skew can reorder cause and effect. Trace IDs and parent spans carry the real causal order (see <a href="#distributed-tracing">Distributed Tracing</a>).</li>
+</ul>
+
+<div class="callout warn"><strong>Never decide "which write is newer" by comparing wall clocks from two machines.</strong> The answer is wrong whenever the writes are closer together than the skew, and you won't get an error, only lost data.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Clocks drift and jump. NTP keeps them within tens of milliseconds over the internet, sometimes much worse, so cross-machine timestamps are approximate.</li>
+  <li>Use the monotonic clock for durations and timeouts. Go's <code>time.Time</code> carries it automatically; <code>Round(0)</code>, <code>UTC()</code> and serialization drop it.</li>
+  <li>Use logical clocks for ordering: Lamport for a consistent order, vector clocks to detect concurrency, HLC when you also want timestamps near real time.</li>
+  <li>When you must use physical time across machines, bound the error (offset limits, TrueTime intervals), monitor it, and wait it out.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#eventual-consistency">Eventual Consistency</a> · <a href="#distributed-locks">Distributed Locks</a> · <a href="#distributed-transactions">Distributed Transactions</a> · <a href="#replication">Replication</a> · <a href="#cap-theorem">CAP Theorem</a> · <a href="#distributed-tracing">Distributed Tracing</a></p>
+`;
