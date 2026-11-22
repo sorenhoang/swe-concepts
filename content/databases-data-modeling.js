@@ -325,3 +325,295 @@ ORDER BY pg_relation_size(s.indexrelid) DESC;</code></pre>
 
 <p><strong>Related:</strong> <a href="#query-optimization">Query Optimization</a> · <a href="#n-1-queries">N+1 Queries</a> · <a href="#partitioning">Partitioning</a> · <a href="#database-migrations">Database Migrations</a> · <a href="#race-conditions">Race Conditions</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
 `;
+CONTENT["query-optimization"] = `
+<p class="tldr"><strong>TL;DR</strong>: Query optimization is a loop: find the queries that cost the most in total, read their execution plan, change one thing (an index, a rewrite, fresh statistics), and measure again. Most wins come from a few repeat offenders: predicates the database can't match to an index, deep <code>OFFSET</code> pagination, fetching too much, and planner estimates that are far from reality. Think of the plan as the database's receipt: it shows exactly where the work went.</p>
+
+<h2>The problem it solves</h2>
+<p>SQL says <em>what</em> you want, not <em>how</em> to get it. The <strong>planner</strong> picks the how: which index, which join order, which join algorithm. It does that from statistics about your data, and it is usually right. When it's wrong, or when the query is written so that no good plan exists, one endpoint goes from 5 ms to 5 s, the database CPU sits at 90%, and every other query slows down with it.</p>
+<p>Guessing doesn't work here. Adding indexes at random costs writes and often changes nothing. "Rewrite it in a faster way" often produces the same plan. The cure is a disciplined workflow that always starts from measured data and ends with a re-measurement.</p>
+
+<h2>How it works</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 150" role="img" aria-label="The optimization loop. Step 1, find the expensive queries with pg_stat_statements or the slow query log. Step 2, read the plan with EXPLAIN ANALYZE and BUFFERS. Step 3, fix one thing: an index, a rewrite, or ANALYZE. Step 4, re-measure the plan and p99 in production. Then loop back to the next most expensive query.">
+  <defs><marker id="arr-qo-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="20" y="20" width="165" height="64" rx="8"/>
+  <text x="102" y="42" text-anchor="middle" class="title">1. Find</text>
+  <text x="102" y="60" text-anchor="middle" class="small">pg_stat_statements,</text>
+  <text x="102" y="75" text-anchor="middle" class="small">slow query log</text>
+  <rect class="box" x="215" y="20" width="165" height="64" rx="8"/>
+  <text x="297" y="42" text-anchor="middle" class="title">2. Read the plan</text>
+  <text x="297" y="60" text-anchor="middle" class="small">EXPLAIN (ANALYZE,</text>
+  <text x="297" y="75" text-anchor="middle" class="small">BUFFERS) on real data</text>
+  <rect class="box" x="410" y="20" width="165" height="64" rx="8"/>
+  <text x="492" y="42" text-anchor="middle" class="title">3. Fix one thing</text>
+  <text x="492" y="60" text-anchor="middle" class="small">index, rewrite,</text>
+  <text x="492" y="75" text-anchor="middle" class="small">ANALYZE, less data</text>
+  <rect class="box ok" x="605" y="20" width="155" height="64" rx="8"/>
+  <text x="682" y="42" text-anchor="middle" class="title">4. Re-measure</text>
+  <text x="682" y="60" text-anchor="middle" class="small">same plan check, then</text>
+  <text x="682" y="75" text-anchor="middle" class="small">p99 in production</text>
+  <path class="line" d="M187 52 H213" marker-end="url(#arr-qo-1)"/>
+  <path class="line" d="M382 52 H408" marker-end="url(#arr-qo-1)"/>
+  <path class="line" d="M577 52 H603" marker-end="url(#arr-qo-1)"/>
+  <path class="line dashed" d="M682 86 V118 H102 V88" marker-end="url(#arr-qo-1)"/>
+  <text x="390" y="136" text-anchor="middle" class="small">next most expensive query (total time, not just the slowest single call)</text>
+</svg>
+<figcaption>Change one thing at a time. If you add an index and rewrite the query together, you won't know which one helped, or which one made the other query slower.</figcaption>
+</figure>
+
+<h3>Step 1: find the queries that matter</h3>
+<p>Rank by <strong>total</strong> time, not by the slowest single call. A 2 ms query that runs 50,000 times a minute costs more than a 3 s report that runs once an hour. In PostgreSQL the <code>pg_stat_statements</code> extension groups queries by shape (constants are replaced with <code>$1</code>, <code>$2</code>) and tracks <code>calls</code>, <code>total_exec_time</code>, <code>mean_exec_time</code>, <code>rows</code> and buffer counts per shape:</p>
+<pre><code>-- needs shared_preload_libraries = 'pg_stat_statements' and CREATE EXTENSION
+SELECT calls,
+       round(total_exec_time) AS total_ms,
+       round(mean_exec_time::numeric, 2) AS mean_ms,
+       rows,
+       left(query, 80) AS query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;</code></pre>
+<p>Other sources: <code>log_min_duration_statement</code> logs every statement slower than a threshold (it is off, <code>-1</code>, by default), the <code>auto_explain</code> module logs the plan of slow statements, and MySQL has the slow query log (off by default; <code>long_query_time</code> defaults to 10 s, far too high for a web app). APM and <a href="#distributed-tracing">tracing</a> show which endpoint the query belongs to.</p>
+
+<h3>Step 2: read the plan</h3>
+<p><code>EXPLAIN</code> shows the plan the planner chose, with its estimates. <code>EXPLAIN ANALYZE</code> also <em>runs</em> the query and adds what actually happened. (It really executes: wrap an <code>UPDATE</code> or <code>DELETE</code> in <code>BEGIN … ROLLBACK</code>.) Add <code>BUFFERS</code> to see pages touched; since PostgreSQL 18 it is on by default with <code>ANALYZE</code>. A plan is a tree. Each node pulls rows from its children, so read it from the most indented node outwards.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 150" role="img" aria-label="One plan line taken apart. Seq Scan on users is the node type. cost equals 0.00 to 2334.00 is the planner's estimate in arbitrary units, startup then total. rows equals 500 is the estimated row count. width equals 8 is the average row size in bytes. actual rows equals 1.00 is the measured row count per loop. loops equals 1 is how many times the node ran. A red bracket links rows 500 and actual rows 1: a 500 times misestimate.">
+  <path class="line bad" d="M365 42 V28 H575 V42"/>
+  <text x="470" y="20" text-anchor="middle" class="small">estimate 500 vs actual 1: big gaps here lead to bad plan choices</text>
+  <rect class="box" x="10" y="44" width="140" height="32" rx="5"/><text x="80" y="65" text-anchor="middle">Seq Scan on users</text>
+  <rect class="box" x="160" y="44" width="150" height="32" rx="5"/><text x="235" y="65" text-anchor="middle">cost=0.00..2334.00</text>
+  <rect class="box bad" x="320" y="44" width="90" height="32" rx="5"/><text x="365" y="65" text-anchor="middle">rows=500</text>
+  <rect class="box" x="420" y="44" width="80" height="32" rx="5"/><text x="460" y="65" text-anchor="middle">width=8</text>
+  <rect class="box bad" x="510" y="44" width="130" height="32" rx="5"/><text x="575" y="65" text-anchor="middle">actual rows=1.00</text>
+  <rect class="box" x="650" y="44" width="80" height="32" rx="5"/><text x="690" y="65" text-anchor="middle">loops=1</text>
+  <path class="line" d="M80 76 V96"/><path class="line" d="M235 76 V96"/><path class="line" d="M365 76 V96"/>
+  <path class="line" d="M460 76 V96"/><path class="line" d="M575 76 V96"/><path class="line" d="M690 76 V96"/>
+  <text x="80" y="110" text-anchor="middle" class="small">node type: how</text><text x="80" y="124" text-anchor="middle" class="small">rows are produced</text>
+  <text x="235" y="110" text-anchor="middle" class="small">estimated cost,</text><text x="235" y="124" text-anchor="middle" class="small">startup..total</text>
+  <text x="365" y="110" text-anchor="middle" class="small">estimated</text><text x="365" y="124" text-anchor="middle" class="small">rows</text>
+  <text x="460" y="110" text-anchor="middle" class="small">avg bytes</text><text x="460" y="124" text-anchor="middle" class="small">per row</text>
+  <text x="575" y="110" text-anchor="middle" class="small">measured rows</text><text x="575" y="124" text-anchor="middle" class="small">per loop</text>
+  <text x="690" y="110" text-anchor="middle" class="small">times run;</text><text x="690" y="124" text-anchor="middle" class="small">total = rows × loops</text>
+</svg>
+<figcaption>The first line of the real plan from the example below. Cost is in arbitrary planner units, not milliseconds. With timing on, you also get <code>actual time=startup..total</code> in ms, per loop.</figcaption>
+</figure>
+<p>What to look for, in order:</p>
+<ol>
+  <li><strong>Where the time or buffers go.</strong> Find the node with the largest actual time or <code>Buffers</code>. Times include children, so subtract to find the node's own work. Remember to multiply by <code>loops</code>.</li>
+  <li><strong>Estimated vs actual rows.</strong> A 10× or larger gap means the planner was working from wrong numbers. It may have chosen a nested loop for what it thought was 1 row and got 200,000. Fix the estimate (statistics) before you fight the plan.</li>
+  <li><strong>Wasted work.</strong> <code>Rows Removed by Filter</code> in the hundreds of thousands, an <code>Index Scan</code> whose actual rows dwarf the <code>Limit</code>, or a <code>Sort</code> with <code>Sort Method: external merge  Disk: …</code> (it spilled past <code>work_mem</code>).</li>
+</ol>
+<table>
+  <tr><th>Node</th><th>What it does</th><th>Good when</th><th>Warning sign</th></tr>
+  <tr><td><code>Seq Scan</code></td><td>Reads every page of the table</td><td>Small tables, or the query needs a large fraction of rows</td><td>Big table, few rows returned, large <code>Rows Removed by Filter</code></td></tr>
+  <tr><td><code>Index Scan</code></td><td>Walks the index, fetches each row from the table</td><td>Few rows, or rows wanted in index order</td><td>Many rows: random page reads add up</td></tr>
+  <tr><td><code>Index Only Scan</code></td><td>Answers from the index alone</td><td>All needed columns are in the index</td><td>High <code>Heap Fetches</code> (visibility map not set)</td></tr>
+  <tr><td><code>Bitmap Heap Scan</code></td><td>Collects matching row locations, then reads pages in physical order</td><td>A medium number of rows; combining indexes (<code>BitmapOr</code>/<code>BitmapAnd</code>)</td><td><code>Heap Blocks: lossy</code> (bitmap outgrew <code>work_mem</code>)</td></tr>
+  <tr><td><code>Nested Loop</code></td><td>For each outer row, look up matching inner rows</td><td>Small outer side and an index on the inner join key</td><td>Outer side much bigger than estimated; inner side is a seq scan</td></tr>
+  <tr><td><code>Hash Join</code></td><td>Builds a hash table from one side, probes with the other</td><td>Large unsorted inputs, equality joins</td><td><code>Batches</code> &gt; 1: the hash table spilled to disk</td></tr>
+  <tr><td><code>Merge Join</code></td><td>Walks two inputs sorted on the join key</td><td>Both sides already sorted (e.g. from indexes)</td><td>An expensive explicit <code>Sort</code> beneath it</td></tr>
+</table>
+
+<h3>Step 3: the usual fixes</h3>
+<p>Most slow queries fall into a handful of patterns. A predicate is <strong>sargable</strong> (from "Search ARGument ABLE") when the database can turn it into an index range, which needs the bare column on one side of a comparison. Index design itself (column order, covering, partial indexes) is covered in <a href="#database-indexing">Database Indexing</a>.</p>
+<table>
+  <tr><th>Pattern</th><th>Why it's slow</th><th>Fix</th></tr>
+  <tr><td>Function on the column: <code>lower(email) = $1</code>, <code>date(created_at) = $1</code></td><td>The index stores <code>email</code>, not <code>lower(email)</code>. Seq scan, and no statistics for the expression, so estimates are guesses.</td><td>Expression index on <code>lower(email)</code>, a <code>citext</code> column, or rewrite as a range on the bare column.</td></tr>
+  <tr><td>Leading wildcard: <code>name LIKE '%son'</code></td><td>A B-tree is sorted by prefix; an unknown prefix means scanning everything.</td><td>Trigram GIN index (<code>pg_trgm</code>) or full-text search. <code>LIKE 'son%'</code> can use a B-tree (C collation or <code>text_pattern_ops</code>).</td></tr>
+  <tr><td>Type mismatch: string column vs number, <code>int</code> column vs <code>numeric</code> literal</td><td>The column gets cast, which is the function case again. MySQL's docs say a string column compared to a number can't use its index.</td><td>Send parameters of the column's type. Watch ORMs and drivers that bind everything as one type.</td></tr>
+  <tr><td><code>OFFSET 50000 LIMIT 20</code></td><td>The database produces and discards 50,000 rows to return 20. Deeper pages get linearly slower.</td><td>Keyset pagination: <code>WHERE (created_at, id) &lt; ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 20</code>.</td></tr>
+  <tr><td><code>SELECT *</code></td><td>Reads and ships columns nobody uses (large <code>text</code>/<code>jsonb</code> values are stored out of line and must be fetched), and blocks index-only scans.</td><td>Select the columns you need.</td></tr>
+  <tr><td>Stale or missing statistics</td><td>After a bulk load or a big delete, estimates are far off and the planner picks the wrong join or scan.</td><td>Run <code>ANALYZE table</code> after bulk changes; raise the column's statistics target for skewed data; extended statistics (<code>CREATE STATISTICS</code>) for correlated columns.</td></tr>
+  <tr><td><code>OR</code> across different columns</td><td>One index can't serve <code>a = $1 OR b = $2</code>. PostgreSQL can combine two indexes with <code>BitmapOr</code>; MySQL and complex cases often fall back to a scan.</td><td>Index each column; if the plan still scans, rewrite as <code>UNION</code> (or <code>UNION ALL</code> if duplicates are impossible) of two indexed queries.</td></tr>
+  <tr><td>Correlated subquery per row</td><td>Runs the inner query once per outer row (watch <code>loops=</code>).</td><td>Rewrite as a <code>JOIN</code>, <code>EXISTS</code>, or a <code>LATERAL</code> join with an index on the inner key.</td></tr>
+  <tr><td>Many small queries instead of one</td><td>Not slow per query; slow per request. Round trips add up.</td><td>See <a href="#n-1-queries">N+1 Queries</a>.</td></tr>
+</table>
+<pre><code>-- function on the column: the index on created_at can't be used
+WHERE date(created_at) = '2026-03-01'
+-- sargable: a range on the bare column
+WHERE created_at &gt;= '2026-03-01' AND created_at &lt; '2026-03-02'
+
+-- OFFSET: reads and throws away 50,000 rows
+ORDER BY created_at DESC, id DESC LIMIT 20 OFFSET 50000
+-- keyset: continue after the last row the client saw (tie-break on id)
+WHERE (created_at, id) &lt; ($1, $2)
+ORDER BY created_at DESC, id DESC LIMIT 20</code></pre>
+<p>Keyset pagination has trade-offs: the client can't jump to "page 2,501", only to "next" and "previous", and the sort key must be unique (add <code>id</code> as a tie-breaker), with an index matching the <code>ORDER BY</code>. For infinite scroll and APIs, that is what you want anyway.</p>
+
+<h2>Example</h2>
+<p><strong>Two fixes, measured on a real PostgreSQL 18.</strong> The test starts PostgreSQL with <code>embedded-postgres</code> and loads 100,000 users with mixed-case emails (<code>User4242@Example.com</code>), with a plain index on <code>email</code>. Actual timings are switched off so the plans print the same on every run; they are pinned as <code>// Output:</code> blocks and checked by <code>go test</code>. The setup file is omitted.</p>
+<pre><code>package queryopt
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+)
+
+// plan prints EXPLAIN ANALYZE. Estimated costs stay on (they are stable
+// here); actual timings are off so the output is the same on every run.
+func plan(query string, args ...any) {
+	rows, err := db.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY OFF) "+query, args...)
+	if err != nil {
+		panic(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var line string
+		rows.Scan(&amp;line)
+		if strings.HasPrefix(line, "Planning") {
+			break
+		}
+		fmt.Println(line)
+	}
+}
+
+// Fix 1: a function on the column hides the index on email.
+func Example_nonSargable() {
+	q := &#96;SELECT id FROM users WHERE lower(email) = 'user4242@example.com'&#96;
+	fmt.Println("-- index on email, query on lower(email)")
+	plan(q)
+
+	must(&#96;CREATE INDEX users_email_lower_idx ON users (lower(email))&#96;)
+	must(&#96;ANALYZE users&#96;) // collects statistics for the expression too
+	fmt.Println("-- after an expression index on lower(email)")
+	plan(q)
+}
+
+// Fix 2: page 2,501 of a list, 20 rows per page.
+func Example_offsetVsKeyset() {
+	fmt.Println("-- OFFSET 50000")
+	plan(&#96;SELECT id, email FROM users ORDER BY id LIMIT 20 OFFSET 50000&#96;)
+
+	fmt.Println("-- keyset: id after the last row of the previous page")
+	plan(&#96;SELECT id, email FROM users WHERE id &gt; $1 ORDER BY id LIMIT 20&#96;, 50000)
+}
+
+// buffers returns the pages the whole query touched (top plan node).
+func buffers(query string, args ...any) int {
+	var line string
+	rows, _ := db.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) "+query, args...)
+	defer rows.Close()
+	for rows.Next() {
+		rows.Scan(&amp;line)
+		if _, after, ok := strings.Cut(line, "Buffers: shared hit="); ok {
+			var n int
+			fmt.Sscan(after, &amp;n)
+			return n
+		}
+	}
+	return -1
+}
+
+// How the cost of one page grows with depth.
+func Example_pageDepth() {
+	fmt.Println("depth   OFFSET  keyset   (8 KB pages touched)")
+	for _, depth := range []int{0, 20000, 40000, 60000, 80000} {
+		off := buffers(&#96;SELECT id, email FROM users ORDER BY id LIMIT 20 OFFSET $1&#96;, depth)
+		key := buffers(&#96;SELECT id, email FROM users WHERE id &gt; $1 ORDER BY id LIMIT 20&#96;, depth)
+		fmt.Printf("%5d  %7d  %6d&#92;n", depth, off, key)
+	}
+}
+
+// Wall clock for page depth 80,000 (laptop run, rounded).
+func TestTiming(t *testing.T) {
+	avg := func(q string) time.Duration {
+		const n = 300
+		var start time.Time
+		for i := range n + 30 { // first 30 are warm-up
+			if i == 30 {
+				start = time.Now()
+			}
+			must2(q, 80000)
+		}
+		return time.Since(start) / n
+	}
+	off := avg(&#96;SELECT id, email FROM users ORDER BY id LIMIT 20 OFFSET $1&#96;)
+	key := avg(&#96;SELECT id, email FROM users WHERE id &gt; $1 ORDER BY id LIMIT 20&#96;)
+	t.Logf("OFFSET %v, keyset %v per page", off.Round(10*time.Microsecond), key.Round(10*time.Microsecond))
+}</code></pre>
+<p>Real output of fix 1. Before: a seq scan over 834 pages to find 1 row. Note <code>rows=500</code>: the planner has no statistics for <code>lower(email)</code>, so it falls back to a default guess. After the expression index and <code>ANALYZE</code>, the estimate is exactly 1 and the query reads 4 pages.</p>
+<pre><code>-- index on email, query on lower(email)
+Seq Scan on users  (cost=0.00..2334.00 rows=500 width=8) (actual rows=1.00 loops=1)
+  Filter: (lower(email) = 'user4242@example.com'::text)
+  Rows Removed by Filter: 99999
+  Buffers: shared hit=834
+-- after an expression index on lower(email)
+Index Scan using users_email_lower_idx on users  (cost=0.42..8.44 rows=1 width=8) (actual rows=1.00 loops=1)
+  Index Cond: (lower(email) = 'user4242@example.com'::text)
+  Index Searches: 1
+  Buffers: shared hit=1 read=3</code></pre>
+<p>Fix 2. Both queries return the same 20 rows. <code>OFFSET</code> walks 50,020 index entries (<code>actual rows=50020.00</code> under the <code>Limit</code>) and touches 555 pages. Keyset jumps straight to <code>id &gt; 50000</code> and touches 3.</p>
+<pre><code>-- OFFSET 50000
+Limit  (cost=1720.79..1721.48 rows=20 width=29) (actual rows=20.00 loops=1)
+  Buffers: shared hit=555
+  -&gt;  Index Scan using users_pkey on users  (cost=0.29..3441.29 rows=100000 width=29) (actual rows=50020.00 loops=1)
+        Index Searches: 1
+        Buffers: shared hit=555
+-- keyset: id after the last row of the previous page
+Limit  (cost=0.29..1.03 rows=20 width=29) (actual rows=20.00 loops=1)
+  Buffers: shared hit=3
+  -&gt;  Index Scan using users_pkey on users  (cost=0.29..1847.29 rows=50000 width=29) (actual rows=20.00 loops=1)
+        Index Cond: (id &gt; '50000'::bigint)
+        Index Searches: 1
+        Buffers: shared hit=3</code></pre>
+<p>Repeating that at different depths shows the shape of the problem:</p>
+<pre><code>depth   OFFSET  keyset   (8 KB pages touched)
+    0        3       3
+20000      223       3
+40000      445       3
+60000      666       3
+80000      887       3</code></pre>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Chart of pages touched against page depth, from the real output. OFFSET grows in a straight line from 3 pages at depth 0 to 887 pages at depth 80,000. Keyset stays at 3 pages at every depth.">
+  <text x="80" y="22" class="small">8 KB pages touched per request</text>
+  <path class="line" d="M80 30 V240 H745"/>
+  <text x="70" y="244" text-anchor="end" class="small">0</text>
+  <text x="70" y="177" text-anchor="end" class="small">300</text>
+  <text x="70" y="111" text-anchor="end" class="small">600</text>
+  <text x="70" y="44" text-anchor="end" class="small">900</text>
+  <path class="line dashed" d="M80 173 H745 M80 107 H745 M80 40 H745" style="stroke: var(--line)"/>
+  <text x="80" y="258" text-anchor="middle" class="small">0</text>
+  <text x="245" y="258" text-anchor="middle" class="small">20,000</text>
+  <text x="410" y="258" text-anchor="middle" class="small">40,000</text>
+  <text x="575" y="258" text-anchor="middle" class="small">60,000</text>
+  <text x="740" y="258" text-anchor="middle" class="small">80,000</text>
+  <text x="410" y="284" text-anchor="middle" class="small">page depth (rows skipped before the 20 you want)</text>
+  <path class="line bad" d="M80 239 L245 190 L410 141 L575 92 L740 43"/>
+  <circle class="box bad" cx="80" cy="239" r="4"/><circle class="box bad" cx="245" cy="190" r="4"/><circle class="box bad" cx="410" cy="141" r="4"/><circle class="box bad" cx="575" cy="92" r="4"/><circle class="box bad" cx="740" cy="43" r="4"/>
+  <text x="560" y="62" text-anchor="end">OFFSET: 887 pages at depth 80,000</text>
+  <path class="line ok" d="M80 239 H740"/>
+  <text x="740" y="228" text-anchor="end">keyset: 3 pages at every depth</text>
+</svg>
+<figcaption>Real numbers from <code>Example_pageDepth</code>. OFFSET cost is linear in depth; keyset cost is the depth of the B-tree plus one leaf.</figcaption>
+</figure>
+<p>Wall clock at depth 80,000, measured from Go over a local connection (one laptop run, rounded):</p>
+<pre><code>--- PASS: TestTiming
+    OFFSET 3.4ms, keyset 60µs per page</code></pre>
+
+<p><strong>Real-world scenario.</strong> A support dashboard lists tickets with <code>ORDER BY created_at DESC LIMIT 50 OFFSET $1</code> and a lookup that runs <code>WHERE lower(requester_email) = lower($1)</code>. With 3 M tickets, <code>pg_stat_statements</code> puts the list query at the top by total time, not because one call is slow but because an export job pages through all 60,000 pages, each deeper than the last. Its mean time is 400 ms and rising. <code>EXPLAIN ANALYZE</code> on a deep page shows an index scan returning hundreds of thousands of rows under a <code>Limit</code> of 50. Switching the export job to keyset pagination (continue after the last <code>(created_at, id)</code>) makes every page cost the same few milliseconds. The lookup shows a <code>Seq Scan</code> with an estimate of thousands of rows and an actual of 12; an expression index on <code>lower(requester_email)</code> turns it into an index scan. Re-checking <code>pg_stat_statements</code> a day later (after <code>pg_stat_statements_reset()</code>) confirms both left the top 10.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Optimizing on a toy database.</strong> On 1,000 rows every plan is a seq scan and every query takes 1 ms. Plans depend on table size and data distribution, so test on production-like volume, or run <code>EXPLAIN</code> on a replica.</li>
+  <li><strong>Trusting plain <code>EXPLAIN</code>.</strong> It shows estimates only. If the estimate is wrong, the plan you are reading is not what's slow. Use <code>ANALYZE</code> and compare estimated with actual rows.</li>
+  <li><strong>Reading cost as time.</strong> Cost is in arbitrary planner units and only compares plans for the same query. Look at actual time and buffers.</li>
+  <li><strong>Measuring a warm cache only.</strong> The second run is served from memory. <code>Buffers: shared read=</code> tells you how much came from outside PostgreSQL's cache; production may be colder than your laptop.</li>
+  <li><strong>Fighting the planner instead of fixing its inputs.</strong> PostgreSQL has no built-in query hints by design. Disabling plan types with <code>enable_seqscan = off</code> is a diagnostic, not a fix. Fix statistics, the predicate or the index.</li>
+  <li><strong>Prepared statements and generic plans.</strong> After five executions, PostgreSQL may switch a prepared statement to a generic plan that ignores the actual parameter values. With very skewed data (one tenant owns half the rows) that plan can be bad for some values. <code>plan_cache_mode</code> controls it.</li>
+  <li><strong>Fixing the slowest query instead of the most expensive.</strong> Rank by total time and by p99 of the endpoint, not by the single worst call.</li>
+</ul>
+
+<div class="callout warn"><strong><code>EXPLAIN ANALYZE</code> executes the statement.</strong> On an <code>UPDATE</code>, <code>DELETE</code> or <code>INSERT</code> it changes data for real. Wrap it in <code>BEGIN; EXPLAIN ANALYZE …; ROLLBACK;</code>, and be careful running heavy queries on the primary during peak traffic.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Work in a loop: find by total time, read the plan, change one thing, re-measure.</li>
+  <li>In a plan, look for where buffers and time go, for big gaps between estimated and actual rows, and for rows read and then thrown away.</li>
+  <li>Keep predicates sargable: bare column, matching types, no leading wildcard. Use expression indexes when you must match on a computed value.</li>
+  <li>Replace deep <code>OFFSET</code> with keyset pagination, select only the columns you need, and keep statistics fresh after bulk changes.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#database-indexing">Database Indexing</a> · <a href="#n-1-queries">N+1 Queries</a> · <a href="#connection-pooling">Connection Pooling</a> · <a href="#p99-latency">p99 Latency</a> · <a href="#distributed-tracing">Distributed Tracing</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
+`;
