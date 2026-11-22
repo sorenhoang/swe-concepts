@@ -1272,3 +1272,359 @@ WHERE: while updating tuple (0,94) in relation "accounts"</code></pre>
 
 <p><strong>Related:</strong> <a href="#pessimistic-locking">Pessimistic Locking</a> · <a href="#race-conditions">Race Conditions</a> · <a href="#thread-safety">Thread Safety</a> · <a href="#timeouts">Timeouts</a> · <a href="#retries">Retries</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
 `;
+CONTENT["thread-safety"] = `
+<p class="tldr"><strong>TL;DR</strong>: A type is <em>safe for concurrent use</em> when any number of goroutines can call its methods at the same time, with no locking on their side, and it still behaves as documented. A shared notebook that anyone scribbles in is not; a bank teller who serves one customer at a time is. You get there in a few ways: give the data one owner, never mutate it, guard it with a lock, or use atomics. In Go, a type is not safe unless its documentation says it is.</p>
+
+<h2>The problem it solves</h2>
+<p>Every Go server shares state between goroutines: a cache, a config, a metrics counter, a connection pool, a rate limiter. Each request runs in its own goroutine, so those objects are used concurrently all the time. If a type isn't built for that, you get the bugs from <a href="#race-conditions">Race Conditions</a>: lost updates, torn reads, and for maps a crashed process.</p>
+<p>Thread safety is a <strong>property you design into a type and then promise in its docs</strong>, so callers don't need to know how it works. The Go standard library writes that promise down in one phrase: "safe for concurrent use by multiple goroutines". If the docs don't say it, assume it isn't.</p>
+<table>
+  <tr><th>Type</th><th>Safe for concurrent use?</th><th>What the docs say</th></tr>
+  <tr><td>built-in <code>map</code></td><td><strong>No</strong></td><td>Concurrent writes (or a write during a read) are a data race. The runtime often detects it and stops the process with <code>fatal error: concurrent map writes</code>.</td></tr>
+  <tr><td><code>sync.Map</code></td><td>Yes</td><td>"safe for concurrent use by multiple goroutines without additional locking or coordination". Specialised, see below.</td></tr>
+  <tr><td><code>*sql.DB</code></td><td>Yes</td><td>"It's safe for concurrent use by multiple goroutines." It's a pool; create one and share it.</td></tr>
+  <tr><td><code>*http.Client</code>, <code>*http.Transport</code></td><td>Yes</td><td>"Clients are safe for concurrent use by multiple goroutines", and should be reused because the Transport caches connections.</td></tr>
+  <tr><td><code>*regexp.Regexp</code></td><td>Yes, mostly</td><td>Safe "except for configuration methods, such as <code>Regexp.Longest</code>".</td></tr>
+  <tr><td><code>math/rand</code></td><td>Top-level funcs: yes. <code>rand.New(src)</code>: no</td><td>"Top-level functions, such as Float64 and Int, are safe for concurrent use"; a source from <code>NewSource</code> "is not safe for concurrent use".</td></tr>
+  <tr><td><code>bytes.Buffer</code>, <code>strings.Builder</code></td><td><strong>No</strong></td><td>No such statement in the docs, so treat them as unsafe. Writing logs from several goroutines into one <code>bytes.Buffer</code> in a test is a classic race.</td></tr>
+</table>
+
+<h2>How it works</h2>
+<p>There are four basic ways to make shared state safe. Most real types use one, and some combine two.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 330" role="img" aria-label="Four strategies. Confinement: goroutines G1 and G2 send ops to an owner goroutine, which is the only one touching the map. Mutex-guarded: G1 holds sync.RWMutex while G2 waits; every access to the map holds the lock. Immutable snapshot: G1 and G2 Load an atomic.Pointer without a lock and read a frozen map; writers copy the map and store a new pointer. Atomics: G1 and G2 call Add, Load or CompareAndSwap on an atomic.Int64, which only covers a single value.">
+  <defs><marker id="arr-tsafe-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+
+  <rect class="box muted" x="10" y="10" width="180" height="310" rx="10"/>
+  <text x="100" y="34" text-anchor="middle" class="title">Confinement</text>
+  <rect class="box accent" x="25" y="50" width="65" height="28" rx="5"/><text x="57" y="69" text-anchor="middle">G1</text>
+  <rect class="box accent" x="110" y="50" width="65" height="28" rx="5"/><text x="142" y="69" text-anchor="middle">G2</text>
+  <path class="line" d="M57 78 L80 123" marker-end="url(#arr-tsafe-1)"/>
+  <path class="line" d="M142 78 L120 123" marker-end="url(#arr-tsafe-1)"/>
+  <rect class="box" x="30" y="125" width="140" height="44" rx="6"/><text x="100" y="145" text-anchor="middle">owner goroutine</text><text x="100" y="161" text-anchor="middle" class="small">receives ops on a chan</text>
+  <path class="line" d="M100 169 V213" marker-end="url(#arr-tsafe-1)"/>
+  <rect class="box ok" x="40" y="215" width="120" height="40" rx="6"/><text x="100" y="240" text-anchor="middle">map</text>
+  <text x="100" y="282" text-anchor="middle" class="small">only one goroutine</text>
+  <text x="100" y="298" text-anchor="middle" class="small">ever touches the data</text>
+
+  <rect class="box muted" x="205" y="10" width="180" height="310" rx="10"/>
+  <text x="295" y="34" text-anchor="middle" class="title">Mutex-guarded</text>
+  <rect class="box accent" x="220" y="50" width="65" height="28" rx="5"/><text x="252" y="69" text-anchor="middle">G1</text>
+  <rect class="box bad" x="305" y="50" width="65" height="28" rx="5"/><text x="337" y="69" text-anchor="middle">G2</text>
+  <path class="line" d="M252 78 L275 123" marker-end="url(#arr-tsafe-1)"/>
+  <path class="line bad dashed" d="M337 78 L315 123" marker-end="url(#arr-tsafe-1)"/>
+  <text x="352" y="104" text-anchor="middle" class="small">waits</text>
+  <rect class="box" x="225" y="125" width="140" height="44" rx="6"/><text x="295" y="145" text-anchor="middle">sync.RWMutex</text><text x="295" y="161" text-anchor="middle" class="small">1 writer or N readers</text>
+  <path class="line" d="M295 169 V213" marker-end="url(#arr-tsafe-1)"/>
+  <rect class="box ok" x="235" y="215" width="120" height="40" rx="6"/><text x="295" y="240" text-anchor="middle">map</text>
+  <text x="295" y="282" text-anchor="middle" class="small">every access, read or</text>
+  <text x="295" y="298" text-anchor="middle" class="small">write, holds the lock</text>
+
+  <rect class="box muted" x="400" y="10" width="180" height="310" rx="10"/>
+  <text x="490" y="34" text-anchor="middle" class="title">Immutable snapshot</text>
+  <rect class="box accent" x="415" y="50" width="65" height="28" rx="5"/><text x="447" y="69" text-anchor="middle">G1</text>
+  <rect class="box accent" x="500" y="50" width="65" height="28" rx="5"/><text x="532" y="69" text-anchor="middle">G2</text>
+  <path class="line" d="M447 78 L470 123" marker-end="url(#arr-tsafe-1)"/>
+  <path class="line" d="M532 78 L510 123" marker-end="url(#arr-tsafe-1)"/>
+  <rect class="box" x="420" y="125" width="140" height="44" rx="6"/><text x="490" y="145" text-anchor="middle">atomic.Pointer</text><text x="490" y="161" text-anchor="middle" class="small">Load: no lock</text>
+  <path class="line" d="M490 169 V213" marker-end="url(#arr-tsafe-1)"/>
+  <rect class="box ok" x="430" y="215" width="120" height="40" rx="6"/><text x="490" y="233" text-anchor="middle">map v2</text><text x="490" y="248" text-anchor="middle" class="small">frozen</text>
+  <text x="490" y="282" text-anchor="middle" class="small">writers copy the map,</text>
+  <text x="490" y="298" text-anchor="middle" class="small">then Store a new pointer</text>
+
+  <rect class="box muted" x="595" y="10" width="175" height="310" rx="10"/>
+  <text x="682" y="34" text-anchor="middle" class="title">Atomics</text>
+  <rect class="box accent" x="608" y="50" width="65" height="28" rx="5"/><text x="640" y="69" text-anchor="middle">G1</text>
+  <rect class="box accent" x="692" y="50" width="65" height="28" rx="5"/><text x="724" y="69" text-anchor="middle">G2</text>
+  <path class="line" d="M640 78 L662 123" marker-end="url(#arr-tsafe-1)"/>
+  <path class="line" d="M724 78 L702 123" marker-end="url(#arr-tsafe-1)"/>
+  <rect class="box" x="612" y="125" width="140" height="44" rx="6"/><text x="682" y="145" text-anchor="middle">atomic.Int64</text><text x="682" y="161" text-anchor="middle" class="small">Add · Load · CAS</text>
+  <path class="line" d="M682 169 V213" marker-end="url(#arr-tsafe-1)"/>
+  <rect class="box ok" x="622" y="215" width="120" height="40" rx="6"/><text x="682" y="240" text-anchor="middle">one value</text>
+  <text x="682" y="282" text-anchor="middle" class="small">indivisible ops on a</text>
+  <text x="682" y="298" text-anchor="middle" class="small">single word: counters, flags</text>
+</svg>
+<figcaption>Confinement and immutability avoid sharing mutable data at all. Locks and atomics share it, but make each access an indivisible step.</figcaption>
+</figure>
+<table>
+  <tr><th>Strategy</th><th>How it's safe</th><th>Good for</th><th>Costs and traps</th></tr>
+  <tr><td><strong>Confinement</strong> (one owner, actor style)</td><td>Only one goroutine reads or writes the data; others send it messages over a channel</td><td>State with complex rules, pipelines, a worker that owns a connection</td><td>Every call is a channel round trip and a context switch; the owner is a goroutine you must stop (or it leaks)</td></tr>
+  <tr><td><strong>Immutability / copy-on-write</strong> (<code>atomic.Pointer</code>)</td><td>Readers get a pointer to data nobody changes; writers build a new copy and swap the pointer</td><td>Read-mostly data replaced as a whole: config, routing tables, feature flags</td><td>Every write copies everything; concurrent writers still need a lock between them</td></tr>
+  <tr><td><strong>Mutex-guarded struct</strong> (<code>sync.Mutex</code> / <code>RWMutex</code>)</td><td>Every access to the fields holds the lock</td><td>The default for most shared state, especially with invariants across fields</td><td>Contention on one hot lock; forgetting the lock on one path; copying the struct</td></tr>
+  <tr><td><strong>Atomics</strong> (<code>atomic.Int64</code>, <code>atomic.Bool</code>, <code>CompareAndSwap</code>)</td><td>The hardware makes the single read-modify-write indivisible</td><td>Counters, flags, one pointer</td><td>Only one value at a time: two atomics updated "together" are not atomic together</td></tr>
+  <tr><td><strong><code>sync.Map</code></strong></td><td>Internally synchronised map</td><td>The two cases its docs name: "the entry for a given key is only ever written once but read many times, as in caches that only grow", or goroutines working on "disjoint sets of keys"</td><td>Untyped (<code>any</code>); the docs say "most code should use a plain Go map instead, with separate locking"</td></tr>
+</table>
+<p>Channels deserve a note. The <code>sync/atomic</code> docs repeat the Go proverb "Share memory by communicating; don't communicate by sharing memory." Channels shine when data <em>moves</em>: a job passes from a producer to a worker, and ownership moves with it. For a shared structure that many goroutines query, a mutex is usually simpler and faster than wrapping it in an actor. Use whichever makes the code obviously correct.</p>
+
+<h3>Choosing a strategy</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 380" role="img" aria-label="Decision flow. Must several goroutines share it? No: confine it to one owner goroutine. Yes: is it just one value such as a counter, flag or pointer? Yes: sync/atomic. No: is it read-mostly and replaced as a whole? Yes: atomic.Pointer to an immutable copy. No: are keys written once, or disjoint per goroutine? Yes: sync.Map. No: a struct with sync.Mutex, the default.">
+  <defs><marker id="arr-tsafe-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="40" y="20" width="360" height="46" rx="23"/><text x="220" y="48" text-anchor="middle">Must several goroutines share it?</text>
+  <rect class="box" x="40" y="95" width="360" height="46" rx="23"/><text x="220" y="123" text-anchor="middle">Just one value: counter, flag, pointer?</text>
+  <rect class="box" x="40" y="170" width="360" height="46" rx="23"/><text x="220" y="198" text-anchor="middle">Read-mostly and replaced as a whole?</text>
+  <rect class="box" x="40" y="245" width="360" height="46" rx="23"/><text x="220" y="273" text-anchor="middle">Keys written once, or disjoint per goroutine?</text>
+  <rect class="box accent" x="40" y="320" width="360" height="46" rx="8"/><text x="220" y="348" text-anchor="middle" class="title">struct + sync.Mutex (the default)</text>
+
+  <rect class="box ok" x="470" y="20" width="290" height="46" rx="8"/><text x="615" y="48" text-anchor="middle">Confine it: one goroutine owns it</text>
+  <rect class="box ok" x="470" y="95" width="290" height="46" rx="8"/><text x="615" y="123" text-anchor="middle">sync/atomic (atomic.Int64, …)</text>
+  <rect class="box ok" x="470" y="170" width="290" height="46" rx="8"/><text x="615" y="198" text-anchor="middle">atomic.Pointer to an immutable copy</text>
+  <rect class="box ok" x="470" y="245" width="290" height="46" rx="8"/><text x="615" y="273" text-anchor="middle">sync.Map</text>
+
+  <path class="line" d="M400 43 H468" marker-end="url(#arr-tsafe-2)"/><text x="434" y="36" text-anchor="middle" class="small">no</text>
+  <path class="line" d="M400 118 H468" marker-end="url(#arr-tsafe-2)"/><text x="434" y="111" text-anchor="middle" class="small">yes</text>
+  <path class="line" d="M400 193 H468" marker-end="url(#arr-tsafe-2)"/><text x="434" y="186" text-anchor="middle" class="small">yes</text>
+  <path class="line" d="M400 268 H468" marker-end="url(#arr-tsafe-2)"/><text x="434" y="261" text-anchor="middle" class="small">yes</text>
+
+  <path class="line" d="M220 66 V93" marker-end="url(#arr-tsafe-2)"/><text x="230" y="84" class="small">yes</text>
+  <path class="line" d="M220 141 V168" marker-end="url(#arr-tsafe-2)"/><text x="230" y="159" class="small">no</text>
+  <path class="line" d="M220 216 V243" marker-end="url(#arr-tsafe-2)"/><text x="230" y="234" class="small">no</text>
+  <path class="line" d="M220 291 V318" marker-end="url(#arr-tsafe-2)"/><text x="230" y="309" class="small">no</text>
+</svg>
+<figcaption>Start at the top. Most shared state ends at the bottom box, and that's fine: a mutex is simple, fast enough, and easy to review.</figcaption>
+</figure>
+
+<h2>Example</h2>
+<p><strong>A string cache made safe three ways.</strong> Same <code>Get</code>/<code>Set</code> API, three of the strategies above.</p>
+<pre><code>package tsafe
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+)
+
+// 1. Lock-guarded: every access to m holds mu. Readers share an RLock.
+type MutexCache struct {
+	mu sync.RWMutex
+	m  map[string]string
+}
+
+func NewMutexCache() *MutexCache { return &amp;MutexCache{m: map[string]string{}} }
+
+func (c *MutexCache) Get(k string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.m[k]
+	return v, ok
+}
+
+func (c *MutexCache) Set(k, v string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[k] = v
+}
+
+// 2. Confinement (actor): only the owner goroutine ever touches m.
+// Callers send it closures to run.
+type ActorCache struct{ ops chan func(map[string]string) }
+
+func NewActorCache(ctx context.Context) *ActorCache {
+	c := &amp;ActorCache{ops: make(chan func(map[string]string))}
+	go func() {
+		m := map[string]string{}
+		for {
+			select {
+			case op := &lt;-c.ops:
+				op(m)
+			case &lt;-ctx.Done():
+				return
+			}
+		}
+	}()
+	return c
+}
+
+func (c *ActorCache) Get(k string) (v string, ok bool) {
+	done := make(chan struct{})
+	c.ops &lt;- func(m map[string]string) { v, ok = m[k]; close(done) }
+	&lt;-done
+	return v, ok
+}
+
+func (c *ActorCache) Set(k, v string) {
+	c.ops &lt;- func(m map[string]string) { m[k] = v }
+}
+
+// 3. Immutable snapshot: readers load a pointer to a map nobody mutates.
+// Writers copy the map, change the copy, and swap the pointer.
+type SnapshotCache struct {
+	mu   sync.Mutex // serialises writers only
+	snap atomic.Pointer[map[string]string]
+}
+
+func NewSnapshotCache() *SnapshotCache {
+	c := &amp;SnapshotCache{}
+	c.snap.Store(&amp;map[string]string{})
+	return c
+}
+
+func (c *SnapshotCache) Get(k string) (string, bool) {
+	v, ok := (*c.snap.Load())[k] // no lock: the map behind the pointer never changes
+	return v, ok
+}
+
+// Each write copies the whole map: fine for read-mostly config or routing
+// tables, wrong for write-heavy or large maps (use MutexCache there).
+func (c *SnapshotCache) Set(k, v string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	old := *c.snap.Load()
+	next := make(map[string]string, len(old)+1)
+	for key, val := range old {
+		next[key] = val
+	}
+	next[k] = v
+	c.snap.Store(&amp;next)
+}</code></pre>
+<p>A test drives all of them, plus <code>sync.Map</code> and a plain <code>sync.Mutex</code> version, from eight goroutines at once. It is an <code>Example</code>, so <code>go test</code> checks the output, and <code>go test -race</code> on the package reports nothing:</p>
+<pre><code>// Eight goroutines write 100 keys each, then read them back.
+func Example_caches() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for _, im := range impls(ctx) {
+		var found atomic.Int64
+		var wg sync.WaitGroup
+		for g := range 8 {
+			wg.Go(func() {
+				for i := range 100 {
+					k := fmt.Sprintf("g%d-k%d", g, i)
+					im.c.Set(k, k)
+					if v, ok := im.c.Get(k); ok &amp;&amp; v == k {
+						found.Add(1)
+					}
+				}
+			})
+		}
+		wg.Wait()
+		fmt.Printf("%-8s found %d of 800&#92;n", im.name, found.Load())
+	}
+	// Output:
+	// rwmutex  found 800 of 800
+	// mutex    found 800 of 800
+	// actor    found 800 of 800
+	// snapshot found 800 of 800
+	// sync.Map found 800 of 800
+}</code></pre>
+<p>All five are correct. They are not equally fast. A parallel benchmark over 1,000 keys from 12 goroutines, either reads only or one write in ten (laptop numbers, one run, Apple M4 Pro):</p>
+<pre><code>$ go test -run '^$' -bench . .
+cpu: Apple M4 Pro
+BenchmarkReadOnly/rwmutex-12         	10256230	       120.8 ns/op
+BenchmarkReadOnly/mutex-12           	 9605804	       123.1 ns/op
+BenchmarkReadOnly/actor-12           	 1910014	       719.0 ns/op
+BenchmarkReadOnly/snapshot-12        	235540761	         5.982 ns/op
+BenchmarkReadOnly/sync.Map-12        	172478689	         5.855 ns/op
+BenchmarkWrite1in10/rwmutex-12       	19925913	        60.01 ns/op
+BenchmarkWrite1in10/mutex-12         	10332790	       132.9 ns/op
+BenchmarkWrite1in10/actor-12         	 1942447	       633.9 ns/op
+BenchmarkWrite1in10/snapshot-12      	  436070	      2683 ns/op
+BenchmarkWrite1in10/sync.Map-12      	82104850	        16.29 ns/op</code></pre>
+<ul>
+  <li><strong>Snapshot reads are nearly free</strong> (an atomic load and a map lookup), but each write copies all 1,000 entries, so at 10% writes it is the slowest by far. It's for data that changes rarely.</li>
+  <li><strong><code>sync.Map</code> wins here</strong> because this workload is exactly its documented case: a fixed set of keys, read again and again. With a constantly changing key set, the picture changes. Measure your own workload before switching.</li>
+  <li><strong><code>RWMutex</code> barely beat <code>Mutex</code> on pure reads</strong> (121 vs 123 ns). With a critical section this short, every <code>RLock</code> still updates one shared reader count, and the goroutines queue on that cache line. Read locks pay off when the work under the lock is long.</li>
+  <li><strong>The actor was slowest</strong>: each call is a channel round trip to another goroutine. Confinement buys clarity, not speed.</li>
+</ul>
+
+<p><strong>Safe parts, unsafe whole.</strong> Every <code>sync.Map</code> method is safe. That doesn't make a <em>sequence</em> of calls safe:</p>
+<pre><code>// HitBroken uses only safe operations, but Load and Store are two steps:
+// another goroutine can store between them, and its hit is lost.
+func HitBroken(m *sync.Map, page string) {
+	v, _ := m.LoadOrStore(page, 0)
+	m.Store(page, v.(int)+1)
+}
+
+// Hit stores a pointer to an atomic counter once, then increments it.
+func Hit(m *sync.Map, page string) {
+	v, _ := m.LoadOrStore(page, new(atomic.Int64))
+	v.(*atomic.Int64).Add(1)
+}</code></pre>
+<p>Eight goroutines each record 1,000 hits on one page, three runs. This output is from <code>-race</code>, and it reports nothing: there is no data race, only a lost-update race condition.</p>
+<pre><code>$ DEMO=1 go test -race -run TestHitBroken -v .
+    cache_test.go:106: HitBroken: 1282 hits recorded, want 8000
+    cache_test.go:106: HitBroken: 1559 hits recorded, want 8000
+    cache_test.go:106: HitBroken: 1173 hits recorded, want 8000
+ok  	example.com/tsafe	1.177s</code></pre>
+<p>Over 80% of the hits vanished. <code>Hit</code> stores the counter once with <code>LoadOrStore</code> and then increments it atomically; <code>ExampleHit</code> pins its result at exactly <code>hits: 8000</code>.</p>
+
+<p><strong>An unguarded map.</strong> Two goroutines write to one plain map:</p>
+<pre><code>func main() {
+	m := map[int]int{}
+	var wg sync.WaitGroup
+	for g := range 2 {
+		wg.Go(func() {
+			for i := range 1_000_000 {
+				m[i] = g // two goroutines write the same map
+			}
+		})
+	}
+	wg.Wait()
+}</code></pre>
+<pre><code>$ go run ./mapcrash
+fatal error: concurrent map writes
+
+goroutine 18 [running]:
+internal/runtime/maps.fatal({0x1045eba20?, 0x0?})
+	$GOROOT/src/runtime/panic.go:1195 +0x20
+main.main.func1()
+…
+exit status 2</code></pre>
+<p>This is a <code>fatal error</code>, not a panic: <code>recover</code> can't catch it, and the whole process exits. The runtime checks for it on a best-effort basis. In one of about a dozen runs on the same laptop it died differently, with <code>fatal error: fault</code> and <code>SIGSEGV</code>: the memory corruption the Go memory model warns about.</p>
+
+<p><strong>Real-world scenario.</strong> Picture a pricing service that keeps exchange rates in a <code>map[string]float64</code>. A background goroutine refreshes it every 30 s; 400 requests per second read it. In production a pod occasionally dies with <code>concurrent map writes</code>, and with 3 replicas it gets filed as "flaky". The fix is a few lines with an <code>atomic.Pointer[map[string]float64]</code>: the refresher builds a new map and calls <code>rates.Store(&amp;next)</code>, and readers call <code>rates.Load()</code>. Reads take no lock, and refreshes are atomic: no request ever sees half-updated rates.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Copying a mutex.</strong> "A Mutex must not be copied after first use" (the same rule applies to <code>RWMutex</code>, <code>WaitGroup</code>, <code>sync.Map</code>, <code>atomic.Pointer</code>). A value receiver or passing the struct by value copies the lock, and each copy guards nothing. <code>go vet</code>'s copylocks check catches it:
+<pre><code>type Stats struct {
+	mu   sync.Mutex
+	hits int
+}
+
+// Value receiver: every call locks a fresh copy of mu and bumps a copy of hits.
+func (s Stats) Hit() {
+	s.mu.Lock()
+	s.hits++
+	s.mu.Unlock()
+}
+
+func Snapshot(s Stats) int { return s.hits } // copies the lock too</code></pre>
+<pre><code>$ go vet ./copylock
+copylock/stats.go:11:9: Hit passes lock by value: example.com/tsafe/copylock.Stats contains sync.Mutex
+copylock/stats.go:17:17: Snapshot passes lock by value: example.com/tsafe/copylock.Stats contains sync.Mutex</code></pre>
+  Use pointer receivers for any type that contains a lock, and run <code>go vet</code> in CI.</li>
+  <li><strong>Leaking internals.</strong> A method that returns the internal map or slice hands out an unguarded reference. The lock protected the field, not the data it points to:
+<pre><code>// AllLeaky leaks the internal map: callers can now read and write it
+// with no lock held.
+func (c *MutexCache) AllLeaky() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.m
+}
+
+// All returns a copy the caller owns.
+func (c *MutexCache) All() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return maps.Clone(c.m)
+}</code></pre></li>
+  <li><strong>Check-then-act on a safe type.</strong> <code>if _, ok := c.Get(k); !ok { c.Set(k, v) }</code> is two locked calls with a gap between them. Add compound methods (<code>GetOrSet</code>, <code>LoadOrStore</code>, <code>CompareAndSwap</code>) that hold the lock for the whole operation.</li>
+  <li><strong>Holding a lock across slow work.</strong> Calling the network, a database or a user callback while holding a lock stalls everyone else, and can cause <a href="#deadlocks">deadlocks</a>. Copy what you need, unlock, then do the slow part.</li>
+  <li><strong>Expecting <code>RWMutex</code> to scale reads.</strong> With a short critical section, readers still contend on the shared reader count (121 vs 123 ns above); it pays off when read-side work is long. It also forbids recursive read locking: per the docs, once a writer calls <code>Lock</code>, new <code>RLock</code> calls block until the writer is done, so a goroutine that re-enters <code>RLock</code> can deadlock.</li>
+  <li><strong>Unusable zero values.</strong> A struct with a nil map field panics on the first <code>Set</code>. Either make the zero value work (lazily create the map under the lock) or provide a constructor and say so.</li>
+  <li><strong>Forgotten owner goroutines.</strong> An actor or background refresher needs a way to stop (a <code>context</code> or <code>Close</code>), or it leaks. See <a href="#memory-leaks">Memory Leaks</a>.</li>
+</ul>
+
+<div class="callout warn"><strong>Document the promise.</strong> If your type is safe for concurrent use, write "safe for concurrent use by multiple goroutines" in its doc comment, as the standard library does. If it isn't, say that too. Callers can't see your locks.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Unless the docs say "safe for concurrent use", assume a type isn't. Plain maps, slices and <code>bytes.Buffer</code> aren't; <code>*sql.DB</code>, <code>*http.Client</code> and <code>sync.Map</code> are.</li>
+  <li>Four strategies: confine the data to one goroutine, make it immutable and swap pointers, guard it with a mutex, or use atomics for single values. A mutex-guarded struct is the right default.</li>
+  <li>Safe methods don't make a sequence of calls safe; provide compound operations instead.</li>
+  <li>Don't copy locks (<code>go vet</code> catches it), don't return internal maps or slices, and measure before reaching for <code>RWMutex</code> or <code>sync.Map</code>.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#race-conditions">Race Conditions</a> · <a href="#deadlocks">Deadlocks</a> · <a href="#pessimistic-locking">Pessimistic Locking</a> · <a href="#caching">Caching</a> · <a href="#memory-leaks">Memory Leaks</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
+`;
+
