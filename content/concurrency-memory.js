@@ -1628,3 +1628,327 @@ func (c *MutexCache) All() map[string]string {
 <p><strong>Related:</strong> <a href="#race-conditions">Race Conditions</a> · <a href="#deadlocks">Deadlocks</a> · <a href="#pessimistic-locking">Pessimistic Locking</a> · <a href="#caching">Caching</a> · <a href="#memory-leaks">Memory Leaks</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
 `;
 
+CONTENT["memory-leaks"] = `
+<p class="tldr"><strong>TL;DR</strong>: A garbage collector frees memory nobody can reach any more. It can't free memory you can still reach but will never use again, and that is what a memory leak is in Go. Think of a coat check: the attendant only throws a coat away when no ticket for it exists. Keep every ticket "just in case" and the room fills up, however good the attendant is.</p>
+
+<h2>The problem it solves</h2>
+<p>In C a leak is a <code>malloc</code> without a <code>free</code>. In Go, Java or Python the GC does the freeing, so a leak is different: some <em>reference</em> keeps data alive. A global map that only grows. A goroutine blocked forever, holding its stack and everything its stack points to. A 16-byte slice that still points into a 10 MiB array. The GC is working correctly in every case. It sees a path from a root to the data, so it must keep it.</p>
+<p>A leak rarely crashes anything right away. It shows up as a slow trend:</p>
+<ul>
+  <li><strong>Memory (RSS) climbs</strong> over hours or days and never comes back down after traffic drops.</li>
+  <li><strong>The container gets OOMKilled.</strong> When a container goes over its memory limit, the kernel's OOM killer sends <code>SIGKILL</code>. Kubernetes reports the reason <code>OOMKilled</code> and exit code 137 (128 + 9), and restarts the pod. A pod that restarts every few days on a schedule is a classic leak signature.</li>
+  <li><strong>GC CPU goes up.</strong> Each GC cycle has to mark the whole live heap, and leaked data is live. A bigger live heap means more marking work per cycle and higher latency during the mark phase (see <a href="#garbage-collection">Garbage Collection</a>).</li>
+  <li><strong>Goroutine count climbs.</strong> Each leaked goroutine holds at least a few KiB of stack, plus whatever it references: request bodies, buffers, DB connections.</li>
+</ul>
+
+<h2>How it works</h2>
+<p>A tracing GC starts from the <strong>roots</strong>: global variables and every goroutine's stack. It follows pointers and marks everything it reaches. Anything not marked is freed. So for each object there are three cases, and only one of them is a leak:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Reachability. Roots are globals and goroutine stacks. From globals, a config object is reachable and used. A global cache map is reachable; its fresh entries are used, but entries for old URLs are reachable and never read again: a leak. From goroutine stacks, a running handler uses its request. A blocked worker goroutine stuck on a channel send keeps its 64 KiB buffer reachable: a leak. An object no root points to is unreachable and the GC frees it.">
+  <defs><marker id="arr-mleak-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="90" y="26" text-anchor="middle" class="title">GC roots</text>
+  <text x="340" y="26" text-anchor="middle" class="title">Reachable</text>
+  <text x="660" y="26" text-anchor="middle" class="title">Unreachable</text>
+
+  <rect class="box accent" x="20" y="50" width="140" height="90" rx="8"/>
+  <text x="90" y="88" text-anchor="middle" class="title">globals</text>
+  <text x="90" y="106" text-anchor="middle" class="small">package-level vars</text>
+  <rect class="box accent" x="20" y="170" width="140" height="90" rx="8"/>
+  <text x="90" y="208" text-anchor="middle" class="title">goroutine stacks</text>
+  <text x="90" y="226" text-anchor="middle" class="small">locals of every goroutine</text>
+
+  <rect class="box ok" x="230" y="44" width="130" height="34" rx="6"/><text x="295" y="66" text-anchor="middle">config</text>
+  <rect class="box" x="230" y="96" width="130" height="44" rx="6"/><text x="295" y="115" text-anchor="middle">cache map</text><text x="295" y="131" text-anchor="middle" class="small">var Cache = map[…]</text>
+  <rect class="box ok" x="420" y="78" width="160" height="30" rx="6"/><text x="500" y="98" text-anchor="middle">entry: hot URL</text>
+  <rect class="box bad" x="420" y="118" width="160" height="40" rx="6"/><text x="500" y="135" text-anchor="middle">entries: old URLs</text><text x="500" y="150" text-anchor="middle" class="small">never read again</text>
+
+  <rect class="box ok" x="230" y="166" width="130" height="34" rx="6"/><text x="295" y="188" text-anchor="middle">running handler</text>
+  <rect class="box bad" x="230" y="214" width="130" height="44" rx="6"/><text x="295" y="233" text-anchor="middle">blocked worker</text><text x="295" y="249" text-anchor="middle" class="small">stuck on ch &lt;- v</text>
+  <rect class="box bad" x="420" y="218" width="160" height="36" rx="6"/><text x="500" y="241" text-anchor="middle">its 64 KiB buffer</text>
+
+  <path class="line" d="M160 80 H228" marker-end="url(#arr-mleak-1)"/>
+  <path class="line" d="M160 112 H228" marker-end="url(#arr-mleak-1)"/>
+  <path class="line" d="M360 110 L418 95" marker-end="url(#arr-mleak-1)"/>
+  <path class="line bad" d="M360 126 L418 136" marker-end="url(#arr-mleak-1)"/>
+  <path class="line" d="M160 196 L228 184" marker-end="url(#arr-mleak-1)"/>
+  <path class="line bad" d="M160 226 L228 234" marker-end="url(#arr-mleak-1)"/>
+  <path class="line bad" d="M360 236 H418" marker-end="url(#arr-mleak-1)"/>
+
+  <rect class="box muted" x="600" y="120" width="120" height="60" rx="6"/>
+  <text x="660" y="146" text-anchor="middle">old request</text>
+  <text x="660" y="164" text-anchor="middle" class="small">no path from a root</text>
+  <text x="660" y="204" text-anchor="middle" class="small">GC frees it</text>
+  <text x="390" y="288" text-anchor="middle" class="small">green: reachable and used · red: reachable but never used again (the leak) · grey: garbage</text>
+</svg>
+<figcaption>The GC only knows the arrows, not your intent. The red boxes are "live" as far as it can tell, so it keeps them forever. Fixing a leak means removing an arrow: evict the entry, or let the goroutine exit.</figcaption>
+</figure>
+
+<h3>The goroutine leak, step by step</h3>
+<p>The most common Go leak is a goroutine that can never finish. A goroutine is not garbage collected while it is blocked: its stack is a root. Here a handler starts a worker, then gives up when the request deadline passes. The worker finishes later and tries to send on an unbuffered channel that nobody will ever read again.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 250" role="img" aria-label="Sequence. The handler starts a worker and waits in a select. At 1 ms the context deadline fires and the handler returns an error. At 20 ms the worker finishes and tries to send on the unbuffered channel. No one receives, so it blocks forever: one leaked goroutine per timed-out request. With a buffer of one, the send succeeds, the worker exits, and the channel becomes garbage.">
+  <defs><marker id="arr-mleak-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="60" y="14" width="140" height="30" rx="6"/><text x="130" y="34" text-anchor="middle">handler</text>
+  <rect class="box" x="320" y="14" width="140" height="30" rx="6"/><text x="390" y="34" text-anchor="middle">ch (unbuffered)</text>
+  <rect class="box" x="580" y="14" width="140" height="30" rx="6"/><text x="650" y="34" text-anchor="middle">worker</text>
+  <path class="line dashed" d="M130 44 V240" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M390 44 V240" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M650 44 V240" style="stroke: var(--line)"/>
+
+  <path class="line" d="M130 70 H648" marker-end="url(#arr-mleak-2)"/>
+  <text x="520" y="64" text-anchor="middle" class="small">go func() { ch &lt;- slowLookup() }()</text>
+  <text x="250" y="96" text-anchor="middle" class="small">select { &lt;-ch · &lt;-ctx.Done() }</text>
+  <rect class="box bad" x="40" y="114" width="180" height="40" rx="6"/>
+  <text x="130" y="131" text-anchor="middle">t = 1 ms: deadline</text>
+  <text x="130" y="147" text-anchor="middle" class="small">returns error, stops reading</text>
+  <path class="line bad" d="M650 186 H394" marker-end="url(#arr-mleak-2)"/>
+  <text x="520" y="178" text-anchor="middle" class="small">t = 20 ms: ch &lt;- "price=42"</text>
+  <rect class="box bad" x="560" y="200" width="200" height="40" rx="6"/>
+  <text x="660" y="217" text-anchor="middle">blocked forever</text>
+  <text x="660" y="233" text-anchor="middle" class="small">no receiver will ever come</text>
+  <text x="260" y="220" text-anchor="middle" class="small">fix: make(chan string, 1)</text>
+  <text x="260" y="236" text-anchor="middle" class="small">the send lands in the buffer, worker exits</text>
+</svg>
+<figcaption>Every request that times out leaves one goroutine behind. At 50 timeouts per second, that's 180,000 goroutines an hour, each pinning its stack and whatever it captured.</figcaption>
+</figure>
+
+<h3>The usual suspects</h3>
+<table>
+  <tr><th>Leak</th><th>What keeps it reachable</th><th>Fix</th></tr>
+  <tr><td><strong>Goroutine blocked forever</strong> (send/receive with no partner, <code>select</code> without <code>ctx.Done()</code>, waiting on a lock never released)</td><td>The goroutine's stack is a GC root</td><td>Buffered channel of the right size, <code>select</code> on <code>ctx.Done()</code>, always give a goroutine a way to exit. See <a href="#timeouts">Timeouts</a>.</td></tr>
+  <tr><td><strong>Unbounded map or cache</strong></td><td>A global or long-lived struct holds every key ever seen</td><td>Size limit + eviction (LRU), TTL, or a bounded cache library. See <a href="#caching">Caching</a>.</td></tr>
+  <tr><td><strong>Ticker loop with no exit</strong></td><td>The goroutine running <code>for range t.C</code> never returns</td><td>Exit on <code>ctx.Done()</code> and <code>defer t.Stop()</code></td></tr>
+  <tr><td><strong>Sub-slice / substring pinning</strong></td><td>A small slice still points into the big backing array</td><td><code>bytes.Clone</code>, <code>strings.Clone</code>, or <code>copy</code> into a new slice</td></tr>
+  <tr><td><strong>Global slice of pointers</strong> (listeners, subscribers, "recent requests")</td><td>Append without remove; or <code>s = s[1:]</code> as a queue, which leaves popped items in the array</td><td>Unregister functions, set removed elements to <code>nil</code>, use a ring buffer</td></tr>
+  <tr><td><strong><code>defer</code> inside a long loop</strong></td><td>Deferred calls (and the files, rows, locks they close) wait until the <em>function</em> returns</td><td>Move the loop body into its own function</td></tr>
+  <tr><td><strong>Never-closed resources</strong> (<code>resp.Body</code>, <code>rows</code>, files)</td><td>Buffers, connections and file descriptors stay checked out</td><td><code>defer x.Close()</code> right after the error check. See <a href="#connection-pooling">Connection Pooling</a>.</td></tr>
+  <tr><td><strong>cgo and finalizers</strong> (brief)</td><td>C memory is invisible to the GC; a cycle that contains an object with a finalizer is not guaranteed to be collected</td><td>Free C memory explicitly; prefer <code>runtime.AddCleanup</code> (Go 1.24+) over <code>SetFinalizer</code>, and never rely on either for prompt cleanup</td></tr>
+</table>
+<p><strong>About tickers and timers.</strong> Before Go 1.23, a <code>time.Ticker</code> that was never stopped could never be collected, so <code>defer t.Stop()</code> was mandatory, and <code>time.After</code> in a hot loop piled up timers. The <code>time</code> package docs say that as of Go 1.23 the GC can recover unreferenced tickers and timers even if they were never stopped. That only fixes the timer itself. A goroutine looping <code>for range t.C</code> with no exit still leaks in every version. Give it one:</p>
+<pre><code>// Poll: the caller's ctx ends the goroutine (and Stop ends the ticks).
+func Poll(ctx context.Context, url string) {
+	t := time.NewTicker(time.Second)
+	go func() {
+		defer t.Stop()
+		for {
+			select {
+			case &lt;-ctx.Done():
+				return
+			case &lt;-t.C:
+				check(url)
+			}
+		}
+	}()
+}</code></pre>
+
+<h3>What a leak looks like on a dashboard</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Chart of process memory over 12 hours. A healthy service shows a sawtooth that rises between GC cycles and drops back to the same floor. A leaking service shows the same sawtooth, but the floor rises every hour, until memory reaches the container limit around hour 9; the pod is OOMKilled and restarts, and the climb starts again.">
+  <defs><marker id="arr-mleak-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <path class="line" d="M70 250 H750" marker-end="url(#arr-mleak-3)"/>
+  <path class="line" d="M70 250 V30" marker-end="url(#arr-mleak-3)"/>
+  <text x="740" y="272" text-anchor="end" class="small">time (hours)</text>
+  <text x="62" y="40" text-anchor="end" class="small">memory</text>
+  <path class="line bad dashed" d="M70 60 H740"/>
+  <text x="80" y="54" class="small">container memory limit</text>
+  <path class="line ok" d="M70 205 L97 170 L125 205 L153 170 L181 205 L209 170 L237 205 L265 170 L293 205 L321 170 L349 205 L377 170 L405 205 L432 170 L460 205 L488 170 L516 205 L544 170 L572 205 L600 170 L628 205 L656 170 L684 205 L712 170"/>
+  <path class="line bad" d="M70 205 L97 170 L125 188 L153 153 L181 171 L209 136 L237 154 L265 119 L293 137 L321 102 L349 120 L377 85 L405 103 L432 68 L460 86 L488 60 L516 69 L544 60 L572 205 L600 170 L628 188 L656 153 L684 171 L712 136"/>
+  <path class="line bad dashed" d="M572 60 V205"/>
+  <text x="572" y="222" text-anchor="middle">OOMKilled</text>
+  <text x="572" y="238" text-anchor="middle" class="small">exit 137, restart</text>
+  <text x="200" y="96" text-anchor="middle" class="small">leak: the floor after each GC keeps rising</text>
+  <text x="300" y="232" text-anchor="middle" class="small">healthy: GC brings it back to the same floor</text>
+</svg>
+<figcaption>Look at the <em>floor</em> (memory right after a GC), not the peaks. A rising floor means the live heap is growing. A restart "fixes" it, which is why leaks hide behind deploys: a team that ships daily may never notice one that takes three days to fill the limit.</figcaption>
+</figure>
+
+<h3>Finding it</h3>
+<table>
+  <tr><th>Tool</th><th>Answers</th><th>Notes</th></tr>
+  <tr><td><code>runtime.NumGoroutine()</code> / metric <code>/sched/goroutines:goroutines</code></td><td>Is the goroutine count growing?</td><td>Export it as a gauge (see <a href="#metrics">Metrics</a>). Steady traffic, flat line.</td></tr>
+  <tr><td><code>pprof</code> goroutine profile (<code>/debug/pprof/goroutine?debug=1</code>)</td><td>Where are all goroutines parked?</td><td>Groups identical stacks with a count. "4,000 goroutines at <code>leak.go:20</code> in chan send" names the line.</td></tr>
+  <tr><td><code>goroutineleak</code> profile</td><td>Which goroutines can <em>never</em> wake up?</td><td>New: an experiment in Go 1.26 (<code>GOEXPERIMENT=goroutineleakprofile</code>); in the Go 1.27 used here it is a built-in profile. It uses the GC to find goroutines blocked on a channel or lock that no runnable goroutine can reach. It can't see leaks through globals.</td></tr>
+  <tr><td><code>pprof</code> heap, <code>inuse_space</code> (the default)</td><td>What is live right now, by allocation site?</td><td>Live as of the last GC. Use this for leaks.</td></tr>
+  <tr><td><code>pprof</code> heap, <code>-sample_index=alloc_space</code></td><td>What allocated the most, freed or not?</td><td>For GC pressure, not leaks.</td></tr>
+  <tr><td><code>go tool pprof -base old new</code></td><td>What grew between two snapshots?</td><td>Take one profile, wait, take another. The diff hides the steady state and shows the growth.</td></tr>
+  <tr><td><code>go.uber.org/goleak</code></td><td>Did this test leave goroutines behind?</td><td><code>defer goleak.VerifyNone(t)</code> per test, or <code>goleak.VerifyTestMain(m)</code> for a package. Catches leaks in CI, before production.</td></tr>
+</table>
+<p>To get these profiles from a running service, import <code>net/http/pprof</code> and serve it on a private port (never on the public listener):</p>
+<pre><code>import _ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux
+go func() { log.Println(http.ListenAndServe("localhost:6060", nil)) }()
+
+// then, from your laptop (port-forward first):
+//   curl -s localhost:6060/debug/pprof/goroutine?debug=1 | head -30
+//   curl -s localhost:6060/debug/pprof/goroutineleak?debug=1
+//   curl -s -o heap1.pb.gz localhost:6060/debug/pprof/heap   (an hour later: heap2.pb.gz)
+//   go tool pprof -top -base heap1.pb.gz heap2.pb.gz</code></pre>
+
+<h2>Example</h2>
+<p><strong>A leaking handler, a growing cache and a pinned slice.</strong> <code>HandleLeaky</code> is the sequence diagram above. <code>HandleFixed</code> is identical except for the buffer. <code>HandleCached</code> is a "cache" with no eviction.</p>
+<pre><code>package leak
+
+import (
+	"bytes"
+	"context"
+	"time"
+)
+
+// slowLookup stands in for a call to another service.
+func slowLookup() string {
+	time.Sleep(20 * time.Millisecond)
+	return "price=42"
+}
+
+// HandleLeaky gives up after the request deadline, but the worker it
+// started is stuck forever on "ch &lt;- ...": nobody will ever receive.
+func HandleLeaky(ctx context.Context) (string, error) {
+	ch := make(chan string) // unbuffered
+	go func() {
+		ch &lt;- slowLookup() // blocks forever once the handler has returned
+	}()
+	select {
+	case v := &lt;-ch:
+		return v, nil
+	case &lt;-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// HandleFixed: a buffer of 1 lets the worker finish its send and exit
+// even if nobody is listening any more.
+func HandleFixed(ctx context.Context) (string, error) {
+	ch := make(chan string, 1)
+	go func() {
+		ch &lt;- slowLookup()
+	}()
+	select {
+	case v := &lt;-ch:
+		return v, nil
+	case &lt;-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// Cache grows forever: one entry per distinct key, never evicted.
+var Cache = map[string][]byte{}
+
+func HandleCached(key string) []byte {
+	if v, ok := Cache[key]; ok {
+		return v
+	}
+	v := make([]byte, 64&lt;&lt;10) // 64 KiB rendered page
+	Cache[key] = v
+	return v
+}</code></pre>
+<p>The tests run 1,000 requests with a 1 ms deadline against a 20 ms lookup, so every request times out. <code>Example</code> tests fail if the printed output differs from the <code>// Output:</code> block, so those lines are real:</p>
+<pre><code>func run(n int, h func(context.Context) (string, error)) {
+	for range n {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		h(ctx) // times out: the lookup takes 20 ms
+		cancel()
+	}
+	time.Sleep(500 * time.Millisecond) // let every lookup finish
+}
+
+func Example_leak() {
+	before := runtime.NumGoroutine()
+	run(1000, HandleLeaky)
+	fmt.Println("leaky: goroutines added:", runtime.NumGoroutine()-before)
+	var prof strings.Builder
+	pprof.Lookup("goroutineleak").WriteTo(&amp;prof, 1) // runs a leak-detecting GC
+	fmt.Println(strings.SplitN(prof.String(), "&#92;n", 2)[0])
+
+	before = runtime.NumGoroutine()
+	run(1000, HandleFixed)
+	fmt.Println("fixed: goroutines added:", runtime.NumGoroutine()-before)
+	// Output:
+	// leaky: goroutines added: 1000
+	// goroutineleak profile: total 1000
+	// fixed: goroutines added: 0
+}
+
+// Run with LEAKDEMO=1 to see goleak fail the test.
+func TestHandlerNoLeak(t *testing.T) {
+	if os.Getenv("LEAKDEMO") == "" {
+		t.Skip("set LEAKDEMO=1")
+	}
+	defer goleak.VerifyNone(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if _, err := HandleLeaky(ctx); err != nil {
+		t.Log("handler:", err)
+	}
+}</code></pre>
+<p>The goroutine count grows by exactly one per timed-out request, and the <code>goroutineleak</code> profile finds all 1,000 of them. The fixed handler leaves nothing behind. Here is the leak profile's text form (3 requests, so it's short), and <code>goleak</code> failing the test with <code>LEAKDEMO=1</code>; both are real runs, with the absolute path shortened:</p>
+<pre><code>goroutineleak profile: total 3
+3 @ 0x1023a8428 0x10233b7e4 0x10233b3f8 0x10244fcb8 0x1023aecc4
+#	0x10244fcb7	example.com/leak.HandleLeaky.func1+0x47	.../memory-leaks/leak.go:20</code></pre>
+<pre><code>--- FAIL: TestHandlerNoLeak (0.44s)
+    leak_test.go:51: handler: context deadline exceeded
+    leak_test.go:53: found unexpected goroutines:
+        [Goroutine 36 in state chan send, with example.com/leak.HandleLeaky.func1 on top of the stack:
+        example.com/leak.HandleLeaky.func1()
+        	.../memory-leaks/leak.go:20 +0x48
+        created by example.com/leak.HandleLeaky in goroutine 35
+        	.../memory-leaks/leak.go:19 +0x7c
+        ]
+FAIL
+FAIL	example.com/leak	0.595s
+FAIL</code></pre>
+<p>Both point to the exact line: <code>leak.go:20</code> is <code>ch &lt;- slowLookup()</code>, and goleak even reports the state, <code>chan send</code>.</p>
+<p><strong>The cache.</strong> A test calls <code>HandleCached</code> for 500 URLs, writes a heap profile, calls it for 1,000 more URLs and writes a second one. Real <code>pprof</code> output (heap profiles are sampled, so the MB figures are estimates: 1,500 × 64 KiB is really 93.75 MiB):</p>
+<pre><code>$ go tool pprof -top -base heap1.pb.gz heap2.pb.gz
+Showing nodes accounting for 65.46MB, 98.49% of 66.46MB total
+      flat  flat%   sum%        cum   cum%
+   65.96MB 99.25% 99.25%    65.96MB 99.25%  example.com/leak.HandleCached (inline)
+   -0.50MB  0.75% 98.49%    -0.50MB  0.75%  fmt.init.func1
+         0     0% 98.49%    65.46MB 98.49%  example.com/leak.TestHeapProfile</code></pre>
+<p>A plain <code>go tool pprof -top heap2.pb.gz</code> shows what is live (99.47 MB in <code>HandleCached</code>); the <code>-base</code> diff shows what <em>grew</em>: about 64 MB more, all from <code>HandleCached</code>. In production, the diff between two snapshots an hour apart is the fastest way to a leak.</p>
+<p><strong>The pinned slice.</strong> Keeping 16 bytes of an upload keeps the whole upload:</p>
+<pre><code>// HeaderOf keeps 16 bytes of a 10 MiB upload, but the slice still points
+// into the big array, so all 10 MiB stay reachable.
+func HeaderOf(upload []byte) []byte { return upload[:16] }
+
+// HeaderCopy copies the 16 bytes; the big array can be collected.
+func HeaderCopy(upload []byte) []byte { return bytes.Clone(upload[:16]) }</code></pre>
+<pre><code>func Example_pin() {
+	base := liveMiB()
+	for range 5 { // five uploads, keep only their headers
+		kept = append(kept, HeaderOf(make([]byte, 10&lt;&lt;20)))
+	}
+	fmt.Println("sub-slice: live heap grew by", liveMiB()-base, "MiB")
+
+	kept = nil
+	base = liveMiB()
+	for range 5 {
+		kept = append(kept, HeaderCopy(make([]byte, 10&lt;&lt;20)))
+	}
+	fmt.Println("copy:      live heap grew by", liveMiB()-base, "MiB")
+	// Output:
+	// sub-slice: live heap grew by 50 MiB
+	// copy:      live heap grew by 0 MiB
+}</code></pre>
+<p>Five 16-byte headers held 50 MiB, because each slice header still points into its 10 MiB array. Substrings of a big string behave the same way.</p>
+<p><strong>Real-world scenario.</strong> A pricing API runs pods with a 512 MiB memory limit. A downstream service gets slow for an afternoon, and 5% of 1,000 requests/s hit the 200 ms deadline: 50 leaked goroutines per second. Say each holds its stack plus a 32 KiB response buffer, about 40 KiB in all. That is 2 MiB per second, 7 GiB an hour if it kept going. Pods get OOMKilled about every 4 minutes. The goroutine panel climbs in a straight line instead of tracking traffic. One buffered channel fixes it, and a <code>goleak.VerifyNone</code> in the handler's timeout test stops it from coming back.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Reading RSS as "live heap".</strong> After a spike, the Go runtime returns freed memory to the OS gradually, so RSS lags. A high but flat RSS is not a leak. Compare <code>inuse_space</code> or the post-GC heap (the third number in a <code>gctrace</code> line) over time.</li>
+  <li><strong>Raising the memory limit.</strong> Doubling the container limit doubles the time between OOMKills. It doesn't fix the leak, and it hides it for longer.</li>
+  <li><strong>Starting goroutines with no exit path.</strong> Before writing <code>go func()</code>, answer "how does this goroutine end?" If the answer depends on someone else reading a channel, make sure they always will, or buffer it.</li>
+  <li><strong>"It's a cache" with no bound.</strong> Any map keyed by user input (URL, user ID, query text) grows with the number of distinct inputs, not with traffic. Bound it by count or bytes, and add a TTL.</li>
+  <li><strong>Profiling only in staging.</strong> Leaks need real traffic and real time. Keep <code>pprof</code> on a private port in production and take two heap profiles an hour apart.</li>
+</ul>
+
+<div class="callout warn"><strong>A blocked goroutine is never collected.</strong> Its stack is a GC root, so it keeps everything it references alive: request bodies, buffers, even database connections. Only the goroutine itself returning frees it.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>In a GC'd language a leak is memory that is still reachable but never used again. The GC is working correctly; the bug is a reference you forgot.</li>
+  <li>The big Go leaks are goroutines that can never exit and caches with no bound. Give every goroutine an exit path (<code>ctx.Done()</code>, buffered channels) and every cache a size limit.</li>
+  <li>Watch the goroutine count and the heap floor after GC. Diagnose with the goroutine and goroutineleak profiles and <code>pprof -base</code> on two heap snapshots.</li>
+  <li>Stop leaks in CI with <code>goleak.VerifyNone</code> on tests that cover timeouts and cancellation.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#garbage-collection">Garbage Collection</a> · <a href="#timeouts">Timeouts</a> · <a href="#caching">Caching</a> · <a href="#kubernetes">Kubernetes</a> · <a href="#metrics">Metrics</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
+`;
