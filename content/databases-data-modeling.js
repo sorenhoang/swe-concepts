@@ -617,3 +617,406 @@ Limit  (cost=0.29..1.03 rows=20 width=29) (actual rows=20.00 loops=1)
 
 <p><strong>Related:</strong> <a href="#database-indexing">Database Indexing</a> · <a href="#n-1-queries">N+1 Queries</a> · <a href="#connection-pooling">Connection Pooling</a> · <a href="#p99-latency">p99 Latency</a> · <a href="#distributed-tracing">Distributed Tracing</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
 `;
+CONTENT["n-1-queries"] = `
+<p class="tldr"><strong>TL;DR</strong>: An N+1 query problem is one query to load a list, then one more query <em>per item</em> to load something related: 1 + N round trips where 1 or 2 would do. Each query is fast, so nothing looks slow in isolation, but 100 rows means 101 round trips. It is like a waiter who walks to the kitchen once per dish instead of carrying the whole order on one tray.</p>
+
+<h2>The problem it solves</h2>
+<p>Here's the shape of the bug. A page shows a customer's last 100 orders with their line items. The code loads the orders, then loops over them and loads each order's items:</p>
+<ul>
+  <li>1 query: <code>SELECT … FROM orders WHERE customer_id = 7</code> returns 100 rows.</li>
+  <li>N queries: <code>SELECT … FROM items WHERE order_id = ?</code>, once per order. That's 100 more.</li>
+</ul>
+<p>Each item query takes well under a millisecond inside the database. The cost is everything around it: a network round trip, driver and protocol overhead, parsing and planning on the server, and a connection held from the pool for the whole loop. If one round trip costs 1 ms (a database in another availability zone, or a busy proxy in between), the page spends at least 101 ms on the wire before the database does any real work. The batched version spends 2 ms.</p>
+<p>It is easy to miss because it scales with data, not with code. In development a customer has 3 orders: 4 queries, nobody notices. In production a big customer has 500, and the same endpoint makes 501 queries, holds a connection for half a second, and starves the pool for everyone else (see <a href="#connection-pooling">Connection Pooling</a>).</p>
+
+<h2>How it works</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 340" role="img" aria-label="Two sequence diagrams. On the left, N+1: the app sends one query for the orders, then a separate query for the items of order 1, order 2, order 3 and so on up to order 100, each waiting for its own round trip: 101 round trips. On the right, batched: the app sends one query for the orders and one query for all items with order_id in the list of 100 ids: 2 round trips.">
+  <defs><marker id="arr-n1-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="200" y="20" text-anchor="middle" class="title">N+1: 1 + 100 queries</text>
+  <text x="580" y="20" text-anchor="middle" class="title">Batched: 2 queries</text>
+  <path class="line dashed" d="M390 8 V330" style="stroke: var(--line)"/>
+
+  <rect class="box" x="40" y="32" width="80" height="26" rx="5"/><text x="80" y="50" text-anchor="middle">app</text>
+  <rect class="box" x="280" y="32" width="80" height="26" rx="5"/><text x="320" y="50" text-anchor="middle">database</text>
+  <path class="line" d="M80 58 V290" style="stroke: var(--line)"/>
+  <path class="line" d="M320 58 V290" style="stroke: var(--line)"/>
+  <text x="200" y="78" text-anchor="middle" class="small">SELECT orders: 100 rows</text>
+  <path class="line accent" d="M82 84 H316" marker-end="url(#arr-n1-1)"/>
+  <path class="line dashed" d="M318 94 H84" marker-end="url(#arr-n1-1)"/>
+  <text x="200" y="122" text-anchor="middle" class="small">items WHERE order_id = 1</text>
+  <path class="line bad" d="M82 128 H316" marker-end="url(#arr-n1-1)"/>
+  <path class="line dashed" d="M318 138 H84" marker-end="url(#arr-n1-1)"/>
+  <text x="200" y="160" text-anchor="middle" class="small">items WHERE order_id = 2</text>
+  <path class="line bad" d="M82 166 H316" marker-end="url(#arr-n1-1)"/>
+  <path class="line dashed" d="M318 176 H84" marker-end="url(#arr-n1-1)"/>
+  <text x="200" y="198" text-anchor="middle" class="small">items WHERE order_id = 3</text>
+  <path class="line bad" d="M82 204 H316" marker-end="url(#arr-n1-1)"/>
+  <path class="line dashed" d="M318 214 H84" marker-end="url(#arr-n1-1)"/>
+  <text x="200" y="236" text-anchor="middle" class="small">… 96 more …</text>
+  <text x="200" y="262" text-anchor="middle" class="small">items WHERE order_id = 100</text>
+  <path class="line bad" d="M82 268 H316" marker-end="url(#arr-n1-1)"/>
+  <path class="line dashed" d="M318 278 H84" marker-end="url(#arr-n1-1)"/>
+  <rect class="box bad" x="70" y="300" width="260" height="30" rx="5"/>
+  <text x="200" y="320" text-anchor="middle">101 round trips, grows with N</text>
+
+  <rect class="box" x="420" y="32" width="80" height="26" rx="5"/><text x="460" y="50" text-anchor="middle">app</text>
+  <rect class="box" x="660" y="32" width="80" height="26" rx="5"/><text x="700" y="50" text-anchor="middle">database</text>
+  <path class="line" d="M460 58 V290" style="stroke: var(--line)"/>
+  <path class="line" d="M700 58 V290" style="stroke: var(--line)"/>
+  <text x="580" y="78" text-anchor="middle" class="small">SELECT orders: 100 rows</text>
+  <path class="line accent" d="M462 84 H696" marker-end="url(#arr-n1-1)"/>
+  <path class="line dashed" d="M698 94 H464" marker-end="url(#arr-n1-1)"/>
+  <text x="580" y="122" text-anchor="middle" class="small">items WHERE order_id IN (1 … 100)</text>
+  <path class="line ok" d="M462 128 H696" marker-end="url(#arr-n1-1)"/>
+  <path class="line dashed" d="M698 138 H464" marker-end="url(#arr-n1-1)"/>
+  <text x="580" y="170" text-anchor="middle" class="small">app groups the 300 items</text>
+  <text x="580" y="186" text-anchor="middle" class="small">by order_id in a map</text>
+  <rect class="box ok" x="450" y="300" width="260" height="30" rx="5"/>
+  <text x="580" y="320" text-anchor="middle">2 round trips, whatever N is</text>
+</svg>
+<figcaption>Both versions return the same 100 orders and 300 items. The work inside the database is similar; the difference is 99 extra round trips, each one waiting for the previous to finish.</figcaption>
+</figure>
+
+<h3>How ORMs cause it</h3>
+<p>Hand-written loops cause N+1, but ORMs are the classic source, because of <strong>lazy loading</strong>: a relation like <code>order.Items</code> isn't loaded until code touches it, and then the ORM quietly runs a query. A template or serializer that walks a list and reads a relation on each element produces N+1 with no visible query in the code at all. The fix is <strong>eager loading</strong>: tell the ORM up front which relations you need.</p>
+<ul>
+  <li><strong>GORM</strong>: <code>Preload("Items")</code> runs one extra query per association with <code>WHERE order_id IN (…)</code>. <code>Joins("Customer")</code> loads a has-one or belongs-to relation with a SQL join in the same query; the GORM docs limit join preloading to one-to-one relations.</li>
+  <li><strong>ent</strong>: <code>WithItems()</code> on a query eager-loads the <code>items</code> edge. The ent docs explain it runs an extra query per edge rather than one big join, because several edges are often loaded together.</li>
+  <li><strong>Other ecosystems</strong>: Rails <code>includes</code>, Django <code>select_related</code> (join) and <code>prefetch_related</code> (separate query), Hibernate/JPA <code>JOIN FETCH</code> and entity graphs. Same idea, different names.</li>
+</ul>
+<pre><code>// (illustration, not executed here)
+// GORM: Preload runs one extra query per association, with an IN list
+db.Preload("Items").Where("customer_id = ?", 7).Find(&amp;orders)
+//   SELECT * FROM orders WHERE customer_id = 7;
+//   SELECT * FROM items WHERE order_id IN (1,2,3,...);
+
+// ent: one eager-load call per edge
+orders, err := client.Order.Query().
+    Where(order.CustomerID(7)).
+    WithItems().
+    All(ctx)</code></pre>
+
+<h3>GraphQL and the dataloader pattern</h3>
+<p>GraphQL makes N+1 the default: each field has its own resolver, so resolving <code>orders { customer { name } }</code> calls the <code>customer</code> resolver once per order. Resolvers don't know about each other, so you can't simply write a join. The <strong>dataloader</strong> pattern (from Facebook's JavaScript <code>dataloader</code> library) fixes this: each resolver calls <code>loader.Load(customerID)</code>, which only records the key and returns a pending result. The loader collects all keys requested in the same tick of execution (Go ports such as <code>graph-gophers/dataloader</code> use a short wait window), calls one batch function with all of them (<code>WHERE id = ANY($1)</code>), and hands each caller its result. The batch function must return results in the same order and count as the keys. The loader also caches by key, and it is meant to be created <strong>per request</strong>, so one user's cached data never leaks to another and nothing goes stale across requests.</p>
+
+<h3>Detecting it</h3>
+<p>N+1 is easy to fix and hard to see. Ways to catch it:</p>
+<ul>
+  <li><strong>Count queries per request.</strong> Wrap the driver (as in the example) or use your ORM's logger, and log or export "queries per request" as a metric. A list endpoint whose query count grows with page size is N+1.</li>
+  <li><strong>Read traces.</strong> In <a href="#distributed-tracing">distributed tracing</a>, N+1 has an unmistakable shape: a staircase of dozens of identical short database spans under one request span.</li>
+  <li><strong>Look at the statistics.</strong> In <code>pg_stat_statements</code>, a cheap <code>WHERE order_id = $1</code> query with far more <code>calls</code> than the endpoint has requests, near the top by total time.</li>
+  <li><strong>Assert in tests.</strong> A test that runs the endpoint with realistic data (say 50 rows, not 2) and fails if it issues more than a fixed number of queries. That catches regressions when someone adds a field to a serializer six months later.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" role="img" aria-label="Mind map of N+1 queries. Where it hides: ORM lazy loading, loops calling a repository, GraphQL field resolvers, templates and serializers. How to see it: query count per request, a staircase of spans in traces, pg_stat_statements calls far above requests, a query-budget test. Fixes: JOIN, batch with IN or ANY, ORM eager loading, dataloader per request, denormalize or cache. Watch out for: row explosion from joining several children, huge IN lists, loading children nobody displays.">
+  <ellipse class="box accent" cx="390" cy="165" rx="78" ry="28"/>
+  <text x="390" y="170" text-anchor="middle" class="title">N+1 queries</text>
+  <path class="line" d="M330 148 L300 120"/><path class="line" d="M450 148 L480 120"/>
+  <path class="line" d="M330 182 L300 210"/><path class="line" d="M450 182 L480 210"/>
+  <rect class="box bad" x="20" y="20" width="280" height="130" rx="8"/>
+  <text x="160" y="44" text-anchor="middle" class="title">Where it hides</text>
+  <text x="160" y="68" text-anchor="middle" class="small">ORM lazy loading of relations</text>
+  <text x="160" y="88" text-anchor="middle" class="small">a loop that calls repo.ByID(id)</text>
+  <text x="160" y="108" text-anchor="middle" class="small">GraphQL resolvers, one per field</text>
+  <text x="160" y="128" text-anchor="middle" class="small">templates and serializers</text>
+  <rect class="box accent" x="480" y="20" width="280" height="130" rx="8"/>
+  <text x="620" y="44" text-anchor="middle" class="title">How to see it</text>
+  <text x="620" y="68" text-anchor="middle" class="small">query count per request (metric, log)</text>
+  <text x="620" y="88" text-anchor="middle" class="small">trace: a staircase of short DB spans</text>
+  <text x="620" y="108" text-anchor="middle" class="small">pg_stat_statements: calls far above requests</text>
+  <text x="620" y="128" text-anchor="middle" class="small">a test with a query budget</text>
+  <rect class="box ok" x="20" y="180" width="280" height="130" rx="8"/>
+  <text x="160" y="204" text-anchor="middle" class="title">Fixes</text>
+  <text x="160" y="228" text-anchor="middle" class="small">JOIN for to-one relations</text>
+  <text x="160" y="248" text-anchor="middle" class="small">batch: WHERE id = ANY($1) / IN (…)</text>
+  <text x="160" y="268" text-anchor="middle" class="small">ORM eager loading, dataloader</text>
+  <text x="160" y="288" text-anchor="middle" class="small">denormalize or cache hot lookups</text>
+  <rect class="box" x="480" y="180" width="280" height="130" rx="8"/>
+  <text x="620" y="204" text-anchor="middle" class="title">Watch out for</text>
+  <text x="620" y="228" text-anchor="middle" class="small">row explosion joining 2+ child lists</text>
+  <text x="620" y="248" text-anchor="middle" class="small">IN lists with thousands of ids</text>
+  <text x="620" y="268" text-anchor="middle" class="small">eager-loading what nobody displays</text>
+  <text x="620" y="288" text-anchor="middle" class="small">a loader shared across requests</text>
+</svg>
+<figcaption>The fix is rarely hard. The work is in noticing the problem, and in not overcorrecting into one giant join.</figcaption>
+</figure>
+
+<h2>Fixes compared</h2>
+<table>
+  <tr><th>Fix</th><th>Queries</th><th>Best for</th><th>Watch out for</th></tr>
+  <tr><td><strong>JOIN</strong></td><td>1</td><td>To-one relations (order → customer): one extra column set per row, no duplication</td><td>To-many relations repeat the parent columns on every child row; two child lists multiply (row explosion)</td></tr>
+  <tr><td><strong>Batch by key</strong> (<code>IN (…)</code>, <code>= ANY($1)</code>)</td><td>1 per relation</td><td>To-many relations, any database, hand-written SQL; stitch results in a map</td><td>Very long lists: SQLite caps bound parameters, MySQL caps packet size. Chunk them, or pass one array parameter in PostgreSQL</td></tr>
+  <tr><td><strong>ORM eager loading</strong> (<code>Preload</code>, <code>With…</code>)</td><td>1 per relation (or 1 with join preloading)</td><td>Code already on an ORM; the same batch-by-key underneath</td><td>Loading relations "just in case"; nested preloads that pull far more than the page shows</td></tr>
+  <tr><td><strong>Dataloader</strong></td><td>1 per relation per tick</td><td>GraphQL and any code where callers don't know about each other</td><td>Must be per request; batch function must keep key order; adds a small wait</td></tr>
+  <tr><td><strong>Denormalize or cache</strong></td><td>0 extra</td><td>Hot, rarely changing lookups (customer name on every order row, product titles)</td><td>Now you have to keep copies in sync (see <a href="#cache-invalidation">Cache Invalidation</a>)</td></tr>
+  <tr><td><strong>Aggregate in SQL</strong></td><td>1</td><td>You only need counts or sums per parent (<code>GROUP BY order_id</code>), not the children themselves</td><td>Don't load 10,000 rows to count them in Go</td></tr>
+</table>
+
+<h3>The counter-pitfall: row explosion</h3>
+<p>A JOIN returns one row per combination. Join 100 orders to their items (3 each) and you get 300 rows, each carrying the order's columns again. That is usually fine. Join orders to items <em>and</em> to payments (2 each) in the same query and you get 100 × 3 × 2 = 600 rows, where each item appears twice and each payment three times; the app must de-duplicate, and the database ships far more bytes than with two separate batched queries. For to-many relations, prefer one batched query per relation over a single wide join. GORM's join preloading only covers one-to-one relations, and ent loads each edge with its own query, so neither runs into this.</p>
+
+<h2>Example</h2>
+<p><strong>Counting queries with a driver wrapper.</strong> To see N+1, you need a query count. This wraps the real SQLite driver (<code>modernc.org/sqlite</code>, pure Go) with a <code>driver.Connector</code> that counts every statement and sleeps for a configurable round trip, so the test can simulate a database 1 ms away. Because it sits under <code>database/sql</code>, it counts queries from hand-written SQL and from ORMs alike.</p>
+<pre><code>package nplus1
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"sync/atomic"
+	"time"
+
+	"modernc.org/sqlite"
+)
+
+// Counter wraps a real driver: every statement that reaches the database
+// is counted and pays a simulated network round trip.
+type Counter struct {
+	Queries   atomic.Int64
+	RoundTrip time.Duration
+}
+
+func (c *Counter) hit() {
+	c.Queries.Add(1)
+	time.Sleep(c.RoundTrip)
+}
+
+type connector struct {
+	dsn string
+	c   *Counter
+}
+
+func (k connector) Connect(context.Context) (driver.Conn, error) {
+	inner, err := (&amp;sqlite.Driver{}).Open(k.dsn)
+	return conn{inner, k.c}, err
+}
+func (k connector) Driver() driver.Driver { return &amp;sqlite.Driver{} }
+
+type conn struct {
+	driver.Conn
+	c *Counter
+}
+
+func (cn conn) QueryContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
+	cn.c.hit()
+	return cn.Conn.(driver.QueryerContext).QueryContext(ctx, q, args)
+}
+
+func (cn conn) ExecContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Result, error) {
+	cn.c.hit()
+	return cn.Conn.(driver.ExecerContext).ExecContext(ctx, q, args)
+}
+
+// Open returns a *sql.DB whose statements are counted by c.
+func Open(dsn string, c *Counter) *sql.DB {
+	return sql.OpenDB(connector{dsn, c})
+}</code></pre>
+<p>The two ways to load a customer's orders with their items. <code>ListNPlus1</code> is the loop that lazy loading produces; <code>ListBatched</code> fetches all items in one <code>IN</code> query and groups them by <code>order_id</code> in a map.</p>
+<pre><code>package nplus1
+
+import (
+	"context"
+	"database/sql"
+	"strings"
+)
+
+type Item struct {
+	SKU string
+	Qty int
+}
+
+type Order struct {
+	ID    int64
+	Total int
+	Items []Item
+}
+
+// ListNPlus1 is what lazy loading does: 1 query for the orders,
+// then 1 more query per order for its items.
+func ListNPlus1(ctx context.Context, db *sql.DB, customer int) ([]Order, error) {
+	orders, err := listOrders(ctx, db, customer)
+	if err != nil {
+		return nil, err
+	}
+	for i := range orders {
+		rows, err := db.QueryContext(ctx,
+			&#96;SELECT sku, qty FROM items WHERE order_id = ?&#96;, orders[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var it Item
+			rows.Scan(&amp;it.SKU, &amp;it.Qty)
+			orders[i].Items = append(orders[i].Items, it)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return orders, nil
+}
+
+// ListBatched loads all items for all orders in one query and
+// stitches them together in memory: always 2 queries.
+func ListBatched(ctx context.Context, db *sql.DB, customer int) ([]Order, error) {
+	orders, err := listOrders(ctx, db, customer)
+	if err != nil || len(orders) == 0 {
+		return orders, err
+	}
+	byID := make(map[int64]*Order, len(orders))
+	ids := make([]any, len(orders))
+	for i := range orders {
+		byID[orders[i].ID] = &amp;orders[i]
+		ids[i] = orders[i].ID
+	}
+	marks := strings.Repeat(",?", len(ids))[1:] // "?,?,?…"
+	rows, err := db.QueryContext(ctx,
+		&#96;SELECT order_id, sku, qty FROM items WHERE order_id IN (&#96;+marks+&#96;)&#96;, ids...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var it Item
+		rows.Scan(&amp;id, &amp;it.SKU, &amp;it.Qty)
+		byID[id].Items = append(byID[id].Items, it)
+	}
+	return orders, rows.Err()
+}
+
+func listOrders(ctx context.Context, db *sql.DB, customer int) ([]Order, error) {
+	rows, err := db.QueryContext(ctx,
+		&#96;SELECT id, total FROM orders WHERE customer_id = ? ORDER BY id&#96;, customer)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Order
+	for rows.Next() {
+		var o Order
+		rows.Scan(&amp;o.ID, &amp;o.Total)
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}</code></pre>
+<p>In PostgreSQL, pass one array parameter instead of building placeholders:</p>
+<pre><code>// PostgreSQL with pgx: one parameter, however many ids (not executed here)
+rows, err := pool.Query(ctx,
+    &#96;SELECT order_id, sku, qty FROM items WHERE order_id = ANY($1)&#96;, ids) // ids is []int64</code></pre>
+<p>The tests. The setup file (create a SQLite database with 100 orders × 3 items for customer 7) is omitted. <code>Example_queryCount</code> pins its output, so <code>go test</code> fails if the counts change. <code>TestOrderListQueryBudget</code> is the kind of regression test worth keeping in a real codebase.</p>
+<pre><code>package nplus1
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"testing"
+	"time"
+)
+
+type lister func(context.Context, *sql.DB, int) ([]Order, error)
+
+// Each statement pays a simulated 1 ms round trip, like a database in
+// another availability zone.
+func Example_queryCount() {
+	db, c, done := setup(time.Millisecond)
+	defer done()
+	for _, v := range []struct {
+		name string
+		list lister
+	}{{"N+1", ListNPlus1}, {"batched", ListBatched}} {
+		c.Queries.Store(0)
+		orders, err := v.list(ctx, db, 7)
+		if err != nil {
+			panic(err)
+		}
+		items := 0
+		for _, o := range orders {
+			items += len(o.Items)
+		}
+		n := c.Queries.Load()
+		fmt.Printf("%-7s orders=%d items=%d queries=%d time on the wire &gt;= %v&#92;n",
+			v.name, len(orders), items, n, time.Duration(n)*c.RoundTrip)
+	}
+}
+
+// queryBudget runs fn and fails if it issued more than max statements.
+func queryBudget(c *Counter, max int64, fn func() error) error {
+	c.Queries.Store(0)
+	if err := fn(); err != nil {
+		return err
+	}
+	if n := c.Queries.Load(); n &gt; max {
+		return fmt.Errorf("%d queries, budget is %d", n, max)
+	}
+	return nil
+}
+
+// A regression test: it fails the build the day someone reintroduces N+1.
+func TestOrderListQueryBudget(t *testing.T) {
+	db, c, done := setup(0)
+	defer done()
+	err := queryBudget(c, 2, func() error {
+		_, err := ListBatched(ctx, db, 7)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the same test says about the N+1 version:
+	t.Log("N+1:", queryBudget(c, 2, func() error {
+		_, err := ListNPlus1(ctx, db, 7)
+		return err
+	}))
+}
+
+// Real wall clock (laptop run, rounded) with the same 1 ms round trip.
+func TestWallTime(t *testing.T) {
+	db, _, done := setup(time.Millisecond)
+	defer done()
+	for _, v := range []struct {
+		name string
+		list lister
+	}{{"N+1", ListNPlus1}, {"batched", ListBatched}} {
+		start := time.Now()
+		v.list(ctx, db, 7)
+		t.Logf("%-7s %v", v.name, time.Since(start).Round(time.Millisecond))
+	}
+}</code></pre>
+<p>Real output of <code>Example_queryCount</code>. Same data, same result; 101 queries vs 2:</p>
+<pre><code>N+1     orders=100 items=300 queries=101 time on the wire &gt;= 101ms
+batched orders=100 items=300 queries=2 time on the wire &gt;= 2ms</code></pre>
+<p>Real output of <code>go test -v</code> for the other two tests. The budget test passes for the batched version and reports what it would say about the N+1 one. Wall times are from one laptop run with the simulated 1 ms round trip, rounded; the N+1 version is above its 101 ms floor because <code>time.Sleep</code> overshoots slightly on each of 101 calls:</p>
+<pre><code>    nplus1_test.go:64: N+1: 101 queries, budget is 2
+--- PASS: TestOrderListQueryBudget (0.02s)
+    nplus1_test.go:80: N+1     132ms
+    nplus1_test.go:80: batched 3ms
+--- PASS: TestWallTime (0.14s)
+--- PASS: Example_queryCount (0.13s)</code></pre>
+
+<p><strong>Real-world scenario.</strong> An internal admin API lists invoices, 50 per page. In the first release each invoice row also shows the customer's name, and the code calls <code>customers.ByID</code> inside the loop: 51 queries per page. Nobody notices; the database is in the same zone and the page takes 40 ms. A year later the team moves the database behind a connection proxy in another zone, and each round trip grows to about 1.5 ms. The page now takes around 120 ms, and an export job that walks 20,000 invoices issues 20,000 extra queries and holds a pooled connection for its whole run. The trace shows a staircase of 50 identical <code>SELECT … FROM customers WHERE id = $1</code> spans per page. The fix collects the 50 customer ids, runs one <code>WHERE id = ANY($1)</code>, and builds a map: 2 queries per page whatever the latency is. A query-budget test (at most 3 queries for a 50-row page) keeps it fixed.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Testing with tiny data.</strong> With 2 rows, N+1 means 3 queries and looks harmless. Seed tests and dev databases with realistic list sizes so the query count shows the pattern.</li>
+  <li><strong>Fixing it with one giant JOIN.</strong> Joining several to-many relations multiplies rows (row explosion). Join for to-one relations; batch per relation for to-many ones.</li>
+  <li><strong>Unbounded <code>IN</code> lists.</strong> Thousands of placeholders hit driver and database limits, and each different list length is a different statement for the plan cache. Paginate the parent list, chunk the ids, or use one array parameter (<code>= ANY($1)</code>).</li>
+  <li><strong>Eager loading everything.</strong> Preloading every relation "to be safe" swaps N+1 for over-fetching: large queries for data the page never shows. Load what the response needs.</li>
+  <li><strong>A dataloader that outlives the request.</strong> Its cache then serves stale data, or another user's data. Create loaders per request.</li>
+  <li><strong>Forgetting the index on the foreign key.</strong> The batched query <code>WHERE order_id IN (…)</code> still needs an index on <code>items(order_id)</code>, or it becomes one large scan instead of 100 small lookups (see <a href="#database-indexing">Database Indexing</a>).</li>
+  <li><strong>Parallelizing the N queries instead.</strong> Firing the 100 queries concurrently hides the latency but takes up to 100 pool connections at once and hammers the database. Batch them instead.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>N+1 is 1 query for a list plus 1 per item. Each query is cheap; the round trips add up and hold pool connections.</li>
+  <li>ORM lazy loading and GraphQL resolvers cause it silently. Eager loading and per-request dataloaders fix it.</li>
+  <li>Fix with a JOIN for to-one relations and one batched <code>IN</code>/<code>ANY</code> query per to-many relation, stitched together in a map.</li>
+  <li>Make it visible: count queries per request, read traces, and keep a test that fails when the query count grows with the data.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#query-optimization">Query Optimization</a> · <a href="#connection-pooling">Connection Pooling</a> · <a href="#database-indexing">Database Indexing</a> · <a href="#distributed-tracing">Distributed Tracing</a> · <a href="#caching">Caching</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
+`;
