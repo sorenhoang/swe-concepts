@@ -948,3 +948,327 @@ func ExampleWithdraw() {
 <p><strong>Related:</strong> <a href="#thread-safety">Thread Safety</a> · <a href="#optimistic-locking">Optimistic Locking</a> · <a href="#pessimistic-locking">Pessimistic Locking</a> · <a href="#idempotency">Idempotency</a> · <a href="#distributed-locks">Distributed Locks</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
 `;
 
+CONTENT["deadlocks"] = `
+<p class="tldr"><strong>TL;DR</strong>: A deadlock is two (or more) workers each holding something the other needs, and each waiting for the other to let go first. Picture two cars nose to nose on a one-lane bridge: neither can move forward, and neither will back up. Nothing crashes and no error is logged. The work just stops. The cure is almost always to make everyone take locks in <strong>the same order</strong>.</p>
+
+<h2>The problem it solves</h2>
+<p>Locks fix <a href="#race-conditions">race conditions</a>, and the moment you hold more than one lock at a time, you can build a deadlock. The classic case is a bank transfer. To move money from A to B safely you lock both accounts. Request 1 transfers A→B and locks A first. At the same millisecond, request 2 transfers B→A and locks B first. Now request 1 waits for B, request 2 waits for A, and both wait forever.</p>
+<p>Deadlocks are <strong>silent</strong> (a stuck goroutine uses no CPU and logs nothing; you see timeouts and a drained connection pool instead), <strong>timing-dependent</strong> (the code passes thousands of tests and hangs only when two opposite transfers overlap under load) and <strong>contagious</strong> (anything that needs one of the stuck locks stops too).</p>
+
+<h2>How it works</h2>
+<p>Draw who is waiting for whom. Each worker is a node; an arrow "G1 → G2" means "G1 is waiting for something G2 holds". This is the <strong>wait-for graph</strong>. A deadlock is exactly a <strong>cycle</strong> in it: follow the arrows and you come back where you started, so nobody in the cycle can ever proceed.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Left: goroutine 1 holds lock A and wants lock B; goroutine 2 holds lock B and wants lock A; the arrows form a cycle, which is a deadlock. Right: both goroutines take lock A first. Goroutine 1 holds A and takes B next, which is free. Goroutine 2 waits for A. There is no cycle, so goroutine 1 finishes and releases A.">
+  <defs><marker id="arr-dlk-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="195" y="30" text-anchor="middle" class="title">Opposite order: a cycle</text>
+  <text x="595" y="30" text-anchor="middle" class="title">Same order (A before B): no cycle</text>
+  <path class="line dashed" d="M390 12 V290" style="stroke: var(--line)"/>
+
+  <rect class="box accent" x="40" y="70" width="120" height="44" rx="6"/><text x="100" y="89" text-anchor="middle">goroutine 1</text><text x="100" y="105" text-anchor="middle" class="small">transfer A→B</text>
+  <rect class="box" x="230" y="70" width="120" height="44" rx="6"/><text x="290" y="97" text-anchor="middle">lock A</text>
+  <rect class="box" x="40" y="190" width="120" height="44" rx="6"/><text x="100" y="217" text-anchor="middle">lock B</text>
+  <rect class="box accent" x="230" y="190" width="120" height="44" rx="6"/><text x="290" y="209" text-anchor="middle">goroutine 2</text><text x="290" y="225" text-anchor="middle" class="small">transfer B→A</text>
+  <path class="line" d="M230 92 H162" marker-end="url(#arr-dlk-1)"/><text x="195" y="84" text-anchor="middle" class="small">held by</text>
+  <path class="line" d="M160 212 H228" marker-end="url(#arr-dlk-1)"/><text x="195" y="204" text-anchor="middle" class="small">held by</text>
+  <path class="line bad dashed" d="M100 114 V188" marker-end="url(#arr-dlk-1)"/><text x="94" y="155" text-anchor="end" class="small">wants</text>
+  <path class="line bad dashed" d="M290 190 V116" marker-end="url(#arr-dlk-1)"/><text x="296" y="155" class="small">wants</text>
+  <text x="195" y="155" text-anchor="middle" class="small">cycle = deadlock</text>
+  <text x="195" y="266" text-anchor="middle" class="small">each waits for a lock the other holds</text>
+
+  <rect class="box accent" x="410" y="70" width="120" height="44" rx="6"/><text x="470" y="89" text-anchor="middle">goroutine 1</text><text x="470" y="105" text-anchor="middle" class="small">transfer A→B</text>
+  <rect class="box" x="640" y="70" width="120" height="44" rx="6"/><text x="700" y="97" text-anchor="middle">lock A</text>
+  <rect class="box ok" x="410" y="190" width="120" height="44" rx="6"/><text x="470" y="209" text-anchor="middle">lock B</text><text x="470" y="225" text-anchor="middle" class="small">free</text>
+  <rect class="box accent" x="640" y="190" width="120" height="44" rx="6"/><text x="700" y="209" text-anchor="middle">goroutine 2</text><text x="700" y="225" text-anchor="middle" class="small">transfer B→A</text>
+  <path class="line" d="M640 92 H532" marker-end="url(#arr-dlk-1)"/><text x="585" y="84" text-anchor="middle" class="small">held by</text>
+  <path class="line ok" d="M470 114 V188" marker-end="url(#arr-dlk-1)"/><text x="476" y="155" class="small">takes B next</text>
+  <path class="line dashed" d="M700 190 V116" marker-end="url(#arr-dlk-1)"/><text x="694" y="155" text-anchor="end" class="small">waits</text>
+  <text x="595" y="266" text-anchor="middle" class="small">goroutine 2 waits, but goroutine 1 can finish and release A</text>
+</svg>
+<figcaption>Left: the transfer bug. Right: the fix. If every goroutine takes locks in one global order (here: lower account ID first), an arrow can only point "forward" in that order, so the arrows can never close into a cycle.</figcaption>
+</figure>
+
+<h3>The four conditions (Coffman)</h3>
+<p>In 1971 Coffman, Elphick and Shoshani described four conditions that must <em>all</em> hold for a deadlock. Break any one and deadlock is impossible:</p>
+<ol>
+  <li><strong>Mutual exclusion</strong>: only one holder at a time. Break it with immutable data or atomics.</li>
+  <li><strong>Hold and wait</strong>: a worker holds one resource and asks for another. Break it by taking one lock, or all locks at once.</li>
+  <li><strong>No preemption</strong>: nobody can take a lock away. Break it with timeouts and <code>TryLock</code>; databases break it by aborting a transaction.</li>
+  <li><strong>Circular wait</strong>: a cycle in the wait-for graph. Break it with one global lock order. This is the usual fix, and it costs nothing at runtime.</li>
+</ol>
+
+<h3>Deadlocks in Go</h3>
+<p>Go gives you several ways to build one. Mutexes are the obvious one, but channels and <code>WaitGroup</code>s are just as good at it:</p>
+<ul>
+  <li><strong>Lock-order inversion.</strong> Two goroutines take the same two mutexes in opposite order (the transfer above).</li>
+  <li><strong>Re-locking in the same goroutine.</strong> Go mutexes are not reentrant: a method holding <code>mu</code> that calls another method locking <code>mu</code> blocks forever. The <code>sync</code> docs also forbid recursive <code>RLock</code>: a waiting writer blocks your second <code>RLock</code>.</li>
+  <li><strong>A channel nobody serves.</strong> A send on an unbuffered channel waits for a receiver. If the receiver has returned (an error path, a timeout), the sender waits forever.</li>
+  <li><strong><code>WaitGroup</code> misuse.</strong> <code>Add(n)</code> but fewer than <code>n</code> calls to <code>Done</code>, usually because an early <code>return</code> skipped it. <code>Wait</code> never returns.</li>
+  <li><strong>Mixed resources.</strong> A goroutine holds <code>mu</code> and sends on a channel whose receiver needs <code>mu</code> first. Same cycle.</li>
+</ul>
+<p><strong>What the runtime catches.</strong> If <em>every</em> goroutine is blocked, the runtime stops the program with <code>fatal error: all goroutines are asleep - deadlock!</code> and prints all stacks. That check is global: if any goroutine can still wake up, nothing is reported. The runtime source (<code>checkdead</code> in <code>runtime/proc.go</code>) also gives up if any timer is pending. A real service always has a ticker, a timer or another goroutine alive, so in production a deadlock almost always looks like a hang, not like this error. The example below shows both cases.</p>
+<p><strong>How you find it: a goroutine dump.</strong> Every goroutine's stack, with what it is blocked on in brackets: <code>[sync.Mutex.Lock]</code>, <code>[chan send]</code>, <code>[sync.WaitGroup.Wait]</code>. After a minute the runtime adds how long, e.g. <code>[chan send, 12 minutes]</code>. Ways to get one:</p>
+<ul>
+  <li><code>kill -QUIT &lt;pid&gt;</code>: prints all stacks to stderr and exits (status 2).</li>
+  <li><code>net/http/pprof</code>: <code>/debug/pprof/goroutine?debug=2</code>, same text, process keeps running. <code>?debug=1</code> groups identical stacks with a count.</li>
+  <li>In code or tests: <code>pprof.Lookup("goroutine").WriteTo(w, 2)</code>.</li>
+</ul>
+
+<h3>Deadlocks in PostgreSQL</h3>
+<p>Row locks behave like mutexes. An <code>UPDATE</code> locks the row until the transaction ends. Two transactions updating the same two rows in opposite order build the same cycle. The difference: Postgres breaks it for you.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 340" role="img" aria-label="Timeline of a Postgres deadlock. At 0 ms, tx1 updates row 1 and tx2 updates row 2; each now holds a row lock. At 200 ms, tx1 tries to update row 2 and waits for tx2; tx2 tries to update row 1 and waits for tx1. At about 1.2 seconds deadlock_timeout of 1 second expires, the detector finds the cycle, and one transaction, the victim, gets ERROR deadlock detected SQLSTATE 40P01 and is rolled back. The other transaction's update proceeds and it commits.">
+  <defs><marker id="arr-dlk-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <path class="line" d="M230 56 V330" style="stroke: var(--line)"/>
+  <path class="line" d="M550 56 V330" style="stroke: var(--line)"/>
+  <rect class="box accent" x="150" y="18" width="160" height="38" rx="6"/><text x="230" y="42" text-anchor="middle" class="title">tx1: 1→2</text>
+  <rect class="box accent" x="470" y="18" width="160" height="38" rx="6"/><text x="550" y="42" text-anchor="middle" class="title">tx2: 2→1</text>
+
+  <text x="20" y="94" class="small">0 ms</text>
+  <rect class="box" x="140" y="72" width="180" height="40" rx="6"/><text x="230" y="89" text-anchor="middle">UPDATE id=1</text><text x="230" y="104" text-anchor="middle" class="small">now holds row 1</text>
+  <rect class="box" x="460" y="72" width="180" height="40" rx="6"/><text x="550" y="89" text-anchor="middle">UPDATE id=2</text><text x="550" y="104" text-anchor="middle" class="small">now holds row 2</text>
+
+  <text x="20" y="146" class="small">200 ms</text>
+  <rect class="box muted" x="140" y="124" width="180" height="40" rx="6"/><text x="230" y="141" text-anchor="middle">UPDATE id=2</text><text x="230" y="156" text-anchor="middle" class="small">blocked</text>
+  <rect class="box muted" x="460" y="124" width="180" height="40" rx="6"/><text x="550" y="141" text-anchor="middle">UPDATE id=1</text><text x="550" y="156" text-anchor="middle" class="small">blocked</text>
+  <path class="line bad dashed" d="M320 184 H548" marker-end="url(#arr-dlk-2)"/><text x="435" y="176" text-anchor="middle" class="small">tx1 waits for tx2 (row 2)</text>
+  <path class="line bad dashed" d="M460 212 H232" marker-end="url(#arr-dlk-2)"/><text x="345" y="204" text-anchor="middle" class="small">tx2 waits for tx1 (row 1)</text>
+
+  <text x="20" y="252" class="small">≈1.2 s</text>
+  <rect class="box bad" x="140" y="230" width="500" height="34" rx="6"/><text x="390" y="252" text-anchor="middle">deadlock_timeout (1s) expires → detector finds the cycle</text>
+
+  <rect class="box bad" x="130" y="280" width="200" height="44" rx="6"/><text x="230" y="298" text-anchor="middle">ERROR 40P01</text><text x="230" y="314" text-anchor="middle" class="small">victim: rolled back → retry</text>
+  <rect class="box ok" x="450" y="280" width="200" height="44" rx="6"/><text x="550" y="298" text-anchor="middle">UPDATE id=1 runs</text><text x="550" y="314" text-anchor="middle" class="small">COMMIT</text>
+</svg>
+<figcaption>The exact run in the example below. Which transaction is the victim is up to Postgres; the docs say not to rely on it. The other one simply continues, about a second late.</figcaption>
+</figure>
+<p>The deadlock check is "relatively expensive" (the docs' words), so a waiting backend first waits <code>deadlock_timeout</code> (default <strong>1s</strong>), then searches for a cycle. If it finds one, one transaction gets <code>ERROR: deadlock detected</code> (SQLSTATE <code>40P01</code>) and is rolled back, releasing its locks. Two consequences:</p>
+<ul>
+  <li><strong>A deadlock costs at least a second</strong> for every transaction in the cycle.</li>
+  <li><strong>The victim must retry the whole transaction</strong>, from <code>BEGIN</code>, not just the last statement. The transaction is already aborted. Treat 40P01 like a serialization failure (40001): retry with backoff, a few times. See <a href="#retries">Retries</a>.</li>
+</ul>
+<p>Without a cycle, Postgres doesn't intervene: a transaction waiting on a lock held by a slow (not deadlocked) transaction waits indefinitely. That's what <code>lock_timeout</code> and <code>statement_timeout</code> are for (see <a href="#pessimistic-locking">Pessimistic Locking</a>).</p>
+
+<h3>Prevention strategies</h3>
+<table>
+  <tr><th>Strategy</th><th>Breaks condition</th><th>In Go</th><th>In the database</th><th>Cost / catch</th></tr>
+  <tr><td><strong>Global lock order</strong></td><td>circular wait</td><td>lock the lower ID (or address, or name) first</td><td>update rows in primary-key order; <code>SELECT … ORDER BY id FOR UPDATE</code> to lock a set up front</td><td>Free at runtime. Every code path must follow it, including ones written next year</td></tr>
+  <tr><td><strong>One lock, or all at once</strong></td><td>hold and wait</td><td>one mutex for the whole structure</td><td>lock every row you will touch at the start; or one advisory lock per aggregate</td><td>Less concurrency; you must know the full set up front</td></tr>
+  <tr><td><strong>Timeouts / try-lock</strong></td><td>no preemption</td><td><code>TryLock</code> (the docs call correct uses "rare"), <code>select</code> with <code>ctx.Done()</code> on channels</td><td><code>lock_timeout</code>, <code>NOWAIT</code></td><td>Turns a hang into an error you must handle; back off or you get livelock</td></tr>
+  <tr><td><strong>Detect and retry</strong></td><td>no preemption</td><td>a watchdog that dumps stacks and alerts</td><td>built in: 40P01 → retry the transaction</td><td>The deadlock still happens and costs ≥ <code>deadlock_timeout</code></td></tr>
+  <tr><td><strong>Don't hold locks across waits</strong></td><td>hold and wait</td><td>no channel ops, I/O or callbacks under a mutex</td><td>no network calls inside a transaction</td><td>Shrinks the window; needs discipline, not code</td></tr>
+</table>
+
+<h3>Livelock and starvation</h3>
+<p><strong>Livelock</strong> is a deadlock where everyone is busy: two goroutines <code>TryLock</code> the second lock, fail, release the first and retry, in lockstep, forever, like two people in a corridor stepping aside to the same side. Fix it with jittered backoff (see <a href="#exponential-backoff">Exponential Backoff</a>) or, better, a lock order.</p>
+<p><strong>Starvation</strong> is one worker that never gets its turn while others keep going. Go's <code>sync.Mutex</code> guards against it: per its source, once a waiter has waited more than 1 ms the mutex enters <em>starvation mode</em> and hands ownership straight to the waiter at the front of the queue, instead of letting newly arriving goroutines barge in. In <code>RWMutex</code>, a waiting writer makes new readers queue behind it.</p>
+
+<h2>Example</h2>
+<p><strong>Scenario.</strong> A wallet service moves money between accounts. Alice sends Bob 10 while Bob sends Alice 20, both at the same moment. Each request locks the sender's account, writes an audit record (10 ms of I/O while holding the lock), then locks the receiver. When the two overlap, both goroutines hang forever, and every later request touching those accounts piles up behind them.</p>
+
+<h3>1. In memory: a lock-order deadlock, caught by a watchdog</h3>
+<pre><code>// TransferUnordered locks "from" then "to". Two opposite transfers
+// (A→B and B→A) can each hold their first lock and wait for the other's.
+func TransferUnordered(from, to *Account, amount int) {
+	from.mu.Lock()
+	defer from.mu.Unlock()
+	audit()
+	to.mu.Lock()
+	defer to.mu.Unlock()
+	from.Balance -= amount
+	to.Balance += amount
+}
+
+// TransferOrdered always locks the lower ID first, whatever the direction.
+// A global order means no cycle in the wait-for graph, so no deadlock.
+func TransferOrdered(from, to *Account, amount int) {
+	first, second := from, to
+	if to.ID &lt; from.ID {
+		first, second = to, from
+	}
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	audit()
+	second.mu.Lock()
+	defer second.mu.Unlock()
+	from.Balance -= amount
+	to.Balance += amount
+}
+
+// Watchdog runs fn and reports false if it hasn't finished within d.
+// The runtime won't flag a deadlock while other goroutines (or timers)
+// are alive, so long-running services need their own detector like this.
+func Watchdog(d time.Duration, fn func()) bool {
+	done := make(chan struct{})
+	go func() { fn(); close(done) }()
+	select {
+	case &lt;-done:
+		return true
+	case &lt;-time.After(d):
+		return false
+	}
+}</code></pre>
+<p>The test runs the two opposite transfers at once, first with the buggy version, then with the ordered one. It is an <code>Example</code> test, so <code>go test</code> fails if the output changes:</p>
+<pre><code>func ExampleTransferUnordered() {
+	finished := run(TransferUnordered)
+	fmt.Println("unordered finished within 1s:", finished)
+	dump := GoroutineDump()
+	fmt.Println("goroutines blocked in sync.Mutex.Lock:", CountWaiting(dump, "sync.Mutex.Lock"))
+
+	fmt.Println("ordered finished within 1s:", run(TransferOrdered))
+}</code></pre>
+<pre><code>unordered finished within 1s: false
+goroutines blocked in sync.Mutex.Lock: 2
+ordered finished within 1s: true</code></pre>
+<p>No fatal error: the test binary still had live goroutines, so only the watchdog noticed. Part of the goroutine dump at that moment (real laptop run, trimmed): both goroutines sit in <code>TransferUnordered</code> line 26 (<code>to.mu.Lock()</code>), with the same two account pointers in swapped order. That is the inversion in plain sight.</p>
+<pre><code>goroutine 19 [sync.Mutex.Lock]:
+…
+example.com/deadlocks.TransferUnordered(0x48d51f6d4000, 0x48d51f6d4018, 0xa)
+	…/deadlocks/bank.go:26 +0x10c
+
+goroutine … [sync.Mutex.Lock]:
+…
+example.com/deadlocks.TransferUnordered(0x48d51f6d4018, 0x48d51f6d4000, 0x14)
+…</code></pre>
+
+<h3>2. What the runtime does and doesn't catch</h3>
+<p>A <code>WaitGroup</code> bug where every goroutine ends up blocked. The runtime catches this one:</p>
+<pre><code>func main() {
+	var wg sync.WaitGroup
+	wg.Add(3)
+	for id := 1; id &lt;= 3; id++ {
+		go func() {
+			if err := fetch(id); err != nil {
+				return // BUG: returns without wg.Done(); use defer wg.Done() or wg.Go
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait() // waits for a Done that never comes
+	fmt.Println("all fetched")
+}</code></pre>
+<pre><code>$ go run ./cmd/asleep
+fatal error: all goroutines are asleep - deadlock!
+
+goroutine 1 [sync.WaitGroup.Wait]:
+sync.runtime_SemacquireWaitGroup(0x1048e8200?, 0x30?)
+	$GOROOT/src/runtime/sema.go:114 +0x38
+sync.(*WaitGroup).Wait(0x7454ab416020)
+	$GOROOT/src/sync/waitgroup.go:206 +0xa4
+main.main()
+	…/deadlocks/cmd/asleep/main.go:27 +0xb8
+exit status 2</code></pre>
+<p>Now a send with no receiver, in a program that also has one innocent background goroutine. The runtime reports nothing; the process just hangs. After 3 seconds we sent <code>SIGQUIT</code> to get the dump (real run, trimmed):</p>
+<pre><code>func main() {
+	go func() { // stands in for a metrics flusher, a cache janitor, ...
+		for range time.Tick(time.Second) {
+		}
+	}()
+	results := make(chan int) // unbuffered: a send waits for a receiver
+	results &lt;- 42             // BUG: nobody ever receives
+	fmt.Println(&lt;-results)
+}</code></pre>
+<pre><code>$ ./hang &amp; sleep 3; kill -QUIT $!
+SIGQUIT: quit
+…
+goroutine 1 gp=0x4c3ba5541e0 m=nil [chan send]:
+main.main()
+	…/deadlocks/cmd/hang/main.go:14 +0x44
+…
+goroutine 34 gp=0x4c3ba6841e0 m=nil [chan receive]:
+main.main.func1()
+	…/deadlocks/cmd/hang/main.go:10 +0x4c
+created by main.main in goroutine 1
+	…/deadlocks/cmd/hang/main.go:9 +0x24
+…
+exit status 2</code></pre>
+<p>Goroutine 1 is stuck in <code>[chan send]</code> at <code>main.go:14</code>, which is the bug. In a real service you would read the same thing from <code>/debug/pprof/goroutine?debug=2</code> without killing it.</p>
+
+<h3>3. In PostgreSQL: a real "deadlock detected"</h3>
+<p>The same transfer against an embedded PostgreSQL 18: each transaction updates the sender row, does 200 ms of work, then updates the receiver row.</p>
+<pre><code>// Transfer debits "from" first, then credits "to". Two opposite transfers
+// lock the two rows in opposite order: a deadlock waiting to happen.
+func Transfer(ctx context.Context, db *pgxpool.Pool, from, to, amount int) error {
+	return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, addSQL, -amount, from); err != nil {
+			return err
+		}
+		audit()
+		_, err := tx.Exec(ctx, addSQL, amount, to)
+		return err
+	})
+}
+
+// IsRetryable reports whether Postgres aborted the transaction so that a
+// retry of the whole transaction can succeed: deadlock or serialization failure.
+func IsRetryable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &amp;pgErr) &amp;&amp; (pgErr.Code == "40P01" || pgErr.Code == "40001")
+}
+
+// WithRetry re-runs the whole transaction when Postgres picked it as the victim.
+func WithRetry(ctx context.Context, attempts int, fn func() error) error {
+	var err error
+	for i := range attempts {
+		if err = fn(); !IsRetryable(err) {
+			return err
+		}
+		time.Sleep(time.Duration(10&lt;&lt;i) * time.Millisecond) // see exponential backoff
+	}
+	return err
+}</code></pre>
+<p><code>TransferOrdered</code> (not shown) is the same function with the two <code>UPDATE</code>s swapped when <code>to &lt; from</code>, so rows are always touched in id order. The test helper <code>race</code> (not shown) resets both balances to 100 and runs 1→2 (10) and 2→1 (20) at the same moment; the example runs that pair three ways.</p>
+<pre><code>func ExampleTransfer() {
+	ctx := context.Background()
+	db, _ := pgxpool.New(ctx, dsn)
+	defer db.Close()
+	var timeout string
+	db.QueryRow(ctx, "SHOW deadlock_timeout").Scan(&amp;timeout)
+	fmt.Println("deadlock_timeout:", timeout)
+
+	errs, took := race(ctx, db, Transfer)
+	fmt.Println("opposite order:", summary(errs), "took&gt;=1s:", took &gt;= time.Second)
+	fmt.Println("victim got:", errors.Join(errs[:]...))
+
+	retrying := func(ctx context.Context, db *pgxpool.Pool, from, to, amount int) error {
+		return WithRetry(ctx, 3, func() error { return Transfer(ctx, db, from, to, amount) })
+	}
+	errs, _ = race(ctx, db, retrying)
+	fmt.Println("with retry:    ", summary(errs), "balances:", balances(ctx, db))
+
+	errs, took = race(ctx, db, TransferOrdered)
+	fmt.Println("id order:      ", summary(errs), "took&gt;=1s:", took &gt;= time.Second)
+}</code></pre>
+<pre><code>deadlock_timeout: 1s
+opposite order: committed=1 deadlocks=1 took&gt;=1s: true
+victim got: ERROR: deadlock detected (SQLSTATE 40P01)
+with retry:     committed=2 deadlocks=0 balances: 110,90
+id order:       committed=2 deadlocks=0 took&gt;=1s: false</code></pre>
+<p>The plain version deadlocked, waited out <code>deadlock_timeout</code>, and lost one transaction to 40P01. With retry, both commit and the balances are right (100 − 10 + 20 = 110, 100 + 10 − 20 = 90), but the deadlock still cost a second. In id order: no deadlock, no stall. The full error from one run, with the DETAIL Postgres attaches (PIDs and transaction IDs vary):</p>
+<pre><code>ERROR: deadlock detected (SQLSTATE 40P01)
+DETAIL: Process 83229 waits for ShareLock on transaction 810; blocked by process 83230.
+Process 83230 waits for ShareLock on transaction 809; blocked by process 83229.
+HINT: See server log for query details.
+WHERE: while updating tuple (0,94) in relation "accounts"</code></pre>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Lock order that depends on the arguments.</strong> <code>lock(from); lock(to)</code> looks ordered but isn't: the order flips with the direction of the transfer. Order by something stable: ID, primary key, name.</li>
+  <li><strong>Holding a lock across I/O, channel sends or callbacks.</strong> It widens the deadlock window from nanoseconds to milliseconds (the 10 ms audit write above is what made the bug reliable) and hides lock acquisitions inside code you don't see. Copy the data out, unlock, then do the slow part.</li>
+  <li><strong>Waiting for the runtime to tell you.</strong> "all goroutines are asleep" only fires when the <em>whole program</em> is stuck. In a service, partial deadlocks show up as timeouts and a rising <code>runtime.NumGoroutine()</code>. Alert on that, and keep <code>net/http/pprof</code> reachable on an internal port so you can pull a dump.</li>
+  <li><strong>Retrying only the failed statement after 40P01.</strong> The transaction is aborted; every later statement fails until rollback. Retry the whole transaction, and make it safe to re-run (see <a href="#idempotency">Idempotency</a>).</li>
+  <li><strong>Treating retry as the fix.</strong> Each deadlock still costs <code>deadlock_timeout</code> plus the redo. If <code>pg_stat_database.deadlocks</code> keeps growing, fix the access order.</li>
+  <li><strong>Hidden lock order in the database.</strong> Foreign-key checks, triggers and <code>UPDATE … WHERE status = 'x'</code> over many rows also take row locks, in an order you didn't write. Bulk updates from two workers over overlapping row sets deadlock this way; sort the IDs and lock them up front.</li>
+</ul>
+
+<div class="callout warn"><strong>A production deadlock is a hang, not an error.</strong> Go only reports one when every goroutine is blocked, which a server with live tickers and other goroutines will rarely, if ever, hit. Plan for detection: timeouts on every wait, a goroutine-count metric, and a way to get a goroutine dump from a running process.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>A deadlock is a cycle in the wait-for graph. It needs mutual exclusion, hold-and-wait, no preemption and circular wait, all at once.</li>
+  <li>The standard fix is one global lock order (lower ID first), in Go and in SQL. Don't hold locks across I/O or channel operations.</li>
+  <li>Go's runtime only catches whole-program deadlocks; find partial ones with timeouts, goroutine counts and goroutine dumps (<code>SIGQUIT</code>, <code>/debug/pprof/goroutine?debug=2</code>).</li>
+  <li>Postgres detects cycles after <code>deadlock_timeout</code> (1s) and aborts one transaction with 40P01: retry the whole transaction, then fix the order.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#pessimistic-locking">Pessimistic Locking</a> · <a href="#race-conditions">Race Conditions</a> · <a href="#thread-safety">Thread Safety</a> · <a href="#timeouts">Timeouts</a> · <a href="#retries">Retries</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
+`;
