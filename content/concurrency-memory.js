@@ -320,3 +320,300 @@ carol PUT If-Match:  → 428 Precondition Required</code></pre>
 
 <p><strong>Related:</strong> <a href="#pessimistic-locking">Pessimistic Locking</a> · <a href="#race-conditions">Race Conditions</a> · <a href="#idempotency">Idempotency</a> · <a href="#retries">Retries</a> · <a href="#thread-safety">Thread Safety</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
 `;
+CONTENT["pessimistic-locking"] = `
+<p class="tldr"><strong>TL;DR</strong>: Pessimistic locking assumes someone <em>will</em> fight you for the data, so it locks the data before reading it and holds the lock until it commits. Everyone else who wants to change it waits their turn. It's the single key to a petrol-station bathroom: whoever holds the key goes in, everyone else queues at the counter.</p>
+
+<h2>The problem it solves</h2>
+<p>Read-modify-write code has a gap between reading a value and writing the new one. In that gap, another request can read the same old value, and one of the two writes gets lost (the <em>lost update</em>, see <a href="#optimistic-locking">Optimistic Locking</a>). Optimistic locking detects that at write time and throws the loser's work away. That is a poor fit when:</p>
+<ul>
+  <li><strong>Conflicts are the normal case.</strong> 300 people try to book the last seats of a concert. With optimistic locking most attempts fail and retry, again and again.</li>
+  <li><strong>The work can't be thrown away.</strong> You call a payment provider or send a shipment request between reading and writing. If the write then fails, you can't take the side effect back.</li>
+  <li><strong>The decision needs a stable view.</strong> "Withdraw 80 if the balance is at least 80" must not be decided on a balance that changes while you look at it.</li>
+</ul>
+<p>Pessimistic locking closes the gap from the other side: take the lock <em>first</em>, so nobody else can change the row until you are done. The second request doesn't fail; it waits, then reads the new value and decides correctly.</p>
+
+<h2>How it works</h2>
+<p>In PostgreSQL the tool is a <strong>row lock</strong>, taken by <code>SELECT … FOR UPDATE</code> inside a transaction. The lock lasts until <code>COMMIT</code> or <code>ROLLBACK</code>. Plain <code>SELECT</code>s are not blocked (MVCC gives them a snapshot); other <code>FOR UPDATE</code>s, <code>UPDATE</code>s and <code>DELETE</code>s of that row wait.</p>
+<pre><code>BEGIN;
+SELECT holder FROM seats WHERE id = 7 FOR UPDATE;   -- lock first (others now wait)
+-- decide in the app: holder is '' → free
+UPDATE seats SET holder = 'alice' WHERE id = 7;
+COMMIT;                                             -- lock released here</code></pre>
+<figure class="diagram">
+<svg viewBox="0 0 780 360" role="img" aria-label="Sequence diagram. Transaction A runs SELECT FOR UPDATE on seat 7 and gets the row with an empty holder; the row is now locked by A. Transaction B runs SELECT FOR UPDATE on the same row and blocks; pg_stat_activity shows it waiting on a Lock. A updates holder to alice and commits, releasing the lock. B's SELECT now returns the row with holder alice, so B reports seat taken and rolls back.">
+  <defs><marker id="arr-pl-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="50" y="16" width="120" height="36" rx="6"/><text x="110" y="39" text-anchor="middle" class="title">Tx A (alice)</text>
+  <rect class="box" x="310" y="16" width="160" height="36" rx="6"/><text x="390" y="39" text-anchor="middle" class="title">seats row id=7</text>
+  <rect class="box accent" x="610" y="16" width="120" height="36" rx="6"/><text x="670" y="39" text-anchor="middle" class="title">Tx B (bob)</text>
+  <path d="M110 52 V350" style="stroke: var(--line)"/>
+  <path d="M390 52 V350" style="stroke: var(--line)"/>
+  <path d="M670 52 V350" style="stroke: var(--line)"/>
+
+  <path class="line" d="M110 88 H386" marker-end="url(#arr-pl-1)"/>
+  <text x="250" y="80" text-anchor="middle" class="small">BEGIN; SELECT … FOR UPDATE</text>
+  <path class="line ok" d="M390 118 H114" marker-end="url(#arr-pl-1)"/>
+  <text x="250" y="110" text-anchor="middle" class="small">holder '' · row locked by A</text>
+  <rect class="box accent" x="382" y="120" width="16" height="122" rx="3"/>
+
+  <path class="line" d="M670 150 H402" marker-end="url(#arr-pl-1)"/>
+  <text x="530" y="142" text-anchor="middle" class="small">BEGIN; SELECT … FOR UPDATE</text>
+  <rect class="box bad" x="662" y="156" width="16" height="122" rx="3"/>
+  <text x="560" y="200" text-anchor="middle" class="small">B blocks: waits for A</text>
+  <text x="560" y="216" text-anchor="middle" class="small">wait_event_type = Lock</text>
+
+  <path class="line" d="M110 190 H378" marker-end="url(#arr-pl-1)"/>
+  <text x="250" y="182" text-anchor="middle" class="small">UPDATE holder = 'alice'</text>
+  <path class="line accent" d="M110 236 H378" marker-end="url(#arr-pl-1)"/>
+  <text x="250" y="228" text-anchor="middle" class="small">COMMIT → lock released</text>
+
+  <path class="line ok" d="M398 272 H658" marker-end="url(#arr-pl-1)"/>
+  <text x="530" y="264" text-anchor="middle" class="small">holder 'alice' · now locked by B</text>
+  <path class="line" d="M670 316 H394" marker-end="url(#arr-pl-1)"/>
+  <text x="530" y="308" text-anchor="middle" class="small">taken → ROLLBACK</text>
+  <text x="250" y="290" text-anchor="middle" class="small">B decided on the committed value,</text>
+  <text x="250" y="306" text-anchor="middle" class="small">not on a stale copy</text>
+</svg>
+<figcaption>The exact run of <code>ExampleReserve</code> below. The orange bar is A holding the row lock, the red bar is B waiting. B is never wrong; it is only late.</figcaption>
+</figure>
+
+<h3>The four row lock modes</h3>
+<p><code>FOR UPDATE</code> is the strongest of four row-level lock modes. Postgres also takes them implicitly: a <code>DELETE</code>, or an <code>UPDATE</code> that changes certain columns (such as a key column), takes <code>FOR UPDATE</code>; any other <code>UPDATE</code> takes <code>FOR NO KEY UPDATE</code>. Foreign-key checks lock the referenced parent row with <code>FOR KEY SHARE</code>, which is why the weaker modes matter:</p>
+<table>
+  <tr><th>Mode</th><th>Meaning</th><th>Conflicts with (held by another tx)</th></tr>
+  <tr><td><code>FOR UPDATE</code></td><td>exclusive; "I may delete it or change its key"</td><td>all four modes</td></tr>
+  <tr><td><code>FOR NO KEY UPDATE</code></td><td>exclusive, but lets FK checks through; what a normal <code>UPDATE</code> takes</td><td><code>FOR SHARE</code>, <code>FOR NO KEY UPDATE</code>, <code>FOR UPDATE</code></td></tr>
+  <tr><td><code>FOR SHARE</code></td><td>shared: many readers may hold it; nobody may change the row</td><td><code>FOR NO KEY UPDATE</code>, <code>FOR UPDATE</code></td></tr>
+  <tr><td><code>FOR KEY SHARE</code></td><td>weakest: "don't delete it or change its key"</td><td><code>FOR UPDATE</code> only</td></tr>
+</table>
+<p>The practical rule: if you lock a row only to update non-key columns, <code>FOR NO KEY UPDATE</code> is enough, and it won't block other transactions inserting child rows that reference it (<code>orders</code> rows pointing at a locked <code>customers</code> row, say). <code>FOR UPDATE</code> would make those inserts wait.</p>
+
+<h3>When the row is already locked</h3>
+<p>By default, a transaction that wants a conflicting lock waits <em>indefinitely</em> (the docs' word) unless a deadlock is detected. You can choose differently, per statement or per session:</p>
+<table>
+  <tr><th>Option</th><th>If the row is locked</th><th>Error</th><th>Use it for</th></tr>
+  <tr><td>(plain) <code>FOR UPDATE</code></td><td>wait until the holder commits or rolls back</td><td>none; just latency</td><td>short critical sections where waiting is the right answer</td></tr>
+  <tr><td><code>FOR UPDATE NOWAIT</code></td><td>fail at once</td><td><code>could not obtain lock on row in relation "…"</code>, SQLSTATE 55P03</td><td>"someone else is editing this" in a UI; don't queue behind them</td></tr>
+  <tr><td><code>SET lock_timeout = '200ms'</code></td><td>wait up to the limit, then fail</td><td><code>canceling statement due to lock timeout</code>, 55P03</td><td>an upper bound on waiting; also for migrations (see <a href="#database-migrations">Database Migrations</a>)</td></tr>
+  <tr><td><code>FOR UPDATE SKIP LOCKED</code></td><td>pretend the row isn't there</td><td>none</td><td>work queues: each worker takes a different row</td></tr>
+</table>
+<p><code>lock_timeout</code> applies separately to each lock acquisition, and 0 (the default) means no limit. Both errors share SQLSTATE 55P03, <code>lock_not_available</code>. Waiting forever is rarely what an HTTP request wants; set a bound on the request path, either <code>lock_timeout</code> or a context deadline (see <a href="#timeouts">Timeouts</a>).</p>
+
+<h3>SKIP LOCKED: a job queue in a table</h3>
+<p>Several workers draining a <code>jobs</code> table is the classic pessimistic-locking problem. With no lock, two workers read the same pending job and both run it. With plain <code>FOR UPDATE</code>, they all try to lock the <em>same</em> first pending row, so they queue behind each other and work one at a time. <code>SKIP LOCKED</code> makes each worker skip rows that others hold, so worker 4 takes job 4 while 1–3 are busy. The Postgres docs warn that skipping gives an inconsistent view of the data, "not suitable for general purpose work", but fine for "multiple consumers accessing a queue-like table".</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="Four workers and a jobs table with eight pending jobs. Workers 1 to 3 hold row locks on jobs 1 to 3. Worker 4 runs SELECT FOR UPDATE SKIP LOCKED with LIMIT 1, skips the locked rows 1 to 3, and locks job 4. On the right: with no lock, worker 4 also takes job 1 and it runs twice; with plain FOR UPDATE, worker 4 waits on job 1; with SKIP LOCKED, worker 4 takes job 4 and all four work in parallel.">
+  <defs><marker id="arr-pl-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="30" width="110" height="30" rx="6"/><text x="75" y="50" text-anchor="middle">worker 1</text>
+  <rect class="box" x="20" y="72" width="110" height="30" rx="6"/><text x="75" y="92" text-anchor="middle">worker 2</text>
+  <rect class="box" x="20" y="114" width="110" height="30" rx="6"/><text x="75" y="134" text-anchor="middle">worker 3</text>
+  <rect class="box ok" x="20" y="156" width="110" height="30" rx="6"/><text x="75" y="176" text-anchor="middle">worker 4</text>
+  <text x="75" y="206" text-anchor="middle" class="small">SKIP LOCKED LIMIT 1</text>
+  <text x="75" y="222" text-anchor="middle" class="small">skips 1–3, locks 4</text>
+
+  <text x="345" y="22" text-anchor="middle" class="title">jobs (status = 'pending')</text>
+  <rect class="box accent" x="250" y="32" width="190" height="24" rx="4"/><text x="345" y="49" text-anchor="middle" class="small">job 1 · locked by W1</text>
+  <rect class="box accent" x="250" y="60" width="190" height="24" rx="4"/><text x="345" y="77" text-anchor="middle" class="small">job 2 · locked by W2</text>
+  <rect class="box accent" x="250" y="88" width="190" height="24" rx="4"/><text x="345" y="105" text-anchor="middle" class="small">job 3 · locked by W3</text>
+  <rect class="box ok" x="250" y="116" width="190" height="24" rx="4"/><text x="345" y="133" text-anchor="middle" class="small">job 4 · locked by W4</text>
+  <rect class="box muted" x="250" y="144" width="190" height="24" rx="4"/><text x="345" y="161" text-anchor="middle" class="small">job 5 · free</text>
+  <rect class="box muted" x="250" y="172" width="190" height="24" rx="4"/><text x="345" y="189" text-anchor="middle" class="small">job 6 · free</text>
+  <rect class="box muted" x="250" y="200" width="190" height="24" rx="4"/><text x="345" y="217" text-anchor="middle" class="small">… job 100 · free</text>
+
+  <path class="line" d="M130 45 H248" marker-end="url(#arr-pl-2)"/>
+  <path class="line" d="M130 87 L248 72" marker-end="url(#arr-pl-2)"/>
+  <path class="line" d="M130 129 L248 100" marker-end="url(#arr-pl-2)"/>
+  <path class="line ok" d="M130 171 L248 128" marker-end="url(#arr-pl-2)"/>
+
+  <rect class="box bad" x="500" y="30" width="260" height="60" rx="8"/>
+  <text x="630" y="52" text-anchor="middle" class="title">No lock</text>
+  <text x="630" y="72" text-anchor="middle" class="small">W4 reads job 1 too → it runs twice</text>
+  <rect class="box bad" x="500" y="108" width="260" height="60" rx="8"/>
+  <text x="630" y="130" text-anchor="middle" class="title">FOR UPDATE</text>
+  <text x="630" y="150" text-anchor="middle" class="small">W4 waits on job 1 → one at a time</text>
+  <rect class="box ok" x="500" y="186" width="260" height="60" rx="8"/>
+  <text x="630" y="208" text-anchor="middle" class="title">FOR UPDATE SKIP LOCKED</text>
+  <text x="630" y="228" text-anchor="middle" class="small">W4 takes job 4 → all run in parallel</text>
+  <text x="390" y="276" text-anchor="middle" class="small">each job's row lock is held until its worker commits status = 'done'</text>
+</svg>
+<figcaption>The three variants measured in the example: same 100 jobs, same 4 workers, very different results.</figcaption>
+</figure>
+<p>This is a solid queue for modest volumes when the jobs already live in Postgres: enqueueing is a plain <code>INSERT</code> in the same transaction as the business write, so there's no dual-write problem. For high fan-out, replay or cross-service delivery, use a broker (see <a href="#message-queues">Message Queues</a>). Scheduled work often lands in such a table too (see <a href="#cron-jobs">Cron Jobs</a>).</p>
+
+<h3>Other lock types</h3>
+<p><strong>Advisory locks</strong> lock a number your app chooses, not a row. Use them when there is nothing to lock yet ("only one invoice run per customer") or the thing isn't a row at all. Prefer the transaction-level functions: they release at <code>COMMIT</code>/<code>ROLLBACK</code>. Session-level <code>pg_advisory_lock</code> survives a rollback and stays until you unlock or disconnect, and it breaks behind a transaction-mode pooler (see <a href="#connection-pooling">Connection Pooling</a>).</p>
+<pre><code>-- Illustration (not run on this page): one invoice run per customer at a time,
+-- even though there is no row to lock yet. 1001 is an app-chosen "namespace".
+BEGIN;
+SELECT pg_advisory_xact_lock(1001, $1);       -- waits if another tx holds (1001, customer)
+-- … read usage, insert invoices …
+COMMIT;                                       -- released automatically
+
+SELECT pg_try_advisory_xact_lock(1001, $1);   -- non-blocking variant: returns true/false</code></pre>
+<p><strong>Table locks</strong> (<code>LOCK TABLE … IN … MODE</code>, eight modes from <code>ACCESS SHARE</code> to <code>ACCESS EXCLUSIVE</code>) are rarely what app code wants: they serialize every writer of the table. You meet them mostly through DDL: most forms of <code>ALTER TABLE</code> take <code>ACCESS EXCLUSIVE</code>, which blocks even plain reads.</p>
+<p><strong>In process</strong>, a Go <code>sync.Mutex</code> is the same idea: <code>Lock</code>, work, <code>Unlock</code>; <code>sync.RWMutex</code> is the <code>FOR SHARE</code> / <code>FOR UPDATE</code> split for memory. It protects one process only; with three replicas you have three mutexes (see <a href="#thread-safety">Thread Safety</a>). Across services with no shared database row, you need a <a href="#distributed-locks">distributed lock</a>.</p>
+<table>
+  <tr><th>Tool</th><th>Scope</th><th>Released</th><th>Good for</th></tr>
+  <tr><td>Row lock (<code>FOR UPDATE</code> / <code>NO KEY UPDATE</code>)</td><td>specific rows</td><td>end of transaction</td><td>balances, seats, stock: the row you're about to change</td></tr>
+  <tr><td>Advisory lock (<code>pg_advisory_xact_lock</code>)</td><td>an app-chosen key</td><td>end of tx (xact variant)</td><td>serializing a job or a process that has no single row</td></tr>
+  <tr><td>Table lock (<code>LOCK TABLE</code>)</td><td>whole table</td><td>end of transaction</td><td>bulk rewrites, migrations; rarely app code</td></tr>
+  <tr><td><code>sync.Mutex</code> / <code>RWMutex</code></td><td>one Go process</td><td><code>Unlock</code></td><td>in-memory state</td></tr>
+  <tr><td>Distributed lock (lease)</td><td>many processes, any resource</td><td>unlock or lease expiry</td><td>coordination without a shared DB row</td></tr>
+</table>
+
+<h2>Example</h2>
+<p>The tests run a real PostgreSQL 18 (<code>embedded-postgres</code>, <code>pgx</code>). <code>Reserve</code> books a seat: lock the row, check it is free, write, commit. The <code>lock</code> argument picks the locking clause, and a test hook lets us pause while the lock is held.</p>
+<pre><code>// Reserve locks the seat row first, then checks and writes.
+// lock is the locking clause, e.g. "FOR UPDATE" or "FOR UPDATE NOWAIT".
+// whileLocked is a test hook that runs while we hold the row lock.
+func Reserve(ctx context.Context, db *pgxpool.Pool, seat int, user, lock string, whileLocked func()) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // no-op after Commit
+
+	var holder string
+	err = tx.QueryRow(ctx, &#96;SELECT holder FROM seats WHERE id = $1 &#96;+lock, seat).Scan(&amp;holder)
+	if err != nil {
+		return err // includes "could not obtain lock" from NOWAIT / lock_timeout
+	}
+	whileLocked()
+	if holder != "" {
+		return ErrTaken // safe: nobody can change the row until we finish
+	}
+	if _, err = tx.Exec(ctx, &#96;UPDATE seats SET holder = $1 WHERE id = $2&#96;, user, seat); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}</code></pre>
+<p><strong>1. Blocking.</strong> Alice locks seat 7 and pauses. Bob tries to book the same seat. While he waits, we ask Postgres who is waiting on a lock:</p>
+<pre><code>func ExampleReserve() {
+	ctx := context.Background()
+	db := open(nil)
+	defer db.Close()
+	setup(db, 0)
+	locked, release := make(chan struct{}), make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		err := Reserve(ctx, db, 7, "alice", "FOR UPDATE", func() {
+			fmt.Println("A: locked seat 7")
+			close(locked)
+			&lt;-release
+			fmt.Println("A: writing alice, committing")
+		})
+		fmt.Println("A: done, err =", err)
+	})
+	&lt;-locked
+	start := time.Now()
+	wg.Go(func() {
+		fmt.Println("B: SELECT … FOR UPDATE (blocks)")
+		err := Reserve(ctx, db, 7, "bob", "FOR UPDATE", func() {
+			fmt.Println("B: got the lock after A committed, waited ≥300ms:",
+				time.Since(start) &gt;= 300*time.Millisecond)
+		})
+		fmt.Println("B: done, err =", err)
+	})
+	time.Sleep(300 * time.Millisecond)
+	var waiting int
+	db.QueryRow(ctx, &#96;SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'&#96;).Scan(&amp;waiting)
+	fmt.Println("sessions waiting on a lock:", waiting)
+	close(release)
+	wg.Wait()
+	// Output:
+	// A: locked seat 7
+	// B: SELECT … FOR UPDATE (blocks)
+	// sessions waiting on a lock: 1
+	// A: writing alice, committing
+	// A: done, err = &lt;nil&gt;
+	// B: got the lock after A committed, waited ≥300ms: true
+	// B: done, err = seat already taken
+}</code></pre>
+<p>All outputs on this page are pinned <code>// Output:</code> blocks of <code>Example</code> tests, so they are real (and stable across <code>-count=3</code>). Bob's session sat in <code>wait_event_type = 'Lock'</code> for 300 ms, then read the committed row and refused correctly. Nobody got an error, and the seat was not double-booked.</p>
+<p><strong>2. Failing fast.</strong> Same situation, but Bob uses <code>NOWAIT</code>, then a pool whose sessions all have <code>lock_timeout = 200ms</code> (set through pgx's <code>RuntimeParams</code>):</p>
+<pre><code>func Example_failFast() {
+	ctx := context.Background()
+	db := open(map[string]string{"lock_timeout": "200ms"}) // every session in this pool
+	defer db.Close()
+	setup(db, 0)
+	locked, release := make(chan struct{}), make(chan struct{})
+	go Reserve(ctx, db, 7, "alice", "FOR UPDATE", func() { close(locked); &lt;-release })
+	&lt;-locked
+
+	start := time.Now()
+	err := Reserve(ctx, db, 7, "bob", "FOR UPDATE NOWAIT", func() {})
+	fmt.Printf("NOWAIT after %v: %v&#92;n", time.Since(start).Round(time.Second), err)
+
+	start = time.Now()
+	err = Reserve(ctx, db, 7, "bob", "FOR UPDATE", func() {})
+	fmt.Println("lock_timeout, gave up after ~200ms:",
+		time.Since(start).Round(100*time.Millisecond) == 200*time.Millisecond)
+	fmt.Println(err)
+	close(release)
+	// Output:
+	// NOWAIT after 0s: ERROR: could not obtain lock on row in relation "seats" (SQLSTATE 55P03)
+	// lock_timeout, gave up after ~200ms: true
+	// ERROR: canceling statement due to lock timeout (SQLSTATE 55P03)
+}</code></pre>
+<p><strong>3. A job queue.</strong> 100 jobs, 4 workers, each job "takes" 10 ms. <code>WorkOne</code> claims one job, runs it while holding the row lock, and marks it done. The test runs it with no lock clause, with <code>FOR UPDATE</code>, and with <code>FOR UPDATE SKIP LOCKED</code>:</p>
+<pre><code>// WorkOne claims and runs one pending job. It returns false if it found none.
+// lock is "FOR UPDATE SKIP LOCKED" (the queue pattern), "FOR UPDATE", or "".
+func WorkOne(ctx context.Context, db *pgxpool.Pool, worker int, lock string, process func(id int)) (bool, error) {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var id int
+	err = tx.QueryRow(ctx, &#96;SELECT id FROM jobs WHERE status = 'pending'
+		ORDER BY id LIMIT 1 &#96;+lock).Scan(&amp;id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	process(id) // the row stays locked while we work: keep this short
+	_, err = tx.Exec(ctx, &#96;UPDATE jobs SET status = 'done', runs = runs + 1, worker = $2
+		WHERE id = $1&#96;, id, worker)
+	if err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
+}</code></pre>
+<p>Output of one run (<code>go test -v -run TestQueue</code>, laptop). The locked variants always give exactly 100; the no-lock count moves a little between runs (394–397 here), and times vary:</p>
+<pre><code>""                       executions=397 ranTwice=99 leftPending=0 workersUsed=4 took=1.17s
+"FOR UPDATE"             executions=100 ranTwice=0 leftPending=0 workersUsed=4 took=1.13s
+"FOR UPDATE SKIP LOCKED" executions=100 ranTwice=0 leftPending=0 workersUsed=4 took=300ms</code></pre>
+<ul>
+  <li><strong>No lock:</strong> about 4 executions per job. All four workers saw the same "first pending" job each time, so nearly every job ran four times, and it took as long as one worker would.</li>
+  <li><strong><code>FOR UPDATE</code>:</strong> correct (100 executions), but the workers queued on the same row, so 4 workers took about 1 s, the time of 100 × 10 ms in a row.</li>
+  <li><strong><code>SKIP LOCKED</code>:</strong> correct <em>and</em> parallel: 300 ms, about a quarter of the time.</li>
+</ul>
+
+<p><strong>Real-world scenario.</strong> A wallet has a balance of 100. The user double-taps "withdraw 80", and two requests arrive 5 ms apart. With <code>SELECT balance</code> then <code>UPDATE</code>, both see 100, both approve, and the balance ends at 20 after paying out 160 (or at −60, if the update subtracts). With <code>SELECT balance FROM wallets WHERE id = $1 FOR NO KEY UPDATE</code>, the second request waits about as long as the first transaction takes (a few ms), sees 20, and declines. Two more rules keep it healthy: the payment-provider call happens <em>after</em> commit, driven by an outbox row, so no lock is held across the network; and the handler sets <code>lock_timeout = '2s'</code>, so a stuck transaction gives callers a fast 503 instead of a pile-up. A double-tap is also a job for an <a href="#idempotency">idempotency key</a>; the lock protects the balance from <em>different</em> requests too.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Holding locks across slow work.</strong> A transaction that calls an HTTP API, waits on a user, or sleeps holds its row locks, and every waiter holds a pooled connection too. One slow call can exhaust the pool (see <a href="#connection-pooling">Connection Pooling</a>). Do network calls before or after the transaction.</li>
+  <li><strong>Locking outside a transaction.</strong> In autocommit mode, <code>SELECT … FOR UPDATE</code> is its own transaction: the lock is released the moment the statement returns. Begin a transaction, and run every statement on that <code>tx</code>, not on the pool.</li>
+  <li><strong>Inconsistent lock order.</strong> Transfer A→B locks account A then B; transfer B→A locks B then A. Under load they deadlock, and Postgres aborts one. Lock in a fixed order (by id), or in one statement with <code>ORDER BY id FOR UPDATE</code> (see <a href="#deadlocks">Deadlocks</a>).</li>
+  <li><strong>Locking more than you need.</strong> <code>FOR UPDATE</code> on a range or a join locks every matching row; <code>FOR UPDATE</code> where <code>FOR NO KEY UPDATE</code> would do blocks foreign-key inserts. Lock exactly the rows you'll change, with the weakest mode that works.</li>
+  <li><strong>Waiting without a bound.</strong> The default wait is unlimited. Use <code>NOWAIT</code>, <code>lock_timeout</code> or a context deadline, and treat 55P03 as "busy, try later", not as a bug.</li>
+  <li><strong>Long jobs inside a SKIP LOCKED transaction.</strong> Fine for seconds. For minutes, claim the job instead (<code>UPDATE … SET status = 'running', locked_until = now() + interval '5 minutes' … RETURNING</code>), commit, and run it outside any transaction; a sweeper requeues expired claims. That is a lease, and the job must be idempotent.</li>
+  <li><strong>A mutex is not a database lock.</strong> <code>sync.Mutex</code> around a read-modify-write only serializes goroutines of one process. The second replica races right past it.</li>
+</ul>
+
+<div class="callout warn"><strong>Lock duration is throughput.</strong> A hot row can handle about 1 / (time the lock is held) writes per second. A 2 ms transaction allows roughly 500 per second on that row; put a 200 ms API call inside it and the ceiling drops to about 5.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Pessimistic locking locks first, then reads and writes; contenders wait instead of failing, so it fits hot rows and work you can't redo.</li>
+  <li>In Postgres: <code>SELECT … FOR UPDATE</code> (or the lighter <code>FOR NO KEY UPDATE</code>) inside a transaction; the lock lasts until commit.</li>
+  <li>Bound every wait with <code>NOWAIT</code> or <code>lock_timeout</code> (55P03), and use <code>SKIP LOCKED</code> to let many workers drain a table queue in parallel.</li>
+  <li>Keep transactions short, lock in a consistent order, and never hold a lock across a network call.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#optimistic-locking">Optimistic Locking</a> · <a href="#deadlocks">Deadlocks</a> · <a href="#thread-safety">Thread Safety</a> · <a href="#distributed-locks">Distributed Locks</a> · <a href="#message-queues">Message Queues</a> · <a href="#connection-pooling">Connection Pooling</a></p>
+`;
