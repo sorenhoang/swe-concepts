@@ -2869,3 +2869,295 @@ ok  	example.com/migrations	7.160s</code></pre>
 
 <p><strong>Related:</strong> <a href="#schema-versioning">Schema Versioning</a> · <a href="#rolling-deployments">Rolling Deployments</a> · <a href="#ci-cd">CI/CD</a> · <a href="#rollbacks">Rollbacks</a> · <a href="#database-indexing">Database Indexing</a> · <a href="#backups">Backups</a></p>
 `;
+CONTENT["schema-versioning"] = `
+<p class="tldr"><strong>TL;DR</strong>: Data outlives the code that wrote it. Rows, JSON documents, cached values and events written by last year's release are still read by this year's, and during every deploy two releases read and write the same data at once. Schema versioning means treating the <em>shape</em> of that data as a versioned contract: tag it with a version, only change it in ways the other side can still read, and upgrade old shapes when you read them. It's how a word processor still opens files saved ten years ago, and why the old version can still open a file saved by the new one, minus the new features.</p>
+
+<h2>The problem it solves</h2>
+<p><a href="#database-migrations">Database Migrations</a> change the schema of tables. But the shape of data also lives in places no migration runner touches, and even for tables, the runner doesn't decide what the <em>code</em> can handle:</p>
+<ul>
+  <li><strong>Rolling deploys.</strong> For a few minutes, or a few hours with a canary, release N and release N-1 both run. N-1 reads rows N wrote, and N reads rows N-1 wrote. If either can't, you get errors or, worse, silent data loss.</li>
+  <li><strong>Old data at rest.</strong> A JSONB column, a document store or a blob in object storage holds records in every shape the app ever wrote. Rewriting a billion documents in one migration is slow and risky, so old shapes stay around.</li>
+  <li><strong>Events and messages.</strong> A topic may keep events for days, or forever for event sourcing. Consumers are deployed by other teams on their own schedule. A replay after a bug fix reads events written by old producers.</li>
+  <li><strong>Caches and clients.</strong> A cache full of serialized structs survives a deploy. Mobile apps stay on old versions for months.</li>
+</ul>
+<p>In all of these, writers and readers run different versions of the code. The question is always the same: which direction must still work, and for how long?</p>
+
+<h2>How it works</h2>
+<p>Two words do most of the work. A change is <strong>backward compatible</strong> when new code can read data written by old code. It is <strong>forward compatible</strong> when old code can read data written by new code. A rolling deploy needs both, because both kinds of pods are running.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 270" role="img" aria-label="During a rolling deploy, writers on release N-1 and release N both write to the same shared data: table rows, JSON documents, events and cache entries. Readers on N-1 and N both read it. Reader N must read what N-1 wrote, which is backward compatibility. Reader N-1 must read what N writes, which is forward compatibility.">
+  <defs><marker id="arr-schv-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="115" y="22" text-anchor="middle" class="title">Writers</text>
+  <text x="390" y="22" text-anchor="middle" class="title">Shared data</text>
+  <text x="665" y="22" text-anchor="middle" class="title">Readers</text>
+  <rect class="box" x="20" y="40" width="190" height="50" rx="6"/><text x="115" y="61" text-anchor="middle" class="title">Release N-1</text><text x="115" y="79" text-anchor="middle" class="small">old pods, old shape</text>
+  <rect class="box accent" x="20" y="170" width="190" height="50" rx="6"/><text x="115" y="191" text-anchor="middle" class="title">Release N</text><text x="115" y="209" text-anchor="middle" class="small">new pods, new shape</text>
+  <rect class="box" x="300" y="90" width="180" height="90" rx="6"/>
+  <text x="390" y="114" text-anchor="middle" class="title">same data</text>
+  <text x="390" y="136" text-anchor="middle" class="small">table rows, JSON docs,</text>
+  <text x="390" y="152" text-anchor="middle" class="small">events, cache entries</text>
+  <path class="line" d="M212 72 L298 112" marker-end="url(#arr-schv-1)"/>
+  <path class="line accent" d="M212 190 L298 160" marker-end="url(#arr-schv-1)"/>
+  <path class="line" d="M482 112 L568 72" marker-end="url(#arr-schv-1)"/>
+  <path class="line" d="M482 160 L568 190" marker-end="url(#arr-schv-1)"/>
+  <rect class="box" x="570" y="40" width="190" height="50" rx="6"/><text x="665" y="61" text-anchor="middle" class="title">Release N-1</text><text x="665" y="79" text-anchor="middle" class="small">must read what N writes</text>
+  <text x="665" y="110" text-anchor="middle" class="small">= forward compatibility</text>
+  <rect class="box accent" x="570" y="170" width="190" height="50" rx="6"/><text x="665" y="191" text-anchor="middle" class="title">Release N</text><text x="665" y="209" text-anchor="middle" class="small">must read what N-1 wrote</text>
+  <text x="665" y="240" text-anchor="middle" class="small">= backward compatibility</text>
+  <text x="390" y="215" text-anchor="middle" class="small">during the rollout, all four</text>
+  <text x="390" y="231" text-anchor="middle" class="small">run at the same time</text>
+  <text x="390" y="262" text-anchor="middle" class="small">After the rollout only release N is left, but its data at rest still holds every older shape.</text>
+</svg>
+<figcaption>Backward compatibility protects old data. Forward compatibility protects old code. A rollback swaps the roles: N-1 must read everything N wrote while it ran.</figcaption>
+</figure>
+
+<h3>Rule 1: N and N-1 must both work</h3>
+<p>Every change to a shared shape has to work with the release before it. For tables, that is the expand/contract sequence from <a href="#database-migrations">Database Migrations</a>: add before you use, stop using before you remove. For any other format it comes down to a few habits:</p>
+<ul>
+  <li><strong>Add, don't change.</strong> New fields are optional and have a sensible default. Old readers skip them; new readers fill the default when they're missing.</li>
+  <li><strong>Never rename, never reuse.</strong> A rename is a remove plus an add, and both sides see a missing field. Never give an old name or Protobuf field number a new meaning; old data still carries the old meaning.</li>
+  <li><strong>Readers ship first.</strong> Deploy code that <em>understands</em> the new shape before any code <em>writes</em> it. In the example below, the expand release writes the new <code>phones</code> list next to the old <code>phone</code> field, and only a later release drops <code>phone</code>.</li>
+  <li><strong>Units and meaning are part of the schema.</strong> Changing <code>amount</code> from dollars to cents without a new name is a breaking change that no compatibility checker will catch.</li>
+</ul>
+
+<h3>Rule 2: tag stored shapes with a version, upgrade on read</h3>
+<p>For documents and JSON columns, store a <code>schema_version</code> in each record. The reader keeps a chain of small upgrade steps (v1 to v2, v2 to v3) and runs the ones a record needs, so the rest of the code only ever sees the current shape. This is <strong>upgrade-on-read</strong>. If the reader also saves the upgraded record, it's a <strong>lazy migration</strong>: each record gets rewritten the first time anyone touches it.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 240" role="img" aria-label="A stored record goes through upgrade steps. A v1 record runs step 1 to 2 (split name) and step 2 to 3 (phone becomes a list of phones). A v2 record only runs the second step, a v3 record none. The result is the current Customer struct, which is written back as v3. A v4 record from a newer release is rejected instead of guessed at.">
+  <defs><marker id="arr-schv-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="40" width="130" height="56" rx="6"/><text x="85" y="63" text-anchor="middle" class="title">stored record</text><text x="85" y="82" text-anchor="middle" class="small">v1, v2 or v3</text>
+  <rect class="box accent" x="200" y="40" width="150" height="56" rx="6"/><text x="275" y="63" text-anchor="middle" class="title">upgrade 1 → 2</text><text x="275" y="82" text-anchor="middle" class="small">split "name"</text>
+  <rect class="box accent" x="400" y="40" width="150" height="56" rx="6"/><text x="475" y="63" text-anchor="middle" class="title">upgrade 2 → 3</text><text x="475" y="82" text-anchor="middle" class="small">phone → phones[]</text>
+  <rect class="box ok" x="600" y="40" width="160" height="56" rx="6"/><text x="680" y="63" text-anchor="middle" class="title">Customer</text><text x="680" y="82" text-anchor="middle" class="small">current shape (v3)</text>
+  <path class="line" d="M152 68 H198" marker-end="url(#arr-schv-2)"/>
+  <path class="line" d="M352 68 H398" marker-end="url(#arr-schv-2)"/>
+  <path class="line" d="M552 68 H598" marker-end="url(#arr-schv-2)"/>
+  <text x="275" y="14" text-anchor="middle" class="small">v1 starts here</text><path class="line dashed" d="M275 20 V38" marker-end="url(#arr-schv-2)"/>
+  <text x="475" y="14" text-anchor="middle" class="small">v2 starts here</text><path class="line dashed" d="M475 20 V38" marker-end="url(#arr-schv-2)"/>
+  <text x="680" y="14" text-anchor="middle" class="small">v3 needs no steps</text><path class="line dashed" d="M680 20 V38" marker-end="url(#arr-schv-2)"/>
+  <path class="line ok" d="M680 98 V128 H85 V100" marker-end="url(#arr-schv-2)"/>
+  <text x="390" y="148" text-anchor="middle" class="small">write back as v3 (lazy migration): each record is upgraded once, the first time it's read</text>
+  <rect class="box bad" x="20" y="172" width="250" height="50" rx="6"/><text x="145" y="193" text-anchor="middle" class="title">v4 record</text><text x="145" y="211" text-anchor="middle" class="small">from a newer release: reject, don't guess</text>
+  <rect class="box muted" x="300" y="172" width="460" height="50" rx="6"/><text x="530" y="193" text-anchor="middle">background sweep</text><text x="530" y="211" text-anchor="middle" class="small">upgrades records nobody reads, so old steps can finally be deleted</text>
+</svg>
+<figcaption>Upgrade steps are small, ordered and never edited once released, just like migration files. The current code only ever handles one shape.</figcaption>
+</figure>
+<p>Two details matter. Records written before versioning existed have no version field, so "missing" must mean v1. And a reader that sees a version <em>newer</em> than it knows should fail loudly instead of quietly dropping fields it doesn't understand. That happens during a rollback, and it's the moment silent data loss starts.</p>
+
+<h3>Rule 3: for events, let a registry enforce compatibility</h3>
+<p>Producers and consumers of a topic are often different services owned by different teams, so "deploy readers first" needs tooling. With Avro, Protobuf or JSON Schema, a <strong>schema registry</strong> stores each version of a topic's schema and rejects a new version that breaks the configured rule. Confluent Schema Registry defines these modes:</p>
+<table>
+  <tr><th>Mode</th><th>Guarantee</th><th>Allowed changes (Avro)</th><th>Checked against</th><th>Upgrade first</th></tr>
+  <tr><td><code>BACKWARD</code> (the default)</td><td>consumers on the new schema read data written with the previous one</td><td>delete fields; add fields with defaults</td><td>last version</td><td>consumers</td></tr>
+  <tr><td><code>BACKWARD_TRANSITIVE</code></td><td>same, for all older data</td><td>same</td><td>all versions</td><td>consumers</td></tr>
+  <tr><td><code>FORWARD</code></td><td>consumers on the previous schema read data written with the new one</td><td>add fields; delete fields that had defaults</td><td>last version</td><td>producers</td></tr>
+  <tr><td><code>FORWARD_TRANSITIVE</code></td><td>same, for all older consumers</td><td>same</td><td>all versions</td><td>producers</td></tr>
+  <tr><td><code>FULL</code> / <code>FULL_TRANSITIVE</code></td><td>both directions</td><td>add or delete optional fields only</td><td>last / all versions</td><td>either, in any order</td></tr>
+  <tr><td><code>NONE</code></td><td>nothing is checked</td><td>anything</td><td>nothing</td><td>coordinate by hand</td></tr>
+</table>
+<p>If a topic is replayed from the beginning, or events are kept forever, you want a <code>_TRANSITIVE</code> mode: "compatible with the last version" says nothing about version 1 from three years ago. Request and response payloads of public APIs are a related problem with their own tools (URL or header versions, deprecation windows), covered in <a href="#api-versioning">API Versioning</a>.</p>
+
+<h3>What each format tolerates</h3>
+<table>
+  <tr><th>Change</th><th>JSON + Go <code>encoding/json</code></th><th>Protobuf</th><th>Avro</th><th>SQL column</th></tr>
+  <tr><td>Add an optional field</td><td>safe: unknown fields are ignored by default (not with <code>DisallowUnknownFields</code>)</td><td>safe: old binaries keep it as an unknown field</td><td>safe when it has a default</td><td>safe if nullable or with a constant default</td></tr>
+  <tr><td>Remove a field</td><td>old readers silently get the zero value</td><td>safe if you <code>reserved</code> its number and name</td><td>backward-safe; forward-safe only if it had a default</td><td>only after no running code reads it (contract)</td></tr>
+  <tr><td>Rename a field</td><td>breaks both ways, silently</td><td>the wire format uses numbers, so binary is fine; JSON mapping breaks</td><td>breaks, unless the reader schema declares an alias</td><td>expand/contract with a new column</td></tr>
+  <tr><td>Reuse a name or number for a new meaning</td><td colspan="4">never: old data and old code still carry the old meaning</td></tr>
+</table>
+<pre><code>// Protobuf, not executed here. Field 4 (phone) was removed in v3.
+message Customer {
+  reserved 4;              // the number can never come back with a new meaning
+  reserved "phone";        // nor can the name (keeps JSON/text formats parsing)
+  int32  schema_version = 1;
+  string first_name     = 2;
+  string last_name      = 3;
+  repeated Phone phones = 5;
+  string nickname       = 6;  // new and optional: old binaries ignore it
+}</code></pre>
+
+<h2>Example</h2>
+<p><strong>Upgrade-on-read for customer documents, in Go.</strong> Customer profiles live as JSON. The shape changed twice: v1 had a single <code>name</code>, v2 split it into first and last name and added <code>schema_version</code>, and v3 replaced one <code>phone</code> with a list of <code>phones</code>. The reader upgrades any stored version to v3, writes it back, and refuses versions from the future. Standard library only.</p>
+<pre><code>package schemav
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+// Current is the shape this release writes:
+//
+//	v1 {"name": "Ada Lovelace", "phone": "..."}            (no version field)
+//	v2 {"schema_version": 2, "first_name", "last_name", "phone"}
+//	v3 {"schema_version": 3, "first_name", "last_name", "phones": [...]}
+const Current = 3
+
+type Phone struct {
+	Kind   string &#96;json:"kind"&#96;
+	Number string &#96;json:"number"&#96;
+}
+
+type Customer struct {
+	SchemaVersion int     &#96;json:"schema_version"&#96;
+	FirstName     string  &#96;json:"first_name"&#96;
+	LastName      string  &#96;json:"last_name"&#96;
+	Phones        []Phone &#96;json:"phones"&#96;
+}
+
+// upgrades[v] turns a version-v document into a version v+1 document.
+// Each step is small and never changes once released.
+var upgrades = map[int]func(doc map[string]any){
+	1: func(doc map[string]any) { // split "name"
+		name, _ := doc["name"].(string)
+		first, last, _ := strings.Cut(name, " ")
+		doc["first_name"], doc["last_name"] = first, last
+		delete(doc, "name")
+	},
+	2: func(doc map[string]any) { // one phone -&gt; list of phones
+		if _, ok := doc["phones"]; !ok {
+			phones := []any{}
+			if p, _ := doc["phone"].(string); p != "" {
+				phones = append(phones, map[string]any{"kind": "main", "number": p})
+			}
+			doc["phones"] = phones
+		}
+		delete(doc, "phone")
+	},
+}
+
+// Decode reads any known version and returns the current shape.
+// from is the version the bytes were stored in.
+func Decode(raw []byte) (c Customer, from int, err error) {
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &amp;doc); err != nil {
+		return c, 0, err
+	}
+	from = 1 // records written before versioning existed have no field
+	if v, ok := doc["schema_version"].(float64); ok {
+		from = int(v)
+	}
+	if from &gt; Current {
+		// Written by a newer release: refuse rather than drop fields we don't know.
+		return c, from, fmt.Errorf("schema_version %d is newer than this reader (max %d)", from, Current)
+	}
+	for v := from; v &lt; Current; v++ {
+		upgrades[v](doc)
+		doc["schema_version"] = v + 1
+	}
+	b, _ := json.Marshal(doc)
+	return c, from, json.Unmarshal(b, &amp;c)
+}
+
+// Store is a stand-in for a key/value or JSONB column.
+type Store map[string][]byte
+
+// Get upgrades on read and writes the new shape back (lazy migration),
+// so each old record is converted once, the first time anyone touches it.
+func (s Store) Get(id string) (Customer, error) {
+	c, from, err := Decode(s[id])
+	if err != nil {
+		return c, err
+	}
+	if from &lt; Current {
+		s[id], _ = json.Marshal(c)
+	}
+	return c, nil
+}</code></pre>
+<p>The upgrade steps work on a generic map, not on structs. That's deliberate: a v1 record has fields the current struct no longer has, so it can't be decoded into it directly. Only the final, current shape is decoded into a type.</p>
+<p>The tests check two things. First, the lazy migration over three records in three shapes. Second, a rolling deploy: what a pod still on the previous release (it only knows <code>customerV2</code>) sees when the new release writes. The <code>// Output:</code> blocks are checked by <code>go test</code>.</p>
+<pre><code>package schemav
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+func ExampleStore_Get() {
+	s := Store{
+		"c1": []byte(&#96;{"name":"Ada Lovelace","phone":"+44 1"}&#96;),
+		"c2": []byte(&#96;{"schema_version":2,"first_name":"Alan","last_name":"Turing","phone":"+44 2"}&#96;),
+		"c3": []byte(&#96;{"schema_version":3,"first_name":"Grace","last_name":"Hopper","phones":[]}&#96;),
+	}
+	for _, id := range []string{"c1", "c2", "c3"} {
+		_, from, _ := Decode(s[id])
+		c, _ := s.Get(id)
+		fmt.Printf("%s: stored v%d -&gt; %s %s, %d phone(s)&#92;n",
+			id, from, c.FirstName, c.LastName, len(c.Phones))
+	}
+	fmt.Println("c1 now stored as:", string(s["c1"]))
+
+	_, _, err := Decode([]byte(&#96;{"schema_version":4,"first_name":"Edsger"}&#96;))
+	fmt.Println("v4 record:", err)
+
+	// Output:
+	// c1: stored v1 -&gt; Ada Lovelace, 1 phone(s)
+	// c2: stored v2 -&gt; Alan Turing, 1 phone(s)
+	// c3: stored v3 -&gt; Grace Hopper, 0 phone(s)
+	// c1 now stored as: {"schema_version":3,"first_name":"Ada","last_name":"Lovelace","phones":[{"kind":"main","number":"+44 1"}]}
+	// v4 record: schema_version 4 is newer than this reader (max 3)
+}
+
+// customerV2 is the struct the previous release (N-1) compiled in.
+type customerV2 struct {
+	SchemaVersion int    &#96;json:"schema_version"&#96;
+	FirstName     string &#96;json:"first_name"&#96;
+	Phone         string &#96;json:"phone"&#96;
+}
+
+func Example_rollingDeploy() {
+	readOld := func(raw []byte) string {
+		var c customerV2
+		err := json.Unmarshal(raw, &amp;c)
+		return fmt.Sprintf("phone=%q err=%v", c.Phone, err)
+	}
+
+	// Release N writes v3 while N-1 pods are still running.
+	v3 := []byte(&#96;{"schema_version":3,"first_name":"Ada","phones":[{"kind":"main","number":"+44 1"}]}&#96;)
+	fmt.Println("old pod reads v3:      ", readOld(v3))
+
+	// Expand first: keep writing v2, plus the new field next to the old one.
+	both := []byte(&#96;{"schema_version":2,"first_name":"Ada","phone":"+44 1","phones":[{"kind":"main","number":"+44 1"}]}&#96;)
+	fmt.Println("old pod reads v2+phones:", readOld(both))
+	c, _, _ := Decode(both)
+	fmt.Println("new pod reads v2+phones:", c.Phones)
+
+	// Output:
+	// old pod reads v3:       phone="" err=&lt;nil&gt;
+	// old pod reads v2+phones: phone="+44 1" err=&lt;nil&gt;
+	// new pod reads v2+phones: [{main +44 1}]
+}</code></pre>
+<p>Real output of <code>go test -v</code>:</p>
+<pre><code>=== RUN   ExampleStore_Get
+--- PASS: ExampleStore_Get (0.00s)
+=== RUN   Example_rollingDeploy
+--- PASS: Example_rollingDeploy (0.00s)
+PASS
+ok  	example.com/schemav	0.111s</code></pre>
+<p>Read the second example carefully. When release N writes v3 straight away, the old pod's <code>json.Unmarshal</code> returns <strong>no error</strong>: it simply doesn't find <code>phone</code> and leaves it empty. If that pod then saves the record, the phone number is gone. The safe path is the expand step: keep writing <code>schema_version: 2</code> with both <code>phone</code> and <code>phones</code> until no N-1 pod is left. Both releases then read what they need. Only the release after that starts writing v3.</p>
+
+<p><strong>Real-world scenario.</strong> A delivery app stores each user's saved addresses as a JSONB document, about 30 M documents written over five years in three shapes. The team wants to add structured geo-coordinates. A one-shot migration that rewrites 30 M documents would keep the database busy for hours and fight live traffic. Instead they ship it in three releases. First, a reader that understands v4 (with a <code>geo</code> object) but still writes v3. Next, a writer that writes v4 and upgrades on read, so the most active users' documents convert within days. Last, a batched background sweep, throttled like any backfill, for the long tail. When a query shows no document below v4, they delete the old upgrade steps. Meanwhile the <code>OrderPlaced</code> events carry an address snapshot, so the event schema gets the same field as an optional, defaulted addition under <code>BACKWARD_TRANSITIVE</code>, and the billing consumer that replays a year of events never notices.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Writing the new shape before every reader understands it.</strong> The most common cause of silent data loss in rolling deploys, as the example shows. Ship the reader, then the writer.</li>
+  <li><strong>Strict decoding in consumers.</strong> <code>DisallowUnknownFields</code>, or a JSON Schema with <code>additionalProperties: false</code>, turns every additive change into an outage. Be strict on input from outside, tolerant between your own services.</li>
+  <li><strong>Read-modify-write that drops unknown fields.</strong> An old reader that decodes into a struct and saves it back deletes every field it doesn't know. Either reject newer versions, or keep the unknown fields around (Protobuf does; Go structs don't).</li>
+  <li><strong>Upgrade-on-read with no sweep.</strong> Records nobody reads stay at v1 forever, so the upgrade chain can never shrink, and analytics jobs reading the raw data see every shape. Sweep in the background and track how many records are at each version.</li>
+  <li><strong>"Compatible with the last version" when data is older.</strong> Non-transitive checks let v3 be compatible with v2 and v2 with v1, while v3 can't read v1. If old data is ever re-read, use transitive modes.</li>
+  <li><strong>New enum values.</strong> Adding <code>"status": "on_hold"</code> is additive on paper, but an old <code>switch</code> without a default branch mishandles it. Old readers need a safe default for unknown values.</li>
+  <li><strong>Forgetting caches.</strong> Serialized objects in a cache are stored data too. Put a version in the key or the value, or a deploy will read shapes it can't handle.</li>
+</ul>
+
+<div class="callout warn"><strong>No error is not the same as compatible.</strong> Go's <code>encoding/json</code>, Protobuf and most JSON libraries happily decode data with missing or extra fields. A broken schema change usually shows up as empty values and quietly lost data, not as an exception.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>During every deploy, release N and N-1 share the same data. Every shape change must be readable in both directions until N-1 is gone.</li>
+  <li>Add optional fields with defaults; never rename, never reuse a name or number; ship readers before writers.</li>
+  <li>Tag stored documents with a version, upgrade on read, write back, sweep the long tail, and reject versions newer than you know.</li>
+  <li>For events, let a schema registry enforce the rule, transitively if old events are ever replayed.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#database-migrations">Database Migrations</a> · <a href="#api-versioning">API Versioning</a> · <a href="#rolling-deployments">Rolling Deployments</a> · <a href="#event-driven-architecture">Event-Driven Architecture</a> · <a href="#message-queues">Message Queues</a> · <a href="#semantic-versioning">Semantic Versioning</a></p>
+`;
