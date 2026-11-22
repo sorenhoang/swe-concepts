@@ -3161,3 +3161,422 @@ ok  	example.com/schemav	0.111s</code></pre>
 
 <p><strong>Related:</strong> <a href="#database-migrations">Database Migrations</a> · <a href="#api-versioning">API Versioning</a> · <a href="#rolling-deployments">Rolling Deployments</a> · <a href="#event-driven-architecture">Event-Driven Architecture</a> · <a href="#message-queues">Message Queues</a> · <a href="#semantic-versioning">Semantic Versioning</a></p>
 `;
+CONTENT["real-world-data-layer"] = `
+<p class="tldr"><strong>TL;DR</strong>: A data layer grows in steps, and each step has a signal that tells you it's time. First make queries cheap (indexes, query fixes, no N+1). Then share connections well (pool sizing, PgBouncer). Then spread reads (replicas that respect read-your-writes). Then split the biggest table by time (partitions). Only then split the data across servers (shards). Schema changes go expand/contract the whole way, and event schemas carry versions. Think of a restaurant kitchen: you fix the recipes before you hire more cooks, and you hire cooks before you open a second kitchen.</p>
+
+<h2>The problem it solves</h2>
+<p>The nine pages before this one each describe one tool. This page puts them in one system and in the order you usually need them. The order matters as much as the tools. Sharding a database that is slow because of a missing index buys you N slow databases. Adding replicas to fix a pool that leaks connections buys you more connections to leak.</p>
+<p>The system is an <strong>orders service</strong> for an online shop, written in Go on Postgres. It has three kinds of data:</p>
+<ul>
+  <li><code>orders</code> and <code>order_items</code>: the current state of each order. Read by the "order history" page, written by checkout.</li>
+  <li><code>order_events</code>: an append-only log (<code>OrderPlaced</code>, <code>OrderShipped</code>, …) that other services consume and that support uses for audits. It grows forever.</li>
+  <li><code>customers</code>: small and read often.</li>
+</ul>
+<p>It starts as one Go service and one Postgres. It ends, years later, with several shards. The goal of this page is to show what each stage looks like, which signal moved it to the next one, and what breaks if you skip ahead.</p>
+
+<h2>How it works: the end state</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 400" role="img" aria-label="The orders service in Go holds a shard map keyed by customer_id, a replica router with version tokens and a connection pool. It talks through PgBouncer in transaction mode to two shards. Each shard has a primary that streams WAL to an async replica, and the order_events table is split into monthly partitions. A migration runner applies expand and contract migrations to every shard, and the service publishes versioned OrderPlaced events to an event bus.">
+  <defs><marker id="arr-rwdl-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="20" y="40" width="220" height="110" rx="10"/>
+  <text x="130" y="64" text-anchor="middle" class="title">Orders service (Go)</text>
+  <text x="130" y="86" text-anchor="middle" class="small">shard map: customer_id → shard</text>
+  <text x="130" y="106" text-anchor="middle" class="small">replica router + version token</text>
+  <text x="130" y="126" text-anchor="middle" class="small">pool: SetMaxOpenConns per shard</text>
+  <path class="line" d="M240 95 H288" marker-end="url(#arr-rwdl-1)"/>
+  <rect class="box" x="290" y="70" width="150" height="50" rx="10"/>
+  <text x="365" y="92" text-anchor="middle" class="title">PgBouncer</text>
+  <text x="365" y="110" text-anchor="middle" class="small">transaction mode</text>
+  <path class="line" d="M440 88 H465 V77 H493" marker-end="url(#arr-rwdl-1)"/>
+  <path class="line" d="M440 102 H465 V257 H493" marker-end="url(#arr-rwdl-1)"/>
+  <rect class="box muted" x="480" y="20" width="280" height="165" rx="12"/>
+  <text x="494" y="40" class="title">Shard 1</text>
+  <rect class="box" x="495" y="52" width="120" height="50" rx="8"/>
+  <text x="555" y="74" text-anchor="middle" class="title">Primary</text>
+  <text x="555" y="92" text-anchor="middle" class="small">all writes</text>
+  <path class="line accent dashed" d="M615 77 H633" marker-end="url(#arr-rwdl-1)"/>
+  <rect class="box" x="635" y="52" width="110" height="50" rx="8"/>
+  <text x="690" y="74" text-anchor="middle" class="title">Replica</text>
+  <text x="690" y="92" text-anchor="middle" class="small">reads, lag watched</text>
+  <text x="494" y="124" class="small">order_events: monthly partitions</text>
+  <rect class="box muted" x="495" y="134" width="78" height="28" rx="5"/>
+  <text x="534" y="152" text-anchor="middle" class="small">2026-09</text>
+  <rect class="box muted" x="583" y="134" width="78" height="28" rx="5"/>
+  <text x="622" y="152" text-anchor="middle" class="small">2026-10</text>
+  <rect class="box ok" x="671" y="134" width="74" height="28" rx="5"/>
+  <text x="708" y="152" text-anchor="middle" class="small">2026-11</text>
+  <rect class="box muted" x="480" y="200" width="280" height="165" rx="12"/>
+  <text x="494" y="220" class="title">Shard 2</text>
+  <rect class="box" x="495" y="232" width="120" height="50" rx="8"/>
+  <text x="555" y="254" text-anchor="middle" class="title">Primary</text>
+  <text x="555" y="272" text-anchor="middle" class="small">all writes</text>
+  <path class="line accent dashed" d="M615 257 H633" marker-end="url(#arr-rwdl-1)"/>
+  <rect class="box" x="635" y="232" width="110" height="50" rx="8"/>
+  <text x="690" y="254" text-anchor="middle" class="title">Replica</text>
+  <text x="690" y="272" text-anchor="middle" class="small">reads, lag watched</text>
+  <text x="494" y="304" class="small">order_events: monthly partitions</text>
+  <rect class="box muted" x="495" y="314" width="78" height="28" rx="5"/>
+  <text x="534" y="332" text-anchor="middle" class="small">2026-09</text>
+  <rect class="box muted" x="583" y="314" width="78" height="28" rx="5"/>
+  <text x="622" y="332" text-anchor="middle" class="small">2026-10</text>
+  <rect class="box ok" x="671" y="314" width="74" height="28" rx="5"/>
+  <text x="708" y="332" text-anchor="middle" class="small">2026-11</text>
+  <path class="line" d="M130 150 V198" marker-end="url(#arr-rwdl-1)"/>
+  <rect class="box" x="20" y="200" width="220" height="60" rx="10"/>
+  <text x="130" y="224" text-anchor="middle" class="title">Event bus</text>
+  <text x="130" y="244" text-anchor="middle" class="small">OrderPlaced v2, compat checked</text>
+  <rect class="box" x="20" y="300" width="220" height="60" rx="10"/>
+  <text x="130" y="324" text-anchor="middle" class="title">Migration runner (CI)</text>
+  <text x="130" y="344" text-anchor="middle" class="small">expand/contract, lock_timeout</text>
+  <path class="line dashed" d="M240 330 H478" marker-end="url(#arr-rwdl-1)"/>
+  <text x="360" y="320" text-anchor="middle" class="small">same versions on every shard</text>
+  <text x="290" y="150" class="small">Reads go through the same pooler</text>
+  <text x="290" y="166" class="small">to the replicas (arrows omitted).</text>
+</svg>
+<figcaption>The end state after five growth stages. Most systems stop earlier, and that is fine: each box exists only because a signal showed up that the stage before it couldn't handle.</figcaption>
+</figure>
+
+<p>Each piece has its own page. Here is the job each one does in this system:</p>
+<ol>
+  <li><strong>Indexes on the access paths</strong>: <a href="#database-indexing">Database Indexing</a>. <code>orders(customer_id, id)</code> and <code>order_items(order_id)</code>.</li>
+  <li><strong>Read plans, fix the query</strong>: <a href="#query-optimization">Query Optimization</a>. Keyset pagination instead of <code>OFFSET</code>.</li>
+  <li><strong>One query per list, not per row</strong>: <a href="#n-1-queries">N+1 Queries</a>. The history page loads items for 20 orders with one <code>IN (…)</code>, not 20 queries.</li>
+  <li><strong>Bounded pools, external pooler</strong>: <a href="#connection-pooling">Connection Pooling</a>. A fixed pool per instance; PgBouncer multiplexes onto few backends.</li>
+  <li><strong>Replicas for reads</strong>: <a href="#read-replicas">Read Replicas</a>. Browsing reads go to replicas; reads right after checkout carry a version token.</li>
+  <li><strong>Partition the log by month</strong>: <a href="#partitioning">Partitioning</a>. Retention is <code>DROP</code> of an old partition, not a huge <code>DELETE</code>.</li>
+  <li><strong>Shard by customer</strong>: <a href="#sharding">Sharding</a>. Every hot-path query has <code>customer_id</code>, so it hits one shard.</li>
+  <li><strong>Change schemas without downtime</strong>: <a href="#database-migrations">Database Migrations</a>. Expand/contract, with <code>lock_timeout</code>.</li>
+  <li><strong>Version the data's shape</strong>: <a href="#schema-versioning">Schema Versioning</a>. Old code and old consumers must read what new code writes.</li>
+</ol>
+
+<h2>The growth timeline</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="Five stages from left to right as load and data grow: fix queries, pool connections, add replicas, partition order_events, shard by customer_id. Each stage lists the signal that triggers it and what to do.">
+  <defs><marker id="arr-rwdl-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <path class="line" d="M15 22 H762" marker-end="url(#arr-rwdl-2)"/>
+  <text x="390" y="14" text-anchor="middle" class="small">traffic and data grow →</text>
+  <rect class="box ok" x="15" y="36" width="140" height="44" rx="8"/>
+  <text x="85" y="63" text-anchor="middle" class="title">1. Fix queries</text>
+  <rect class="box ok" x="165" y="36" width="140" height="44" rx="8"/>
+  <text x="235" y="63" text-anchor="middle" class="title">2. Pool</text>
+  <rect class="box accent" x="315" y="36" width="140" height="44" rx="8"/>
+  <text x="385" y="63" text-anchor="middle" class="title">3. Replicas</text>
+  <rect class="box accent" x="465" y="36" width="140" height="44" rx="8"/>
+  <text x="535" y="63" text-anchor="middle" class="title">4. Partition</text>
+  <rect class="box bad" x="615" y="36" width="150" height="44" rx="8"/>
+  <text x="690" y="63" text-anchor="middle" class="title">5. Shard</text>
+  <text x="15" y="106" class="title">Signal</text>
+  <text x="15" y="126" class="small">slow pages, seq scans</text>
+  <text x="15" y="142" class="small">in pg_stat_statements</text>
+  <text x="165" y="126" class="small">connections near</text>
+  <text x="165" y="142" class="small">max_connections, waits</text>
+  <text x="315" y="126" class="small">primary busy with reads</text>
+  <text x="315" y="142" class="small">after stage 1 is done</text>
+  <text x="465" y="126" class="small">order_events huge,</text>
+  <text x="465" y="142" class="small">slow retention DELETE</text>
+  <text x="615" y="126" class="small">writes or size outgrow</text>
+  <text x="615" y="142" class="small">the biggest primary</text>
+  <text x="15" y="176" class="title">Do</text>
+  <text x="15" y="196" class="small">indexes, EXPLAIN,</text>
+  <text x="15" y="212" class="small">keyset, kill N+1</text>
+  <text x="165" y="196" class="small">size pools per instance,</text>
+  <text x="165" y="212" class="small">PgBouncer (transaction)</text>
+  <text x="315" y="196" class="small">replicas + version-</text>
+  <text x="315" y="212" class="small">token routing</text>
+  <text x="465" y="196" class="small">monthly RANGE parts,</text>
+  <text x="465" y="212" class="small">DROP old months</text>
+  <text x="615" y="196" class="small">shard by customer_id,</text>
+  <text x="615" y="212" class="small">move tenants online</text>
+  <path class="line dashed" d="M15 236 H765"/>
+  <text x="15" y="262" class="small">Cost to undo: low on the left, very high on the right. A sharded system stays sharded.</text>
+  <text x="15" y="280" class="small">Migrations (expand/contract) and versioned event schemas run through every stage.</text>
+</svg>
+<figcaption>The stages in the usual order. Move right only when the signal shows and the stages to the left are done; a replica doesn't fix a missing index, and a shard doesn't fix an N+1.</figcaption>
+</figure>
+
+<h3>What to do at each scale</h3>
+<p>There are no honest universal thresholds like "shard at X rows". Hardware, row size and query shape change the answer by orders of magnitude. Use signals you can measure on your own system.</p>
+<table>
+  <tr><th>Stage</th><th>Move on when you see</th><th>What you add</th><th>What it costs you</th></tr>
+  <tr><td>1. Fix queries</td><td>A few queries dominate total time in <code>pg_stat_statements</code>; plans show seq scans on big tables; query count per request grows with page size</td><td>Indexes, rewritten queries, batched loading</td><td>Write cost and storage per index; nothing else</td></tr>
+  <tr><td>2. Pool</td><td>Total connections across instances approach Postgres <code>max_connections</code> (default 100); <code>DB.Stats().WaitCount</code> climbing; many idle backends</td><td>Explicit <code>SetMaxOpenConns</code> per instance; PgBouncer in transaction mode</td><td>No session state across transactions: <code>SET</code>, <code>LISTEN</code>, session advisory locks, SQL-level <code>PREPARE</code></td></tr>
+  <tr><td>3. Replicas</td><td>Primary CPU or I/O is mostly reads, after stage 1; a cache doesn't fit because reads are too varied or must be fresh-ish</td><td>Async replicas; a router; lag metrics</td><td>Stale reads; read-your-writes logic; more servers to run</td></tr>
+  <tr><td>4. Partition</td><td>One table is far larger than the rest; queries mostly hit recent data; retention <code>DELETE</code>s cause bloat and long vacuums</td><td>Declarative RANGE partitions by month; automatic creation of next month</td><td>The partition key must be in the primary key; queries without it scan every partition</td></tr>
+  <tr><td>5. Shard</td><td>Write volume or data size exceeds what the largest primary you can buy handles, and stages 1–4 are done</td><td>Shard key, shard map, routing, resharding tooling (or Citus / Vitess)</td><td>Cross-shard queries and transactions, per-shard migrations, global IDs, operations ×N</td></tr>
+</table>
+
+<h2>The incident: a Black Friday slowdown</h2>
+<p>This is a made-up but typical story, and the Go example below replays its mechanics. The shop is at stage 2: one primary, a pool per instance. On the morning of the sale, a deploy ran a migration that rebuilt <code>order_items</code> to add a <code>currency</code> column. The rebuild copied the rows into a new table, dropped the old one and renamed. The index on <code>order_id</code> belonged to the old table, so it was dropped with it. Nobody noticed, because traffic was low and the history page was only a bit slower.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 390" role="img" aria-label="Incident timeline. 09:00 a migration drops the order_items index. Until 10:00 traffic is low. At 10:00 the sale starts. 10:03 the pool is empty, held by N+1 history requests. 10:05 checkout times out too because it shares the pool. 10:12 EXPLAIN shows a seq scan and the index is re-created concurrently. 10:20 errors drop. Next week the item lookups are batched and checkout gets its own pool.">
+  <text x="20" y="24" class="title">Time</text>
+  <text x="110" y="24" class="title">What happened</text>
+  <text x="545" y="24" class="title">Where you see it</text>
+  <text x="20" y="62" >09:00</text>
+  <rect class="box muted" x="110" y="40" width="420" height="36" rx="6"/>
+  <text x="320" y="62" text-anchor="middle">Deploy: migration 3 rebuilds order_items, index lost</text>
+  <text x="555" y="62" class="small">schema_migrations: version 3</text>
+  <text x="20" y="104">09:00–10:00</text>
+  <rect class="box muted" x="110" y="82" width="420" height="36" rx="6"/>
+  <text x="320" y="104" text-anchor="middle">History page slower, but traffic is low</text>
+  <text x="555" y="104" class="small">p99 of one endpoint creeps up</text>
+  <text x="20" y="146">10:00</text>
+  <rect class="box accent" x="110" y="124" width="420" height="36" rx="6"/>
+  <text x="320" y="146" text-anchor="middle">Sale starts; requests per second jump</text>
+  <text x="555" y="146" class="small">throughput graph</text>
+  <text x="20" y="188">10:03</text>
+  <rect class="box bad" x="110" y="166" width="420" height="36" rx="6"/>
+  <text x="320" y="188" text-anchor="middle">Pool empty: N+1 history requests hold every conn</text>
+  <text x="555" y="188" class="small">DB.Stats(): InUse = max, WaitCount ↑</text>
+  <text x="20" y="230">10:05</text>
+  <rect class="box bad" x="110" y="208" width="420" height="36" rx="6"/>
+  <text x="320" y="230" text-anchor="middle">Checkout times out too: it shares the same pool</text>
+  <text x="555" y="230" class="small">"context deadline exceeded" in logs</text>
+  <text x="20" y="272">10:12</text>
+  <rect class="box accent" x="110" y="250" width="420" height="36" rx="6"/>
+  <text x="320" y="272" text-anchor="middle">EXPLAIN shows Seq Scan on order_items; index re-added</text>
+  <text x="555" y="272" class="small">CREATE INDEX CONCURRENTLY</text>
+  <text x="20" y="314">10:20</text>
+  <rect class="box ok" x="110" y="292" width="420" height="36" rx="6"/>
+  <text x="320" y="314" text-anchor="middle">Errors drop; history still holds conns for 21 queries</text>
+  <text x="555" y="314" class="small">traces: 21 DB spans per request</text>
+  <text x="20" y="356">next week</text>
+  <rect class="box ok" x="110" y="334" width="420" height="36" rx="6"/>
+  <text x="320" y="356" text-anchor="middle">Batch the item lookups; checkout gets its own pool</text>
+  <text x="555" y="356" class="small">traces: 2 DB spans per request</text>
+</svg>
+<figcaption>Two small problems that were harmless alone (a lost index, an N+1) became an outage together, through a third shared thing: the connection pool. The user-facing symptom was in checkout, which had neither problem.</figcaption>
+</figure>
+<p>The chain is worth spelling out, because it's how most data-layer incidents go:</p>
+<ul>
+  <li>The history page runs inside a transaction, so it keeps <strong>one connection for its whole life</strong>.</li>
+  <li>Its life is <strong>21 queries</strong> (1 for the orders, 1 per order for the items), so it holds that connection for 21 round trips.</li>
+  <li>Without the index, each of those item queries <strong>scans the whole table</strong>, so each round trip gets longer too.</li>
+  <li>The pool has a fixed size. Once every connection is held by a slow history page, <strong>every other request waits</strong>, including checkout, and their contexts expire while waiting.</li>
+</ul>
+<div class="callout warn"><strong>Re-adding the index on a live Postgres needs <code>CREATE INDEX CONCURRENTLY</code>.</strong> A plain <code>CREATE INDEX</code> blocks writes to the table until it finishes, which during a sale means checkout stops. <code>CONCURRENTLY</code> doesn't block writes, takes longer, and can't run inside a transaction block, so migration tools need to run it outside one. The other lesson is in the migration: a table rebuild must recreate every index, and a check in CI that compares the index list before and after would have caught it.</div>
+
+<h3>Symptom → tool</h3>
+<table>
+  <tr><th>Symptom</th><th>First thing to check</th><th>Likely fix</th><th>Page</th></tr>
+  <tr><td>One endpoint slow, others fine</td><td><code>EXPLAIN (ANALYZE, BUFFERS)</code> of its top query</td><td>Index, sargable rewrite, keyset pagination</td><td><a href="#query-optimization">Query Optimization</a>, <a href="#database-indexing">Indexing</a></td></tr>
+  <tr><td>Query count per request grows with the list size</td><td>DB spans per trace; a query counter in tests</td><td>Batch with <code>IN</code> / <code>ANY</code>, JOIN, preload</td><td><a href="#n-1-queries">N+1 Queries</a></td></tr>
+  <tr><td>Timeouts everywhere, DB CPU not maxed</td><td><code>DB.Stats()</code>: <code>InUse</code>, <code>WaitCount</code>, <code>WaitDuration</code></td><td>Find who holds connections long; separate pools; right-size</td><td><a href="#connection-pooling">Connection Pooling</a></td></tr>
+  <tr><td>"too many clients already" from Postgres</td><td>Pool size × instances vs <code>max_connections</code></td><td>Cap pools; PgBouncer</td><td><a href="#connection-pooling">Connection Pooling</a></td></tr>
+  <tr><td>"My order disappeared" right after checkout</td><td>Which DB served the read; replica lag</td><td>Version token or primary-after-write</td><td><a href="#read-replicas">Read Replicas</a></td></tr>
+  <tr><td>Deleting old events takes hours and bloats the table</td><td>Table size, vacuum activity</td><td>Monthly partitions, drop old ones</td><td><a href="#partitioning">Partitioning</a></td></tr>
+  <tr><td>Everything piles up during a deploy</td><td><code>pg_locks</code> / <code>pg_stat_activity</code>: an <code>ALTER</code> waiting on a lock</td><td><code>lock_timeout</code>, expand/contract, retry</td><td><a href="#database-migrations">Database Migrations</a></td></tr>
+  <tr><td>A consumer crashes on a new event</td><td>Event version vs consumer's known versions</td><td>Additive changes only; compatibility check in CI</td><td><a href="#schema-versioning">Schema Versioning</a></td></tr>
+  <tr><td>One shard much busier than the others</td><td>Load per shard key</td><td>Split the hot tenant, better key</td><td><a href="#sharding">Sharding</a></td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>The incident and two fixes, then a replica router, in one Go package.</strong> It uses <code>database/sql</code> with <code>modernc.org/sqlite</code> (pure Go), so it runs anywhere with no server. SQLite stands in for Postgres: its <code>EXPLAIN QUERY PLAN</code> output differs, but scans, indexes, pools and transactions are real. Every query also waits 5 ms first, to simulate the network round trip to a database server. The seed is 1,000 customers × 20 orders × 6 items = 120,000 <code>order_items</code> rows.</p>
+<p>The store: a pool of fixed size, the migrations (number 3 is the one that loses the index), and the round-trip wrapper. <code>HistoryNPlus1</code> (not shown) opens a transaction, so it holds one connection, then runs 1 query for the 20 orders and 1 per order for its items. <code>Load</code> (not shown) starts n page requests at the same instant, each with its own deadline, and counts successes, timeouts and <code>DB.Stats().WaitCount</code>. <code>HistoryBatched</code> (same file, not shown) loads the items for all 20 orders with one <code>IN (…)</code> query; the <a href="#n-1-queries">N+1 page</a> covers that pattern.</p>
+<pre><code>// Store is the orders database as the app sees it: a fixed-size pool, and a
+// simulated network round trip (RTT) paid by every query.
+type Store struct {
+	DB      *sql.DB
+	RTT     time.Duration
+	Queries atomic.Int64
+}
+
+func Open(path string, pool int, rtt time.Duration) (*Store, error) {
+	db, err := sql.Open("sqlite", "file:"+path+
+		"?_pragma=journal_mode(WAL)&amp;_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(pool) // the pool: at most &#96;pool&#96; connections, others wait
+	db.SetMaxIdleConns(pool)
+	return &amp;Store{DB: db, RTT: rtt}, nil
+}
+
+// Migrations run in order; schema_migrations records which ones are applied.
+var Migrations = []string{
+	1: &#96;CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INT, created_at INT);
+	    CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INT, price_cents INT);&#96;,
+	2: &#96;CREATE INDEX idx_orders_customer ON orders(customer_id, id);
+	    CREATE INDEX idx_items_order ON order_items(order_id);&#96;,
+	// 3 rebuilds the table to add a column (copy, drop, rename).
+	// Dropping the old table silently drops idx_items_order with it.
+	3: &#96;CREATE TABLE order_items_new (id INTEGER PRIMARY KEY, order_id INT,
+	      price_cents INT, currency TEXT NOT NULL DEFAULT 'USD');
+	    INSERT INTO order_items_new (id, order_id, price_cents)
+	      SELECT id, order_id, price_cents FROM order_items;
+	    DROP TABLE order_items;
+	    ALTER TABLE order_items_new RENAME TO order_items;&#96;,
+	4: &#96;CREATE INDEX idx_items_order ON order_items(order_id);&#96;, // the fix
+}
+
+// query pays one round trip on the request's transaction (so the
+// connection stays checked out for the whole request).
+func (s *Store) query(ctx context.Context, tx *sql.Tx, q string, args ...any) (*sql.Rows, error) {
+	s.Queries.Add(1)
+	select {
+	case &lt;-time.After(s.RTT):
+	case &lt;-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return tx.QueryContext(ctx, q, args...)
+}</code></pre>
+<p>The replica router. A write returns the primary's new version as a token. A read that carries a token goes to the replica only if the replica has applied at least that version. In Postgres the version would be a WAL position: <code>pg_current_wal_lsn()</code> on the primary after the write, compared with <code>pg_last_wal_replay_lsn()</code> on the replica.</p>
+<pre><code>// Router sends writes to the primary and reads to a replica, unless the
+// caller carries a version token the replica hasn't applied yet.
+// The replica is fed from a log by Replicate, so lag is under test control.
+// Not safe for concurrent use; a real router guards the versions with a mutex.
+type Router struct {
+	Primary, Replica *sql.DB
+	pending          []logEntry
+	primaryVer       int64 // last version committed on the primary
+	replicaVer       int64 // last version the replica has applied
+}
+
+type logEntry struct {
+	q    string
+	args []any
+}
+
+// Write commits on the primary and returns the new version as a token.
+func (r *Router) Write(ctx context.Context, q string, args ...any) (int64, error) {
+	if _, err := r.Primary.ExecContext(ctx, q, args...); err != nil {
+		return 0, err
+	}
+	r.primaryVer++
+	r.pending = append(r.pending, logEntry{q, args})
+	return r.primaryVer, nil
+}
+
+// Replicate applies up to n log entries to the replica (n &lt; 0: all).
+func (r *Router) Replicate(ctx context.Context, n int) error {
+	for ; n != 0 &amp;&amp; len(r.pending) &gt; 0; n-- {
+		e := r.pending[0]
+		if _, err := r.Replica.ExecContext(ctx, e.q, e.args...); err != nil {
+			return err
+		}
+		r.pending = r.pending[1:]
+		r.replicaVer++
+	}
+	return nil
+}
+
+// Reader picks the database for a read that must see at least minVersion
+// (0 = any staleness is fine).
+func (r *Router) Reader(minVersion int64) (*sql.DB, string) {
+	if r.replicaVer &gt;= minVersion {
+		return r.Replica, "replica"
+	}
+	return r.Primary, "primary"
+}
+
+func (r *Router) Lag() int64 { return r.primaryVer - r.replicaVer }</code></pre>
+<p>The scenario: 12 history requests arrive at once, each with a 300 ms deadline, against a pool of 4. (<code>seed</code> just inserts the rows.)</p>
+<pre><code>const itemsQuery = &#96;SELECT count(*), sum(price_cents) FROM order_items WHERE order_id = 42&#96;
+
+func Example() {
+	dir, _ := os.MkdirTemp("", "orders")
+	defer os.RemoveAll(dir)
+	ctx := context.Background()
+
+	// Stage 1-2: one primary, pool of 4, 5 ms per round trip, 12 concurrent
+	// "order history" requests, each with a 300 ms deadline.
+	s, _ := Open(filepath.Join(dir, "orders.db"), 4, 5*time.Millisecond)
+	s.Migrate(1)
+	seed(s)
+	s.Migrate(3) // the Black Friday deploy: rebuilds order_items
+	fmt.Println("after migration 3:", s.Plan(itemsQuery))
+	s.Queries.Store(0)
+	s.HistoryNPlus1(ctx, 7)
+	fmt.Println("N+1 page issues", s.Queries.Load(), "queries")
+	fmt.Printf("incident:     %+v&#92;n", s.Load(12, 300*time.Millisecond, s.HistoryNPlus1))
+
+	s.Migrate(4) // fix 1: put the index back
+	fmt.Println("after migration 4:", s.Plan(itemsQuery))
+	fmt.Printf("index only:   %+v&#92;n", s.Load(12, 300*time.Millisecond, s.HistoryNPlus1))
+
+	s.Queries.Store(0) // fix 2: batch the item lookups
+	a, _ := s.HistoryNPlus1(ctx, 7)
+	n1 := s.Queries.Load()
+	b, _ := s.HistoryBatched(ctx, 7)
+	fmt.Println("batched page issues", s.Queries.Load()-n1, "queries; same result:",
+		fmt.Sprint(a) == fmt.Sprint(b))
+	fmt.Printf("index+batch:  %+v&#92;n", s.Load(12, 300*time.Millisecond, s.HistoryBatched))
+
+	var versions []int
+	rows, _ := s.DB.Query(&#96;SELECT version FROM schema_migrations ORDER BY version&#96;)
+	for rows.Next() {
+		var v int
+		rows.Scan(&amp;v)
+		versions = append(versions, v)
+	}
+	rows.Close()
+	fmt.Println("schema_migrations:", versions)
+
+	// Stage 3: a read replica, with the replica's apply step under our control.
+	open := func(name string) *sql.DB {
+		db, _ := sql.Open("sqlite", filepath.Join(dir, name))
+		db.Exec(Migrations[1])
+		return db
+	}
+	r := &amp;Router{Primary: open("primary.db"), Replica: open("replica.db")}
+	count := func(minVersion int64) string {
+		db, name := r.Reader(minVersion)
+		var n int
+		db.QueryRow(&#96;SELECT count(*) FROM orders WHERE customer_id = 7&#96;).Scan(&amp;n)
+		return fmt.Sprintf("%d order(s), read from %s", n, name)
+	}
+	r.Write(ctx, &#96;INSERT INTO orders VALUES (1, 7, 100)&#96;)
+	r.Replicate(ctx, -1)
+	token, _ := r.Write(ctx, &#96;INSERT INTO orders VALUES (2, 7, 200)&#96;) // customer 7 checks out
+	fmt.Println("replica lag:", r.Lag(), "write(s); token =", token)
+	fmt.Println("my orders, no token: ", count(0))
+	fmt.Println("my orders, with token:", count(token))
+	r.Replicate(ctx, -1)
+	fmt.Println("after catch-up, token:", count(token))
+}</code></pre>
+<p>Real output of <code>go test</code> (the <code>// Output:</code> block is pinned, so the test fails if any line changes; it passed on 5 consecutive runs on a laptop):</p>
+<pre><code>after migration 3: SCAN order_items
+N+1 page issues 21 queries
+incident:     {OK:4 TimedOut:8 Other:0 PoolWaits:8}
+after migration 4: SEARCH order_items USING INDEX idx_items_order (order_id=?)
+index only:   {OK:8 TimedOut:4 Other:0 PoolWaits:8}
+batched page issues 2 queries; same result: true
+index+batch:  {OK:12 TimedOut:0 Other:0 PoolWaits:8}
+schema_migrations: [1 2 3 4]
+replica lag: 1 write(s); token = 2
+my orders, no token:  1 order(s), read from replica
+my orders, with token: 2 order(s), read from primary
+after catch-up, token: 2 order(s), read from replica</code></pre>
+<p>Things to notice:</p>
+<ul>
+  <li><strong>The plan tells you the migration's mistake.</strong> After migration 3, the item lookup is <code>SCAN order_items</code>: every one of 120,000 rows, 20 times per page. After migration 4 it's <code>SEARCH … USING INDEX</code>.</li>
+  <li><strong>Only 4 of 12 requests survived the incident.</strong> Four got connections and finished. The other eight waited for a connection and hit their deadline: the pool turned slow queries into errors for requests that were just queued.</li>
+  <li><strong>The index alone was not enough at this load.</strong> 8 of 12 succeeded. Each request still made 21 round trips while holding its connection, so the third group of four ran out of time. Fixing round trips (2 queries instead of 21) let all 12 finish.</li>
+  <li><strong><code>WaitCount</code> is 8 in every run.</strong> With 12 requests and 4 connections, 8 always have to wait. The count says the pool is full; <code>WaitDuration</code> says whether that hurts. Alert on both.</li>
+  <li><strong>The replica read without a token missed the customer's new order.</strong> With the token, the router saw the replica was one write behind and used the primary. After catch-up, the same token was served by the replica again.</li>
+</ul>
+<p>What the example leaves out: real network latency varies (here it's a fixed sleep); PgBouncer, partitions and shards appear only in the diagrams (see their pages for runnable code); and the router isn't safe for concurrent use.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Sharding too early.</strong> Every cross-customer query (admin reports, "top products") becomes a scatter-gather, every migration runs N times, and IDs must be globally unique. If stages 1–4 aren't done, sharding multiplies the problem instead of fixing it.</li>
+  <li><strong>Replicas before indexes or caching.</strong> A replica runs the same bad plan. A missing index costs the same on every copy. Check plans first, then consider a <a href="#caching">cache</a> for hot, repeated reads, then replicas.</li>
+  <li><strong>Migrations without <code>lock_timeout</code>.</strong> An <code>ALTER TABLE</code> waits for its lock behind one long query, and every query that arrives after it waits behind the <code>ALTER</code>. Set a short <code>lock_timeout</code> in the migration and retry, rather than freeze the table.</li>
+  <li><strong>One pool for everything.</strong> In the incident, checkout died because of the history page. Give critical paths their own pool (or a reserved share), and give every request a <a href="#timeouts">deadline</a>.</li>
+  <li><strong>Pools that add up past the server.</strong> Each instance sizes its pool alone, then <a href="#autoscaling">autoscaling</a> adds instances. Total = pool size × instances, and it must stay under <code>max_connections</code> (or under PgBouncer's backend pool).</li>
+  <li><strong>Assuming transaction-mode PgBouncer is transparent.</strong> Session state doesn't survive between transactions: <code>SET</code>, <code>LISTEN</code>, session advisory locks, SQL <code>PREPARE</code>. Protocol-level prepared statements work only when <code>max_prepared_statements</code> is set to a non-zero value.</li>
+  <li><strong>Picking a shard key the hot path doesn't have.</strong> If the history page doesn't know <code>customer_id</code>, every request goes to every shard. Pick the key from the queries, not from the data.</li>
+  <li><strong>Breaking old readers.</strong> During a rolling deploy, old code reads rows written by new code, and old consumers read new events. Add optional fields; don't rename or reuse them.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Grow in order: fix queries, pool, replicas, partitions, shards. Move on only when a measured signal shows up.</li>
+  <li>Data-layer incidents chain through shared resources: a slow query plus an N+1 becomes an empty pool, and the error shows up somewhere else.</li>
+  <li>Plans, query counts per request and <code>DB.Stats()</code> are the three numbers that find most problems.</li>
+  <li>Change schemas with expand/contract and <code>lock_timeout</code>, route reads with version tokens, and keep every schema readable by the previous version of the code.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#connection-pooling">Connection Pooling</a> · <a href="#n-1-queries">N+1 Queries</a> · <a href="#read-replicas">Read Replicas</a> · <a href="#sharding">Sharding</a> · <a href="#database-migrations">Database Migrations</a> · <a href="#real-world-distributed-design">Real-World Distributed Design</a></p>
+`;
+
