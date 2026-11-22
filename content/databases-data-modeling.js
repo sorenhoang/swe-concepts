@@ -1380,3 +1380,371 @@ ok  	example.com/connpool	11.549s</code></pre>
 
 <p><strong>Related:</strong> <a href="#read-replicas">Read Replicas</a> · <a href="#query-optimization">Query Optimization</a> · <a href="#n-1-queries">N+1 Queries</a> · <a href="#timeouts">Timeouts</a> · <a href="#backpressure">Backpressure</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
 `;
+CONTENT["read-replicas"] = `
+<p class="tldr"><strong>TL;DR</strong>: A read replica is a read-only copy of your primary database that you send <code>SELECT</code>s to, so the primary's CPU and I/O are left for writes. It's like a busy shop adding a few cashiers who can only take payments, while one manager handles returns. The catch is that the copies are always a little behind, so right after a user saves something, a replica may still show the old version. Most of the work is deciding which reads may be stale.</p>
+
+<h2>The problem it solves</h2>
+<p>Most applications read far more than they write: product pages, feeds, dashboards, search filters, reports. On a single database, those reads compete with writes for the same cores, memory and disk. When the primary sits at 80% CPU and most of that is <code>SELECT</code>s, you have two options. You can buy a bigger machine, which has a ceiling and a price curve (see <a href="#vertical-scaling">Vertical Scaling</a>). Or you can add copies that serve the reads.</p>
+<p>A read replica is that copy. The primary keeps taking every write and streams its changes to one or more replicas (the mechanics, sync vs async and what is shipped, are covered in <a href="#replication">Replication</a>). Each replica can answer read queries. Five replicas give you roughly five more machines' worth of read capacity, without changing your schema or splitting your data. Replicas also have side jobs: running heavy reports away from production traffic, serving reads in another region, and being promoted if the primary dies.</p>
+
+<h2>How it works</h2>
+<p>Replication itself is the database's job. Routing is <em>yours</em>: something has to decide, for each query, whether it goes to the primary or to a replica. That can be the application (two connection pools, or a small router type like the one in the example), a driver feature, a proxy (ProxySQL for MySQL, Pgpool-II for Postgres), or a managed endpoint. Amazon Aurora, for example, gives a cluster a writer endpoint and a reader endpoint that spreads <em>connections</em> across up to 15 Aurora Replicas.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 320" role="img" aria-label="An app with a router sends writes to the primary, which is at LSN 3, and reads to two replicas. The primary streams WAL asynchronously to both. Replica 1 has replayed up to LSN 2, one change behind. Replica 2 is at LSN 3. The app holds a token LSN 3 from its last write, so a read with that token skips replica 1 and may use replica 2.">
+  <defs><marker id="arr-rrep-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="120" width="170" height="90" rx="8"/>
+  <text x="105" y="145" text-anchor="middle" class="title">App + router</text>
+  <text x="105" y="168" text-anchor="middle" class="small">token from last write:</text>
+  <text x="105" y="190" text-anchor="middle">LSN 3</text>
+
+  <rect class="box accent" x="330" y="30" width="170" height="60" rx="8"/>
+  <text x="415" y="55" text-anchor="middle" class="title">Primary</text>
+  <text x="415" y="75" text-anchor="middle" class="small">all writes · at LSN 3</text>
+
+  <rect class="box bad" x="330" y="230" width="170" height="60" rx="8"/>
+  <text x="415" y="254" text-anchor="middle" class="title">Replica 1</text>
+  <text x="415" y="274" text-anchor="middle" class="small">at LSN 2 · lag 1</text>
+  <rect class="box ok" x="570" y="230" width="180" height="60" rx="8"/>
+  <text x="660" y="254" text-anchor="middle" class="title">Replica 2</text>
+  <text x="660" y="274" text-anchor="middle" class="small">at LSN 3 · lag 0</text>
+
+  <path class="line" d="M190 140 H260 V60 H328" marker-end="url(#arr-rrep-1)"/>
+  <text x="225" y="132" text-anchor="middle" class="small">writes</text>
+  <path class="line" d="M190 190 H260 V260 H328" marker-end="url(#arr-rrep-1)"/>
+  <text x="225" y="182" text-anchor="middle" class="small">reads</text>
+  <path class="line" d="M105 210 V305 H660 V292" marker-end="url(#arr-rrep-1)"/>
+  <text x="535" y="299" text-anchor="middle" class="small">reads</text>
+
+  <path class="line accent dashed" d="M415 90 V228" marker-end="url(#arr-rrep-1)"/>
+  <text x="425" y="160" class="small">WAL, async</text>
+  <path class="line accent dashed" d="M500 60 H660 V228" marker-end="url(#arr-rrep-1)"/>
+  <text x="580" y="52" text-anchor="middle" class="small">WAL, async</text>
+
+  <text x="575" y="130" text-anchor="middle" class="small">read with token LSN 3:</text>
+  <text x="575" y="146" text-anchor="middle" class="small">replica 1 is behind, skip it</text>
+  <text x="575" y="162" text-anchor="middle" class="small">replica 2 qualifies</text>
+</svg>
+<figcaption>Writes have one destination. Reads have several, and each replica sits at its own point in the primary's log. The router's job is to pick one that is healthy and recent enough for this particular read.</figcaption>
+</figure>
+
+<h3>Replication lag, and how to measure it</h3>
+<p>RDS, Aurora, Postgres streaming replication and MySQL replication are asynchronous by default for read replicas: the primary commits, answers the client, and ships the change afterwards. The distance between "committed on the primary" and "visible on the replica" is <strong>replication lag</strong>. It is usually milliseconds. It grows during bulk imports, large <code>UPDATE</code>s or migrations, when the replica's disk or CPU is saturated by its own read load, or when a long query on the replica holds back replay (more on that below).</p>
+<p>Measure it two ways, because they fail differently:</p>
+<pre><code>-- on the PRIMARY: one row per standby  (not executed here)
+SELECT application_name,
+       replay_lag,                         -- an interval
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS bytes_behind
+FROM pg_stat_replication;
+
+-- on a REPLICA
+SELECT pg_last_wal_replay_lsn(),
+       now() - pg_last_xact_replay_timestamp() AS since_last_replayed_commit;</code></pre>
+<ul>
+  <li><strong>Bytes (or log position) behind.</strong> <code>pg_wal_lsn_diff</code> on the primary, against <code>replay_lsn</code> in <code>pg_stat_replication</code>. Zero means caught up, regardless of traffic.</li>
+  <li><strong>Time.</strong> <code>replay_lag</code> in <code>pg_stat_replication</code> (Postgres 10+) is measured from the primary's side. On the replica, <code>now() - pg_last_xact_replay_timestamp()</code> is popular but misleading: it is the age of the <em>last replayed commit</em>, so on an idle primary it keeps growing even when the replica is fully caught up. Check the LSNs before you page someone.</li>
+</ul>
+<p>In MySQL, <code>SHOW REPLICA STATUS</code> reports <code>Seconds_Behind_Source</code>. Managed services export lag as a metric (for example <code>ReplicaLag</code> for RDS and <code>AuroraReplicaLag</code> for Aurora in CloudWatch).</p>
+
+<h3>Read-your-writes: the bug everyone ships once</h3>
+<p>Async lag is harmless for most reads. Nobody notices that a product's review count is 200 ms old. It becomes a bug when the <em>same user</em> who just wrote something reads it back:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 410" role="img" aria-label="Sequence diagram with User, App, Primary and Replica. The user saves the name Annie. The app updates the primary, which commits at LSN 3 and returns OK with the LSN. The user reloads; the app reads from any replica, which is still at LSN 2 and returns the old name Ann. The WAL reaches the replica later. With a token, the app asks the replica whether it has replayed LSN 3; it has not, so the app reads from the primary and gets Annie.">
+  <defs><marker id="arr-rrep-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="40" y="14" width="100" height="30" rx="6"/><text x="90" y="34" text-anchor="middle" class="title">User</text>
+  <rect class="box" x="230" y="14" width="100" height="30" rx="6"/><text x="280" y="34" text-anchor="middle" class="title">App</text>
+  <rect class="box accent" x="430" y="14" width="100" height="30" rx="6"/><text x="480" y="34" text-anchor="middle" class="title">Primary</text>
+  <rect class="box" x="630" y="14" width="100" height="30" rx="6"/><text x="680" y="34" text-anchor="middle" class="title">Replica</text>
+  <path class="line" d="M90 44 V400" style="stroke: var(--line)"/>
+  <path class="line" d="M280 44 V400" style="stroke: var(--line)"/>
+  <path class="line" d="M480 44 V400" style="stroke: var(--line)"/>
+  <path class="line" d="M680 44 V400" style="stroke: var(--line)"/>
+
+  <path class="line" d="M90 72 H278" marker-end="url(#arr-rrep-2)"/><text x="185" y="65" text-anchor="middle" class="small">save name = "Annie"</text>
+  <path class="line" d="M280 97 H478" marker-end="url(#arr-rrep-2)"/><text x="380" y="90" text-anchor="middle" class="small">UPDATE users …</text>
+  <path class="line dashed" d="M480 122 H282" marker-end="url(#arr-rrep-2)"/><text x="380" y="115" text-anchor="middle" class="small">committed at LSN 3</text>
+  <path class="line dashed" d="M280 147 H92" marker-end="url(#arr-rrep-2)"/><text x="185" y="140" text-anchor="middle" class="small">saved</text>
+  <path class="line" d="M90 172 H278" marker-end="url(#arr-rrep-2)"/><text x="185" y="165" text-anchor="middle" class="small">reload profile</text>
+  <path class="line" d="M280 197 H678" marker-end="url(#arr-rrep-2)"/><text x="580" y="190" text-anchor="middle" class="small">SELECT name (any replica)</text>
+  <path class="line bad dashed" d="M680 222 H282" marker-end="url(#arr-rrep-2)"/><text x="580" y="215" text-anchor="middle" class="small">"Ann" (replica still at LSN 2)</text>
+  <path class="line bad dashed" d="M280 247 H92" marker-end="url(#arr-rrep-2)"/><text x="185" y="240" text-anchor="middle" class="small">old name: "did my save fail?"</text>
+  <path class="line accent dashed" d="M480 272 H678" marker-end="url(#arr-rrep-2)"/><text x="580" y="265" text-anchor="middle" class="small">WAL for LSN 3 arrives later</text>
+
+  <text x="390" y="297" text-anchor="middle" class="title">Fix: carry the token</text>
+  <path class="line" d="M280 322 H678" marker-end="url(#arr-rrep-2)"/><text x="580" y="315" text-anchor="middle" class="small">replayed up to LSN 3?</text>
+  <path class="line dashed" d="M680 347 H282" marker-end="url(#arr-rrep-2)"/><text x="580" y="340" text-anchor="middle" class="small">not yet (at LSN 2)</text>
+  <path class="line" d="M280 372 H478" marker-end="url(#arr-rrep-2)"/><text x="380" y="365" text-anchor="middle" class="small">read from primary</text>
+  <path class="line ok dashed" d="M480 396 H282" marker-end="url(#arr-rrep-2)"/><text x="380" y="390" text-anchor="middle" class="small">"Annie"</text>
+</svg>
+<figcaption>The top half is the classic support ticket: "the save button doesn't work". The data was saved; the read just went to a copy that hadn't seen it yet. The bottom half is the token fix that the example implements.</figcaption>
+</figure>
+<p>There is no single fix. Pick per kind of read:</p>
+<table>
+  <tr><th>Strategy</th><th>How it works</th><th>Good</th><th>Cost / limits</th></tr>
+  <tr><td><strong>Primary for a while after a write</strong></td><td>After a user writes, set a flag (cookie, session, cache key) for N seconds; their reads go to the primary until it expires.</td><td>Simple; no database support needed</td><td>N is a guess; a lag spike longer than N still breaks it. Heavy writers put load back on the primary.</td></tr>
+  <tr><td><strong>Version token (LSN / GTID)</strong></td><td>After the write, remember its log position. A read goes to a replica that has replayed at least that far; else wait briefly or use the primary.</td><td>Exact: stale only when it is safe to be</td><td>Token has to travel with the user (session, cookie, header). Needs a cheap way to ask each replica where it is.</td></tr>
+  <tr><td><strong>Critical reads always on the primary</strong></td><td>Checkout, balances, permissions, "edit" forms read from the primary. Everything else from replicas.</td><td>Easy to reason about</td><td>You must classify reads. Grows primary load as more reads become "critical".</td></tr>
+  <tr><td><strong>Sticky replica per session</strong></td><td>Hash the user or session to one replica.</td><td>Gives monotonic reads: time doesn't go backwards between refreshes</td><td>Does <em>not</em> give read-your-writes on its own. Uneven load if sessions are skewed.</td></tr>
+  <tr><td><strong>Wait at commit</strong></td><td>Postgres <code>synchronous_commit = remote_apply</code> with the replica as a synchronous standby: commit returns once the change is visible there.</td><td>Replicas current at commit time</td><td>Every commit pays a round trip; a slow standby slows all writes (see <a href="#replication">Replication</a>).</td></tr>
+  <tr><td><strong>Accept staleness</strong></td><td>Feeds, search results, counts, analytics, other users' data.</td><td>Free</td><td>Only for reads where "a second old" is truly fine.</td></tr>
+</table>
+<p>The token approach maps directly to database features:</p>
+<pre><code>-- read-your-writes with an LSN token in Postgres  (not executed here)
+-- 1. on the primary, right after COMMIT:
+SELECT pg_current_wal_lsn();                       -- e.g. 0/3000148, store it in the session
+
+-- 2. on the replica, before the read:
+SELECT pg_last_wal_replay_lsn() &gt;= '0/3000148'::pg_lsn;   -- true: safe to read here</code></pre>
+<p>MySQL has the same idea with GTIDs: after the write, get the transaction's GTID (the <code>session_track_gtids</code> variable can report it to clients), then run <code>WAIT_FOR_EXECUTED_GTID_SET(gtid_set, timeout)</code> on the replica. It returns 0 once the replica has applied it, and 1 on timeout.</p>
+
+<h3>Health checks and taking replicas out of rotation</h3>
+<p>A router should stop sending reads to a replica that is down <em>or</em> too far behind. A replica 10 minutes behind is technically healthy and answers every query, with data that is 10 minutes old. So the check is two-part: can I connect and run a query (see <a href="#health-checks">Health Checks</a>), and is lag under my threshold? When every replica fails the check, fall back to the primary only if it has headroom. Otherwise, a replica outage becomes a primary overload and then a full outage. Shedding or degrading some reads can be the better choice (see <a href="#backpressure">Backpressure</a>).</p>
+<p>A replica is also your standby: if the primary dies, one is promoted. After a promotion the topology changes, so connections to the old primary must be dropped, and the remaining replicas must follow the new one. That's <a href="#failover">Failover</a>. Setting <code>SetConnMaxLifetime</code> on your pools (see <a href="#connection-pooling">Connection Pooling</a>) means long-lived connections eventually re-resolve DNS endpoints. It also helps a reader endpoint that balances connections, not queries, spread load onto a newly added replica.</p>
+
+<h3>Replica queries can be cancelled</h3>
+<p>A Postgres hot standby must keep replaying the primary's WAL. If replay needs to remove row versions that a long query on the replica still needs (because <code>VACUUM</code> cleaned them up on the primary), or needs a lock the query holds, the two conflict. The standby waits up to <code>max_standby_streaming_delay</code> (default 30 s), then cancels the query. Raising the delay lets lag grow instead. Setting <code>hot_standby_feedback = on</code> tells the primary not to clean up rows the standby still needs, at the price of bloat on the primary. A replica for long analytics queries and a replica for low-lag app reads want opposite settings, so keep them separate.</p>
+
+<h3>When replicas don't help</h3>
+<ul>
+  <li><strong>The load is writes.</strong> Every replica replays every write, so it doesn't reduce write load at all. If the primary is busy with <code>INSERT</code>s and <code>UPDATE</code>s, look at batching, <a href="#partitioning">Partitioning</a> or <a href="#sharding">Sharding</a>.</li>
+  <li><strong>The reads are slow, not numerous.</strong> A query that scans 40 M rows is just as slow on a replica. Fix it first (<a href="#database-indexing">Database Indexing</a>, <a href="#query-optimization">Query Optimization</a>).</li>
+  <li><strong>The same hot rows are read over and over.</strong> A cache in front is cheaper than a database server and usually faster (see <a href="#caching">Caching</a>).</li>
+</ul>
+
+<h2>Example</h2>
+<p><strong>A primary, two replicas and a router, in Go.</strong> To keep lag deterministic, this example simulates replication: each node is an in-memory SQLite database (<code>modernc.org/sqlite</code>), the primary appends every write to a log, and <code>Ship</code> replays log entries on a replica. That's statement-based replication, which real databases avoid for its nondeterminism, but it behaves the same for these statements. The LSN is simply the position in that log. The routing logic is the part that carries over to production.</p>
+<pre><code>package readreplicas
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	_ "modernc.org/sqlite"
+)
+
+// A change in the replication log. LSN = its position in the log.
+type change struct {
+	query string
+	args  []any
+}
+
+// Node is one SQLite database playing primary or replica.
+type Node struct {
+	Name    string
+	DB      *sql.DB
+	applied int64 // LSN this node has replayed up to
+	Down    bool  // set by a health check
+}
+
+var clusters atomic.Int64 // keeps in-memory DB names unique per Router
+
+func open(cluster int64, name string) *Node {
+	dsn := fmt.Sprintf("file:c%d-%s?mode=memory&amp;cache=shared", cluster, name)
+	db, _ := sql.Open("sqlite", dsn)
+	db.SetMaxOpenConns(1)
+	return &amp;Node{Name: name, DB: db}
+}
+
+// Router sends writes to the primary and reads to replicas.
+type Router struct {
+	mu       sync.Mutex
+	primary  *Node
+	replicas []*Node
+	log      []change
+	next     int   // round-robin cursor
+	MaxLag   int64 // replicas further behind than this get no reads
+}
+
+func NewRouter(replicas ...string) *Router {
+	c := clusters.Add(1)
+	r := &amp;Router{primary: open(c, "primary"), MaxLag: 100}
+	for _, name := range replicas {
+		r.replicas = append(r.replicas, open(c, name))
+	}
+	return r
+}
+
+// Write runs on the primary and returns the LSN of the change: the
+// "version token" the caller keeps (in its session or a cookie).
+func (r *Router) Write(ctx context.Context, query string, args ...any) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, err := r.primary.DB.ExecContext(ctx, query, args...); err != nil {
+		return 0, err
+	}
+	r.log = append(r.log, change{query, args})
+	r.primary.applied = int64(len(r.log))
+	return r.primary.applied, nil
+}
+
+// Ship replays up to n pending changes on one replica (async replication;
+// n is how we control lag in the example).
+func (r *Router) Ship(ctx context.Context, name string, n int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, rep := range r.replicas {
+		for rep.Name == name &amp;&amp; n &gt; 0 &amp;&amp; rep.applied &lt; int64(len(r.log)) {
+			c := r.log[rep.applied]
+			rep.DB.ExecContext(ctx, c.query, c.args...)
+			rep.applied++
+			n--
+		}
+	}
+}
+
+// Lag in log entries. Postgres gives the same in bytes:
+// pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn).
+func (r *Router) Lag(name string) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, rep := range r.replicas {
+		if rep.Name == name {
+			return r.primary.applied - rep.applied
+		}
+	}
+	return -1
+}
+
+// pick returns the next healthy replica that has replayed at least minLSN,
+// or the primary if none qualifies.
+func (r *Router) pick(minLSN int64) *Node {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for range r.replicas {
+		rep := r.replicas[r.next%len(r.replicas)]
+		r.next++
+		lag := r.primary.applied - rep.applied
+		if !rep.Down &amp;&amp; lag &lt;= r.MaxLag &amp;&amp; rep.applied &gt;= minLSN {
+			return rep
+		}
+	}
+	return r.primary
+}
+
+// Get reads one row from a replica into dest and says which node served it.
+// minLSN = 0 means "any staleness is fine"; pass the token from Write to
+// get read-your-writes.
+func (r *Router) Get(ctx context.Context, minLSN int64, dest any, query string, args ...any) (string, error) {
+	n := r.pick(minLSN)
+	return n.Name, n.DB.QueryRowContext(ctx, query, args...).Scan(dest)
+}
+
+func (r *Router) SetDown(name string, down bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, rep := range r.replicas {
+		if rep.Name == name {
+			rep.Down = down
+		}
+	}
+}</code></pre>
+<p>The tests are Go <code>Example</code> functions, so <code>go test</code> fails if the printed output differs from the <code>// Output:</code> comment.</p>
+<pre><code>package readreplicas
+
+import (
+	"context"
+	"fmt"
+)
+
+func setup(ctx context.Context) *Router {
+	r := NewRouter("replica-1", "replica-2")
+	r.Write(ctx, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+	r.Write(ctx, "INSERT INTO users VALUES (42, 'Ann')")
+	r.Ship(ctx, "replica-1", 2) // both replicas are fully caught up
+	r.Ship(ctx, "replica-2", 2)
+	return r
+}
+
+func ExampleRouter_staleRead() {
+	ctx := context.Background()
+	r := setup(ctx)
+
+	token, _ := r.Write(ctx, "UPDATE users SET name = 'Annie' WHERE id = 42")
+	fmt.Println("write committed on primary, token LSN =", token)
+	fmt.Println("lag replica-1:", r.Lag("replica-1"), "replica-2:", r.Lag("replica-2"))
+
+	// The page reloads right after the save and reads "any replica".
+	var name string
+	from, _ := r.Get(ctx, 0, &amp;name, "SELECT name FROM users WHERE id = 42")
+	fmt.Printf("read without token -&gt; %s: %q  (stale)&#92;n", from, name)
+
+	// Same read, but carrying the token from the write.
+	from, _ = r.Get(ctx, token, &amp;name, "SELECT name FROM users WHERE id = 42")
+	fmt.Printf("read with token    -&gt; %s: %q&#92;n", from, name)
+
+	r.Ship(ctx, "replica-2", 1) // replica-2 catches up
+	from, _ = r.Get(ctx, token, &amp;name, "SELECT name FROM users WHERE id = 42")
+	fmt.Printf("after replica-2 catches up -&gt; %s: %q&#92;n", from, name)
+	// Output:
+	// write committed on primary, token LSN = 3
+	// lag replica-1: 1 replica-2: 1
+	// read without token -&gt; replica-1: "Ann"  (stale)
+	// read with token    -&gt; primary: "Annie"
+	// after replica-2 catches up -&gt; replica-2: "Annie"
+}
+
+func ExampleRouter_health() {
+	ctx := context.Background()
+	r := setup(ctx)
+	r.MaxLag = 100
+
+	// A bulk import: 150 writes. replica-2 keeps up, replica-1 stalls.
+	for i := range 150 {
+		r.Write(ctx, "INSERT INTO users VALUES (?, ?)", 1000+i, "bulk")
+	}
+	r.Ship(ctx, "replica-2", 150)
+	fmt.Println("lag replica-1:", r.Lag("replica-1"), "replica-2:", r.Lag("replica-2"))
+
+	var n int
+	count := map[string]int{}
+	for range 4 {
+		from, _ := r.Get(ctx, 0, &amp;n, "SELECT count(*) FROM users")
+		count[from]++
+	}
+	fmt.Println("4 reads while replica-1 lags:", count)
+
+	r.SetDown("replica-2", true) // health check fails too
+	from, _ := r.Get(ctx, 0, &amp;n, "SELECT count(*) FROM users")
+	fmt.Println("no healthy replica left, read goes to:", from)
+	// Output:
+	// lag replica-1: 150 replica-2: 0
+	// 4 reads while replica-1 lags: map[replica-2:4]
+	// no healthy replica left, read goes to: primary
+}</code></pre>
+<p>Real output of <code>go test -v</code>:</p>
+<pre><code>=== RUN   ExampleRouter_staleRead
+--- PASS: ExampleRouter_staleRead (0.00s)
+=== RUN   ExampleRouter_health
+--- PASS: ExampleRouter_health (0.00s)
+PASS
+ok  	example.com/readreplicas	0.362s</code></pre>
+<p>In the first example, the write commits on the primary at LSN 3 while both replicas are one entry behind. A read with no token goes to <code>replica-1</code> and returns <code>"Ann"</code>: the stale read from the sequence diagram. The same read with the token finds no replica at LSN 3 and goes to the primary. Once <code>replica-2</code> catches up, token reads go back to a replica. In the second example, a bulk import leaves <code>replica-1</code> 150 entries behind, over the <code>MaxLag</code> of 100, so all four reads skip it. When <code>replica-2</code> is marked down as well, reads fall back to the primary.</p>
+<p>In production, the same router keeps <code>applied</code> fresh by polling each replica's <code>pg_last_wal_replay_lsn()</code> every few hundred milliseconds, and the token is the <code>pg_current_wal_lsn()</code> taken after the write, stored in the user's session. Instead of falling straight back to the primary, it can wait up to a short budget (for example 50 ms) for a replica to catch up.</p>
+
+<p><strong>Real-world scenario.</strong> A marketplace's Postgres primary runs at 75% CPU at peak; about 85% of queries are reads from listing and search pages. The team adds two replicas behind a router and moves listing and search reads there. Primary CPU drops to around 30%. Two days later, support tickets arrive: sellers edit a listing's price, and the edit page shows the old price, so they edit again. Writes and the "edit listing" read now run on different machines, and lag is usually 20–80 ms. The page reloads in about 30 ms. The fix is a token: the handler stores the LSN after the write in the seller's session for 60 s, and reads with that token only use a replica that has replayed it. A month later, a nightly bulk price import pushes one replica 4 minutes behind. The lag check (over 5 s is out of rotation) sends its share to the other replica and the primary, and an alert fires on lag instead of on tickets.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Routing every read to replicas.</strong> Reads right after a write, and reads that decide a write ("is this username taken?", "is the balance enough?"), must see current data. Send them to the primary or use a token. A uniqueness check on a stale replica lets duplicates through.</li>
+  <li><strong>Reading in a transaction that writes.</strong> Once a request has opened a transaction on the primary, all its reads belong in that transaction. Mixing in replica reads mid-transaction gives you data from two different points in time.</li>
+  <li><strong>No lag limit in the router.</strong> A replica that's down gets removed; one that is 10 minutes behind keeps serving wrong answers. Check lag, not just liveness.</li>
+  <li><strong>Trusting <code>now() - pg_last_xact_replay_timestamp()</code> alone.</strong> It reports large "lag" on a quiet primary and pages you at night for nothing. Compare LSNs.</li>
+  <li><strong>Falling back to the primary without limits.</strong> When replicas fail, all reads land on the primary at once. Make sure it can take them, or shed and degrade reads instead.</li>
+  <li><strong>Long reports on the low-lag replica.</strong> They get cancelled by replay conflicts, or, with <code>hot_standby_feedback</code>, cause bloat on the primary. Give analytics its own replica.</li>
+  <li><strong>Adding replicas to fix write load or slow queries.</strong> Replicas copy every write and run the same plans. Index, optimize and cache first.</li>
+</ul>
+
+<div class="callout warn"><strong>A replica is a copy, not a backup.</strong> A bad <code>DELETE</code> or migration reaches every replica within milliseconds. Keep point-in-time backups too (see <a href="#backups">Backups</a>).</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Replicas scale reads, not writes: the primary still takes every write, and every replica replays it.</li>
+  <li>Replication to replicas is usually async, so every replica read may be stale. Decide per read whether that's acceptable.</li>
+  <li>Read-your-writes needs a deliberate fix: primary-after-write, an LSN/GTID token, or routing critical reads to the primary.</li>
+  <li>Measure lag in log position as well as time, and take lagging replicas out of rotation, not just dead ones.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#replication">Replication</a> · <a href="#eventual-consistency">Eventual Consistency</a> · <a href="#connection-pooling">Connection Pooling</a> · <a href="#failover">Failover</a> · <a href="#caching">Caching</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
+`;
