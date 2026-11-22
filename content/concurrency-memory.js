@@ -2229,3 +2229,360 @@ BenchmarkRenderPooled-12    	  176229	      6811 ns/op	       0 B/op	       0 al
 
 <p><strong>Related:</strong> <a href="#memory-leaks">Memory Leaks</a> · <a href="#latency">Latency</a> · <a href="#p99-latency">P99 Latency</a> · <a href="#kubernetes">Kubernetes</a> · <a href="#metrics">Metrics</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
 `;
+CONTENT["real-world-concurrent-service"] = `
+<p class="tldr"><strong>TL;DR</strong>: A service under concurrent load needs a different tool for each kind of shared state. Read-mostly config in memory: an immutable snapshot behind <code>atomic.Pointer</code>. The hot inventory row: let the database do check-and-act in one statement (<code>FOR UPDATE SKIP LOCKED</code>). Rare edits: optimistic version checks. Multi-row writes: lock in one fixed order. Then guard the edges: every goroutine must be able to finish, CI runs <code>-race</code> and <code>goleak</code>, and <code>GOMEMLIMIT</code> matches the container. Think of a concert box office: a printed price list anyone can read, one clerk per seat, and a rule that you always pick up the lower-numbered ticket first.</p>
+
+<h2>The problem it solves</h2>
+<p>The seven pages before this one each describe one tool or one failure. Real incidents rarely come one at a time. A flash sale hits every weak spot at once: thousands of requests for the same row, slow external calls that widen every race window, and timeouts that strand work in the background. This page puts the tools into one service and shows which one goes where.</p>
+<p>The system is a <strong>ticket service</strong> for a flash sale, written in Go on Postgres. One event has 50 seats. At 10:00 the sale opens and 200 buyers click "Buy" in the same second. Each purchase does four things:</p>
+<ol>
+  <li><strong>Authorize</strong> the card with a payment provider (an external call that can hang).</li>
+  <li><strong>Take a seat</strong>: the hot, contended write.</li>
+  <li><strong>Read the price</strong> from an in-memory catalog that a background goroutine refreshes.</li>
+  <li><strong>Capture</strong> the payment (about 100 ms).</li>
+</ol>
+<p>Admins can also edit the event title, and buyers can swap seats with a friend. Every one of these paths touches shared state, and each needs a different answer.</p>
+
+<h2>How it works: the architecture</h2>
+<figure class="diagram">
+<svg viewBox="0 0 780 390" role="img" aria-label="200 buyers call the handler of a Go ticket service. The handler has a 500 ms deadline and a buffered result channel. It reads the event from a catalog held in an atomic.Pointer snapshot that a refresher goroutine replaces, calls a context-aware payments client, and uses a pgx pool of 20 connections. The pool talks to Postgres, where seats are taken with UPDATE and FOR UPDATE SKIP LOCKED, admin edits on events use a version column, and seat swaps lock rows lowest id first. Below, CI runs go test -race and goleak, and the pod sets GOMEMLIMIT to about 90 percent of its memory limit.">
+  <defs><marker id="arr-rwcs-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="58" width="110" height="52" rx="8"/>
+  <text x="75" y="80" text-anchor="middle" class="title">200 buyers</text>
+  <text x="75" y="98" text-anchor="middle" class="small">same second</text>
+  <rect class="box muted" x="150" y="20" width="330" height="270" rx="12"/>
+  <path class="line" d="M130 84 H168" marker-end="url(#arr-rwcs-1)"/>
+  <text x="164" y="40" class="title">Ticket service (Go)</text>
+  <rect class="box accent" x="170" y="56" width="290" height="56" rx="8"/>
+  <text x="315" y="78" text-anchor="middle" class="title">Handler</text>
+  <text x="315" y="98" text-anchor="middle" class="small">500 ms deadline, result chan buffered (1)</text>
+  <path class="line" d="M240 112 V124" marker-end="url(#arr-rwcs-1)"/>
+  <rect class="box ok" x="170" y="126" width="140" height="60" rx="8"/>
+  <text x="240" y="148" text-anchor="middle" class="title">Catalog</text>
+  <text x="240" y="166" text-anchor="middle" class="small">atomic.Pointer</text>
+  <text x="240" y="180" text-anchor="middle" class="small">immutable snapshot</text>
+  <rect class="box" x="320" y="126" width="140" height="60" rx="8"/>
+  <text x="390" y="148" text-anchor="middle" class="title">Refresher</text>
+  <text x="390" y="166" text-anchor="middle" class="small">Store() a new</text>
+  <text x="390" y="180" text-anchor="middle" class="small">*Event each tick</text>
+  <path class="line" d="M320 156 H312" marker-end="url(#arr-rwcs-1)"/>
+  <path class="line" d="M170 104 H160 V225 H168" marker-end="url(#arr-rwcs-1)"/>
+  <rect class="box" x="170" y="200" width="140" height="50" rx="8"/>
+  <text x="240" y="222" text-anchor="middle" class="title">pgx pool</text>
+  <text x="240" y="240" text-anchor="middle" class="small">MaxConns 20</text>
+  <path class="line" d="M460 104 H470 V225 H462" marker-end="url(#arr-rwcs-1)"/>
+  <rect class="box" x="320" y="200" width="140" height="50" rx="8"/>
+  <text x="390" y="222" text-anchor="middle" class="title">Payments</text>
+  <text x="390" y="240" text-anchor="middle" class="small">every call takes ctx</text>
+  <path class="line" d="M240 250 V272 H505 V175 H538" marker-end="url(#arr-rwcs-1)"/>
+  <rect class="box muted" x="540" y="20" width="220" height="270" rx="12"/>
+  <text x="554" y="40" class="title">Postgres</text>
+  <rect class="box bad" x="555" y="52" width="190" height="70" rx="8"/>
+  <text x="650" y="74" text-anchor="middle" class="title">seats (hot path)</text>
+  <text x="650" y="94" text-anchor="middle" class="small">check + act in one UPDATE,</text>
+  <text x="650" y="110" text-anchor="middle" class="small">FOR UPDATE SKIP LOCKED</text>
+  <rect class="box" x="555" y="134" width="190" height="70" rx="8"/>
+  <text x="650" y="156" text-anchor="middle" class="title">events (admin edits)</text>
+  <text x="650" y="176" text-anchor="middle" class="small">WHERE version = $n</text>
+  <text x="650" y="192" text-anchor="middle" class="small">0 rows → conflict, reload</text>
+  <rect class="box" x="555" y="216" width="190" height="62" rx="8"/>
+  <text x="650" y="238" text-anchor="middle" class="title">seat swaps</text>
+  <text x="650" y="258" text-anchor="middle" class="small">FOR UPDATE, lowest id first</text>
+  <rect class="box" x="20" y="312" width="360" height="60" rx="10"/>
+  <text x="200" y="336" text-anchor="middle" class="title">CI</text>
+  <text x="200" y="356" text-anchor="middle" class="small">go test -race ./... · goleak in handler tests</text>
+  <rect class="box" x="400" y="312" width="360" height="60" rx="10"/>
+  <text x="580" y="336" text-anchor="middle" class="title">Pod</text>
+  <text x="580" y="356" text-anchor="middle" class="small">memory limit 512Mi · GOMEMLIMIT=460MiB</text>
+</svg>
+<figcaption>Each kind of shared state gets its own tool. Green is lock-free in-process state, red is the contended row. CI and the pod settings sit outside the code but catch what the code misses.</figcaption>
+</figure>
+
+<p>Each piece has its own page. Here is the job each one does in this service:</p>
+<ol>
+  <li><strong>No check-then-act on stock</strong>: <a href="#race-conditions">Race Conditions</a>. "Read remaining, then write remaining − 1" lets every buyer who read before the first write succeed.</li>
+  <li><strong>The hot row is locked, not guessed</strong>: <a href="#pessimistic-locking">Pessimistic Locking</a>. One statement picks a free seat with <code>FOR UPDATE SKIP LOCKED</code> and assigns it, so buyers spread across seats instead of queueing on one row.</li>
+  <li><strong>Rare edits are checked, not locked</strong>: <a href="#optimistic-locking">Optimistic Locking</a>. Two admins editing the title is rare, so a <code>version</code> column catches the conflict at save time.</li>
+  <li><strong>Multi-row writes lock in one order</strong>: <a href="#deadlocks">Deadlocks</a>. A swap locks the lower seat id first, so two opposite swaps can't wait on each other.</li>
+  <li><strong>In-memory state is published safely</strong>: <a href="#thread-safety">Thread Safety</a>. The catalog is an immutable <code>*Event</code> swapped with <code>atomic.Pointer</code>; readers never lock.</li>
+  <li><strong>Every goroutine can finish</strong>: <a href="#memory-leaks">Memory Leaks</a>. The worker's result channel has room for one value, so it never blocks after the handler has given up.</li>
+  <li><strong>The runtime knows the container's size</strong>: <a href="#garbage-collection">Garbage Collection</a>. <code>GOMEMLIMIT</code> makes the GC work harder near the limit instead of letting the heap grow into an OOM kill.</li>
+</ol>
+
+<h3>Which locking strategy for which path</h3>
+<table>
+  <tr><th>Path</th><th>Contention</th><th>Strategy</th><th>Why not the others</th></tr>
+  <tr><td>Take a seat</td><td>Very high: 200 buyers, 50 rows, same second</td><td>Single <code>UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED)</code></td><td>Optimistic: almost every attempt conflicts, so retries storm. Plain <code>FOR UPDATE</code> on one counter row: every buyer queues on it.</td></tr>
+  <tr><td>Admin edits title or price</td><td>Low; humans take seconds or minutes</td><td>Optimistic: <code>WHERE version = $n</code>, 0 rows → conflict (or ETag + <code>If-Match</code> → 412 over HTTP)</td><td>A lock held while a person types blocks everyone else and can be held forever.</td></tr>
+  <tr><td>Swap two seats</td><td>Low, but touches 2 rows</td><td>Pessimistic, rows locked in id order</td><td>Without a fixed order, opposite swaps deadlock; Postgres then aborts one with 40P01.</td></tr>
+  <tr><td>Catalog in memory</td><td>Read on every request, written every few seconds</td><td><code>atomic.Pointer</code> to an immutable value</td><td>A mutex works but puts a lock on every read; a plain pointer is a data race.</td></tr>
+  <tr><td>Per-key in-memory work (e.g. one cache fill per key)</td><td>Bursty per key</td><td>Per-key mutex or <code>singleflight</code></td><td>One global mutex serializes unrelated keys. Only works inside one process: across replicas use the database or a <a href="#distributed-locks">distributed lock</a>.</td></tr>
+  <tr><td>Retried purchase (double click, client retry)</td><td>Same buyer twice</td><td><a href="#idempotency">Idempotency key</a> with a unique constraint</td><td>An in-process lock doesn't see the other replica.</td></tr>
+</table>
+
+<h2>The incident: oversold, then OOMKilled</h2>
+<p>This is a made-up but typical story, and the Go example below replays its mechanics. The first version of the service read <code>remaining</code> from the <code>events</code> row, called the payment provider, then wrote <code>remaining − 1</code> and inserted a ticket. It ran each purchase in a goroutine and returned "timeout" to the user after 500 ms. Load tests with a few buyers at a time passed.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 360" role="img" aria-label="Incident timeline. 10:00:00 the sale opens with 200 buyers. 10:00:01 every buyer reads remaining greater than zero during the 100 ms payment call. 10:00:02 150 tickets are sold for 50 seats and the counter says 49 left. Also at 10:00:02 card authorization hangs for one in four buyers and their requests time out. From 10:05 goroutines climb by one per timed-out request. Around 11:30 the heap reaches the pod limit and the pod is OOMKilled. The next day the fixes ship.">
+  <text x="20" y="24" class="title">Time</text>
+  <text x="110" y="24" class="title">What happened</text>
+  <text x="545" y="24" class="title">Where you see it</text>
+  <text x="20" y="62">10:00:00</text>
+  <rect class="box accent" x="110" y="40" width="420" height="36" rx="6"/>
+  <text x="320" y="62" text-anchor="middle">Sale opens: 200 buyers in one second</text>
+  <text x="555" y="62" class="small">request rate graph</text>
+  <text x="20" y="104">10:00:01</text>
+  <rect class="box muted" x="110" y="82" width="420" height="36" rx="6"/>
+  <text x="320" y="104" text-anchor="middle">All buyers read remaining = 50 during the payment call</text>
+  <text x="555" y="104" class="small">nothing: no error anywhere</text>
+  <text x="20" y="146">10:00:02</text>
+  <rect class="box bad" x="110" y="124" width="420" height="36" rx="6"/>
+  <text x="320" y="146" text-anchor="middle">150 tickets sold for 50 seats; counter says 49 left</text>
+  <text x="555" y="146" class="small">count(tickets) &gt; capacity</text>
+  <text x="20" y="188">10:00:02</text>
+  <rect class="box bad" x="110" y="166" width="420" height="36" rx="6"/>
+  <text x="320" y="188" text-anchor="middle">Card auth hangs for 1 in 4; those requests time out</text>
+  <text x="555" y="188" class="small">timeout rate, p99 latency</text>
+  <text x="20" y="230">10:05 →</text>
+  <rect class="box bad" x="110" y="208" width="420" height="36" rx="6"/>
+  <text x="320" y="230" text-anchor="middle">One goroutine stuck per timed-out request, forever</text>
+  <text x="555" y="230" class="small">NumGoroutine; pprof: chan send</text>
+  <text x="20" y="272">~11:30</text>
+  <rect class="box bad" x="110" y="250" width="420" height="36" rx="6"/>
+  <text x="320" y="272" text-anchor="middle">Heap reaches the pod limit; GC can't free it; OOMKilled</text>
+  <text x="555" y="272" class="small">restarts, reason OOMKilled</text>
+  <text x="20" y="314">next day</text>
+  <rect class="box ok" x="110" y="292" width="420" height="36" rx="6"/>
+  <text x="320" y="314" text-anchor="middle">SKIP LOCKED seats, buffered chan, atomic snapshot</text>
+  <text x="555" y="314" class="small">50 sold, 0 leaked, -race clean</text>
+  <text x="20" y="348" class="small">The oversell was silent: no error, no alert. It showed up as angry customers at the venue door.</text>
+</svg>
+<figcaption>Two bugs from two different pages, one in the database (check-then-act) and one in the Go code (a blocked send), surfaced about 90 minutes apart. The first was invisible to every metric; the second looked like a memory problem.</figcaption>
+</figure>
+<p>The chain is worth spelling out:</p>
+<ul>
+  <li><strong>The slow call widened the race window.</strong> In a load test with low concurrency, each buyer finished before the next one read the counter. At 200 buyers per second, every buyer read <code>remaining</code> inside the same 100 ms.</li>
+  <li><strong>The write was a lost update too.</strong> Each buyer wrote "what I saw, minus one", so the counter ended at 49 after 150 sales. The table and the counter disagreed, and nothing checked.</li>
+  <li><strong>Timeouts stranded goroutines.</strong> The handler stopped listening after 500 ms, but its worker still tried to send its result on an unbuffered channel. Each one stayed blocked, holding its stack and everything it referenced.</li>
+  <li><strong>GC could not help.</strong> A blocked goroutine is reachable, so nothing it holds is garbage. <code>GOMEMLIMIT</code> only makes the GC try harder near the limit; it can't free live memory, so the pod still died, just later.</li>
+</ul>
+<div class="callout warn"><strong>The race detector did not see the oversell.</strong> <code>go test -race</code> finds unsynchronized access to Go memory in code that actually runs. The oversell happened between rows in Postgres, through properly synchronized connections, so there was no data race to report. Database races need database fixes: a single atomic statement, a row lock, a version check or a unique constraint, plus a test that runs many buyers at once and checks the totals.</div>
+
+<h3>Symptom → concept → tool</h3>
+<table>
+  <tr><th>Symptom</th><th>Likely cause</th><th>How you see it</th><th>Page</th></tr>
+  <tr><td>More sold than in stock; counter disagrees with rows</td><td>Check-then-act, lost update</td><td>Reconcile counts in a test with N concurrent buyers</td><td><a href="#race-conditions">Race Conditions</a></td></tr>
+  <tr><td>Every buyer queues on one row; p99 jumps under load</td><td>One hot row behind <code>FOR UPDATE</code></td><td><code>pg_stat_activity</code> / <code>pg_locks</code>: many waits on one tuple</td><td><a href="#pessimistic-locking">Pessimistic Locking</a></td></tr>
+  <tr><td>"Your changes conflict" errors spike</td><td>Optimistic locking on a hot row</td><td>Conflict and retry counters</td><td><a href="#optimistic-locking">Optimistic Locking</a></td></tr>
+  <tr><td><code>deadlock detected</code> (SQLSTATE 40P01) in logs</td><td>Rows locked in different orders</td><td>Postgres log shows both statements</td><td><a href="#deadlocks">Deadlocks</a></td></tr>
+  <tr><td>Rare wrong values or crashes in memory, e.g. <code>concurrent map writes</code></td><td>Data race</td><td><code>go test -race</code>, a <code>-race</code> build under load</td><td><a href="#thread-safety">Thread Safety</a></td></tr>
+  <tr><td>Goroutine count only goes up</td><td>Goroutines blocked on send/receive with no partner</td><td><code>runtime.NumGoroutine</code>, pprof goroutine profile, <code>goleak</code></td><td><a href="#memory-leaks">Memory Leaks</a></td></tr>
+  <tr><td>RSS climbs until the pod is OOMKilled</td><td>A leak, or a heap that outgrows the container</td><td>pprof heap (<code>inuse_space</code>), <code>GODEBUG=gctrace=1</code></td><td><a href="#memory-leaks">Memory Leaks</a>, <a href="#garbage-collection">Garbage Collection</a></td></tr>
+  <tr><td>GC CPU high, latency up near the memory limit</td><td><code>GOMEMLIMIT</code> too close to the live heap</td><td><code>gctrace</code>: cycles back to back</td><td><a href="#garbage-collection">Garbage Collection</a></td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>The incident and its fixes, in one Go package, against a real Postgres.</strong> It uses <code>pgx/v5</code> and <code>embedded-postgres</code> (PostgreSQL 18.3, started by the test). One <code>Shop</code> type has a <code>Naive</code> switch that turns on the three bugs. The fake payment provider hangs on authorization for every 4th buyer until the request's context ends, and takes 100 ms to capture. The event has 50 seats: a <code>remaining</code> counter on <code>events</code> for the naive path, and 50 rows in <code>seats</code> for the fixed one.</p>
+<p>The shop and the handler. The only difference between the leaky and the safe handler is the channel's buffer:</p>
+<pre><code>// Shop sells the seats of one event. Naive switches on the three bugs from
+// the incident: a racy catalog pointer, check-then-act on a counter, and a
+// goroutine that can't finish after its request times out.
+type Shop struct {
+	EventID int
+	Pool    *pgxpool.Pool
+	Pay     Payments
+	Timeout time.Duration
+	Naive   bool
+
+	plain *Event               // naive catalog: written by Refresh, read by handlers
+	snap  atomic.Pointer[Event] // fixed catalog: readers Load a snapshot, Refresh Stores a new one
+}
+
+// Handle is the core of the HTTP handler: run the purchase in a goroutine
+// and give up when the request deadline passes.
+func (s *Shop) Handle(ctx context.Context, buyer int) string {
+	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
+	defer cancel()
+	done := make(chan string, 1) // FIX: the worker can always send, then exit
+	if s.Naive {
+		done = make(chan string) // BUG: after a timeout nobody receives
+	}
+	go func() {
+		if s.Naive {
+			done &lt;- s.buyNaive(ctx, buyer)
+		} else {
+			done &lt;- s.buy(ctx, buyer)
+		}
+	}()
+	select {
+	case r := &lt;-done:
+		return r
+	case &lt;-ctx.Done():
+		return "timeout"
+	}
+}</code></pre>
+<p>The two purchase paths. The naive one checks, waits on the payment call, then acts. The fixed one checks and acts in one statement, and reads the price from the atomic snapshot (<code>Refresh</code>, not shown, loads the event every tick and either assigns <code>s.plain</code> or calls <code>s.snap.Store</code>):</p>
+<pre><code>func (s *Shop) buyNaive(ctx context.Context, buyer int) string {
+	if err := s.Pay.Authorize(ctx, buyer); err != nil {
+		return "timeout"
+	}
+	var left int
+	err := s.Pool.QueryRow(ctx, &#96;SELECT remaining FROM events WHERE id = $1&#96;, s.EventID).Scan(&amp;left)
+	if err != nil || left == 0 {
+		return "sold out"
+	}
+	// BUG: check-then-act. Every buyer who got here saw left &gt; 0, and the
+	// payment call keeps the window open for 100 ms.
+	ev := s.plain // BUG: data race with Refresh
+	if err := s.Pay.Capture(ctx, buyer, ev.Price); err != nil {
+		return "payment failed"
+	}
+	s.Pool.Exec(ctx, &#96;UPDATE events SET remaining = $1 WHERE id = $2&#96;, left-1, s.EventID)
+	s.Pool.Exec(ctx, &#96;INSERT INTO tickets (event_id, buyer) VALUES ($1, $2)&#96;, s.EventID, buyer)
+	return "sold"
+}
+
+func (s *Shop) buy(ctx context.Context, buyer int) string {
+	if err := s.Pay.Authorize(ctx, buyer); err != nil {
+		return "timeout"
+	}
+	// Check and act in one statement. SKIP LOCKED: each buyer takes a
+	// different free seat instead of queueing on the same row.
+	var seat int
+	err := s.Pool.QueryRow(ctx, &#96;
+		UPDATE seats SET buyer = $1
+		WHERE id = (SELECT id FROM seats
+		            WHERE event_id = $2 AND buyer IS NULL
+		            ORDER BY id LIMIT 1
+		            FOR UPDATE SKIP LOCKED)
+		RETURNING id&#96;, buyer, s.EventID).Scan(&amp;seat)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "sold out"
+	}
+	if err != nil {
+		return "error"
+	}
+	ev := s.snap.Load() // FIX: an immutable snapshot, swapped atomically
+	if err := s.Pay.Capture(ctx, buyer, ev.Price); err != nil {
+		// Give the seat back, even though the request context is done.
+		s.Pool.Exec(context.WithoutCancel(ctx), &#96;UPDATE seats SET buyer = NULL WHERE id = $1&#96;, seat)
+		return "payment failed"
+	}
+	return "sold"
+}</code></pre>
+<p>The two low-contention paths: an optimistic edit and an ordered two-row lock.</p>
+<pre><code>// Rename is an admin edit: rare and low-contention, so optimistic locking.
+func (s *Shop) Rename(ctx context.Context, id, version int, title string) error {
+	tag, err := s.Pool.Exec(ctx, &#96;
+		UPDATE events SET title = $1, version = version + 1
+		WHERE id = $2 AND version = $3&#96;, title, id, version)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict // someone saved first: reload and retry, or show a 412
+	}
+	return nil
+}
+
+// Swap trades the buyers of two seats. Rows are always locked in id order,
+// so Swap(1, 2) and Swap(2, 1) can't each hold one lock and wait for the other.
+func (s *Shop) Swap(ctx context.Context, a, b int) error {
+	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		buyers := map[int]*int{}
+		for _, id := range []int{min(a, b), max(a, b)} {
+			var buyer *int
+			err := tx.QueryRow(ctx, &#96;SELECT buyer FROM seats WHERE id = $1 FOR UPDATE&#96;, id).Scan(&amp;buyer)
+			if err != nil {
+				return err
+			}
+			buyers[id] = buyer
+		}
+		_, err := tx.Exec(ctx, &#96;UPDATE seats SET buyer = CASE id WHEN $1 THEN $3::int ELSE $4::int END
+			WHERE id IN ($1, $2)&#96;, a, b, buyers[b], buyers[a])
+		return err
+	})
+}</code></pre>
+<p>The test sends 200 buyers at once (one goroutine each) while the catalog refreshes every millisecond, then counts results, tickets and goroutines. It records <code>runtime.NumGoroutine</code> and a <code>goleak.IgnoreCurrent()</code> baseline before the sale and compares after it. Then two admins save the same version of the title, and 100 goroutines swap seats 1 and 2, half of them as <code>Swap(1, 2)</code> and half as <code>Swap(2, 1)</code>.</p>
+<p>Real output of <code>go test</code> (the <code>// Output:</code> block is pinned, so the test fails if any line changes; it passed on 10 consecutive runs on a laptop):</p>
+<pre><code>naive: map[sold:150 timeout:50]
+  tickets sold for 50 seats: 150 (events.remaining says 49 left)
+  leaked goroutines: 50, goleak clean: false
+fixed: map[sold:50 sold out:100 timeout:50]
+  tickets sold for 50 seats: 50
+  leaked goroutines: 0, goleak clean: true
+admin A save: &lt;nil&gt;
+admin B save: version conflict
+admin B reloads version 2 and retries: &lt;nil&gt;
+100 swaps: deadlocks 0 other errors 0 seats back where they started: true</code></pre>
+<p>Things to notice:</p>
+<ul>
+  <li><strong>The naive path sold 150 tickets for 50 seats</strong>, and the counter says 49 are left. Every one of the 150 buyers who got past authorization read 50 before anyone wrote. The fixed path sold exactly 50 and told the other 100 "sold out".</li>
+  <li><strong>The 50 timeouts are the same in both runs.</strong> What differs is what happens after: 50 goroutines stay stuck in the naive run and 0 in the fixed one. The leak comes from one line: the channel's buffer.</li>
+  <li><strong>Admin B didn't overwrite admin A.</strong> B's update matched 0 rows, so it got <code>ErrConflict</code>, reloaded version 2 and saved on top of A's change, giving version 3.</li>
+  <li><strong>100 opposite swaps, 0 deadlocks.</strong> When the <code>min</code>/<code>max</code> ordering was removed from <code>Swap</code> for one laptop run, the same test reported 96 deadlocks out of 100 and took about 90 seconds, because Postgres waits <code>deadlock_timeout</code> (1 s by default) before it checks.</li>
+</ul>
+<p>The data race in the catalog is invisible in the normal run. Under <code>go test -race</code> the naive run fails. One laptop run, trimmed:</p>
+<pre><code>$ go test -race ./...
+==================
+WARNING: DATA RACE
+Write at 0x00c000cce030 by goroutine 32:
+  example.com/flashsale.(*Shop).Refresh()
+      …/shop.go:122 +0x29c
+  …
+Previous read at 0x00c000cce030 by goroutine 63:
+  example.com/flashsale.(*Shop).buyNaive()
+      …/shop.go:74 +0x1d8
+  example.com/flashsale.(*Shop).Handle.func1()
+      …/shop.go:50 +0x68
+…
+==================
+--- FAIL: Example (2.02s)
+…
+FAIL	example.com/flashsale	33.015s</code></pre>
+<p>Line 122 is <code>s.plain = ev</code> in <code>Refresh</code>; line 74 is <code>ev := s.plain</code> in <code>buyNaive</code>. That was the only race reported. The detector said nothing about the 150 tickets. <code>TestFixedRaceClean</code>, which runs only the fixed shop, passes under <code>-race</code>. Note the run took 33 s instead of about 9 s: the race detector is slow and memory-hungry (the Go docs say memory may increase 5–10× and run time 2–20× for a typical program), which is why you run it in CI, not in production.</p>
+<p>And this is what <code>goleak.Find</code> reports for the naive handler (from a smaller laptop run with 8 buyers, trimmed). The state <code>chan send</code> and the line number point straight at <code>done &lt;- s.buyNaive(ctx, buyer)</code>:</p>
+<pre><code>found unexpected goroutines:
+[Goroutine 63 in state chan send, with example.com/flashsale.(*Shop).Handle.func1 on top of the stack:
+example.com/flashsale.(*Shop).Handle.func1()
+	…/shop.go:50 +0x48
+created by example.com/flashsale.(*Shop).Handle in goroutine 62
+	…/shop.go:48 +0xfc
+ Goroutine 66 in state chan send, with example.com/flashsale.(*Shop).Handle.func1 on top of the stack:
+…</code></pre>
+<p>The pieces that live outside the Go code:</p>
+<pre><code># CI: every pull request
+go vet ./...
+go test -race -count=1 ./...          # plus goleak.VerifyNone(t) in handler tests
+
+# Kubernetes container spec (excerpt)
+resources:
+  limits:
+    memory: 512Mi
+env:
+  - name: GOMEMLIMIT
+    value: 460MiB                     # about 90% of the limit: room for non-heap memory</code></pre>
+<p>What the example leaves out: HTTP, retries and idempotency keys for repeated clicks, seat holds that expire, and the job that reconciles payments with seats. Each has its own page.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Load tests without concurrency.</strong> A test that sends buyers one after another can't find a race. Send many at once against a small stock, and assert on totals: sold ≤ capacity, counters equal rows.</li>
+  <li><strong>Trusting <code>-race</code> for database races.</strong> It covers Go memory only, and only code paths that ran. Check-then-act across a database needs one atomic statement, a lock, a version check or a constraint.</li>
+  <li><strong>Holding row locks across slow calls.</strong> Locking a seat, then calling the payment provider inside the same transaction, holds the lock and a pool connection for the length of the call. Keep transactions short; if a slow call must sit between steps, record a hold and release it on failure, as <code>buy</code> does.</li>
+  <li><strong>Optimistic locking on the hot row.</strong> With 200 buyers and one counter, nearly every version check fails and the retries add load right when the system is busiest. Use it where conflicts are rare.</li>
+  <li><strong>Cleanup on a dead context.</strong> After a timeout the request's <code>ctx</code> is done, so a "give the seat back" query using it fails at once. Use <code>context.WithoutCancel(ctx)</code> (Go 1.21+) with its own <a href="#timeouts">timeout</a> for compensation work.</li>
+  <li><strong>A goroutine with no way out.</strong> Every <code>go</code> statement needs an answer to "how does this end?": a buffered result channel, a <code>select</code> on <code>ctx.Done()</code>, or a closed input. Run <code>goleak</code> in tests of anything that starts goroutines.</li>
+  <li><strong>Using <code>GOMEMLIMIT</code> as a leak fix.</strong> It makes the GC run more often as the heap nears the limit; the GC guide caps that at roughly 50% of CPU, so a limit that is too low slows the program rather than killing it. It cannot free memory that is still reachable. Set it a bit below the container limit (the guide suggests leaving 5–10% headroom) and still fix leaks.</li>
+  <li><strong>In-process locks in a multi-replica service.</strong> A mutex or <code>singleflight</code> guards one process. With three replicas, three buyers can still pass the same check. Shared state needs a shared guard: the database, or a <a href="#distributed-locks">distributed lock</a>.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Pick the tool by contention: atomic statements and <code>SKIP LOCKED</code> for hot rows, version checks for rare edits, ordered locks for multi-row writes, immutable snapshots for read-mostly memory.</li>
+  <li>Slow external calls widen every race window; never put one between a check and the act that depends on it.</li>
+  <li>Every goroutine needs a guaranteed way to finish, and <code>goleak</code> in tests is the cheap way to prove it.</li>
+  <li><code>-race</code> in CI catches Go data races; concurrent tests that check totals catch database races; <code>GOMEMLIMIT</code> sized to the container buys time but doesn't fix leaks.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#race-conditions">Race Conditions</a> · <a href="#pessimistic-locking">Pessimistic Locking</a> · <a href="#optimistic-locking">Optimistic Locking</a> · <a href="#memory-leaks">Memory Leaks</a> · <a href="#idempotency">Idempotency</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
+`;
