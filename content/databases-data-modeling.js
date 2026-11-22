@@ -1748,3 +1748,359 @@ ok  	example.com/readreplicas	0.362s</code></pre>
 
 <p><strong>Related:</strong> <a href="#replication">Replication</a> · <a href="#eventual-consistency">Eventual Consistency</a> · <a href="#connection-pooling">Connection Pooling</a> · <a href="#failover">Failover</a> · <a href="#caching">Caching</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
 `;
+CONTENT["sharding"] = `
+<p class="tldr"><strong>TL;DR</strong>: Sharding splits one big dataset across several independent database servers. Each server (a <em>shard</em>) holds only some of the rows, chosen by a <strong>shard key</strong> such as <code>customer_id</code>. You get more write throughput and storage than any single machine can give. The price is that every query, transaction and schema change now has to know which shard it is talking to. Think of a library that outgrew its building: it opens four branches and puts authors A–F in branch 1, G–L in branch 2, and so on. Each branch is small and fast, but "every book published in 2019" now means visiting all four.</p>
+
+<h2>The problem it solves</h2>
+<p>Most databases start on one primary server, and that goes a long way. Indexes and query fixes (see <a href="#database-indexing">Database Indexing</a>), a connection pooler and <a href="#read-replicas">Read Replicas</a> push the limit far out. But some limits belong to the single primary itself, and nothing on that list moves them:</p>
+<ul>
+  <li><strong>Write throughput.</strong> Replicas copy every write, so they scale reads, not writes. All inserts and updates still go through one primary's CPU, disk and write-ahead log.</li>
+  <li><strong>Data size.</strong> A multi-terabyte table on one disk means slow backups, hours-long restores, and vacuum or compaction that never catches up.</li>
+  <li><strong>Blast radius.</strong> One primary down means every customer is down. With 8 shards, one shard down hurts about 1/8 of customers.</li>
+</ul>
+<p>Buying a bigger machine (<a href="#vertical-scaling">Vertical Scaling</a>) works until it doesn't: the biggest instance has a ceiling, and the price per core rises steeply near the top. Sharding is <a href="#horizontal-scaling">Horizontal Scaling</a> for the write path. You split the rows so that each shard is an ordinary, small database again.</p>
+
+<div class="callout warn"><strong>Sharding is the last step, not the first.</strong> It adds permanent complexity to every query, migration, backup and on-call shift. Run out of indexes, query fixes, caching, read replicas, partitioning and bigger hardware first. Shard when the <em>write</em> load or the data size of one primary is the real limit, and you can show it with metrics.</div>
+
+<h2>How it works</h2>
+<p>Every sharded system has the same three parts. The <strong>shard key</strong> is a column chosen from each row. A <strong>mapping function</strong> turns a key into a shard. A <strong>router</strong> uses that mapping to send each query to the right place. The router can be a library in your app, a proxy (Vitess's VTGate, MongoDB's <code>mongos</code>) or a coordinator node inside the database (Citus).</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="The order service sends a query for customer 42 to a shard router. The router consults a shard map and forwards the query only to shard 2, one of four independent shards, each with its own primary and replica. A query without the shard key would have to go to all four.">
+  <defs><marker id="arr-shd-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="115" width="130" height="60" rx="8"/>
+  <text x="85" y="140" text-anchor="middle" class="title">Order service</text>
+  <text x="85" y="158" text-anchor="middle" class="small">customer_id = 42</text>
+  <path class="line" d="M150 145 H208" marker-end="url(#arr-shd-1)"/>
+
+  <rect class="box accent" x="210" y="105" width="180" height="80" rx="8"/>
+  <text x="300" y="130" text-anchor="middle" class="title">Shard router</text>
+  <text x="300" y="150" text-anchor="middle" class="small">key = customer_id</text>
+  <text x="300" y="168" text-anchor="middle" class="small">42 maps to shard 2</text>
+  <path class="line dashed" d="M300 185 V228"/>
+  <rect class="box muted" x="220" y="230" width="160" height="50" rx="8"/>
+  <text x="300" y="252" text-anchor="middle">Shard map</text>
+  <text x="300" y="269" text-anchor="middle" class="small">function or lookup table</text>
+
+  <rect class="box" x="500" y="14" width="260" height="56" rx="8"/>
+  <text x="630" y="38" text-anchor="middle" class="title">Shard 0</text>
+  <text x="630" y="56" text-anchor="middle" class="small">primary + replica, ~1/4 of customers</text>
+  <rect class="box" x="500" y="84" width="260" height="56" rx="8"/>
+  <text x="630" y="108" text-anchor="middle" class="title">Shard 1</text>
+  <text x="630" y="126" text-anchor="middle" class="small">primary + replica, ~1/4 of customers</text>
+  <rect class="box ok" x="500" y="154" width="260" height="56" rx="8"/>
+  <text x="630" y="178" text-anchor="middle" class="title">Shard 2</text>
+  <text x="630" y="196" text-anchor="middle" class="small">holds every row of customer 42</text>
+  <rect class="box" x="500" y="224" width="260" height="56" rx="8"/>
+  <text x="630" y="248" text-anchor="middle" class="title">Shard 3</text>
+  <text x="630" y="266" text-anchor="middle" class="small">primary + replica, ~1/4 of customers</text>
+
+  <path class="line dashed" d="M390 130 L498 44" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M390 140 L498 112" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M390 165 L498 250" style="stroke: var(--line)"/>
+  <path class="line ok" d="M390 155 L498 181" marker-end="url(#arr-shd-1)"/>
+  <text x="445" y="92" text-anchor="middle" class="small">no key:</text>
+  <text x="445" y="106" text-anchor="middle" class="small">ask all 4</text>
+</svg>
+<figcaption>A query that carries the shard key goes to one shard. A query without it has to fan out to all of them (dashed) and merge the answers. Each shard is a normal database with its own replicas and backups.</figcaption>
+</figure>
+
+<h3>Mapping strategies</h3>
+<ul>
+  <li><strong>Range.</strong> Each shard owns a contiguous range of keys (customers 1–1M on shard 0, 1M–2M on shard 1). Range scans stay local and a hot range is easy to split. But if the key grows over time (auto-increment IDs, timestamps), <em>every new row lands on the last shard</em>.</li>
+  <li><strong>Hash.</strong> Map <code>hash(key)</code> to a shard. Keys scatter evenly, monotonic IDs included, but range queries on the key hit every shard. The naive form, <code>hash(key) mod N</code>, moves almost every key when <code>N</code> changes.</li>
+  <li><strong>Consistent hashing.</strong> Karger et al. (1997) put shards and keys on the same circle of hash values. A key belongs to the first shard point clockwise from it. A new shard only takes over the arcs just before its points, so about <code>1/N</code> of keys move, all <em>to the new shard</em>. Many points per shard ("virtual nodes") even out the arc sizes.</li>
+  <li><strong>Directory and geo.</strong> A lookup table (<code>tenant 42 → shard 2</code>) lets you move any tenant on its own, at the cost of a lookup on every request. Geo sharding keeps a region's users in that region for latency and data residency.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 345" role="img" aria-label="Two consistent-hash rings. Left: four shards s0 to s3, each with two points on the ring; a key belongs to the next point clockwise, here s2. Right: after adding s4 with two points, only the two arcs just before the s4 points change owner, highlighted; the key now belongs to s4. Everything else stays where it was.">
+  <text x="190" y="24" text-anchor="middle" class="title">4 shards (2 points each)</text>
+  <text x="590" y="24" text-anchor="middle" class="title">Add s4: only 2 arcs move</text>
+  <ellipse class="box muted" cx="190" cy="175" rx="105" ry="105"/>
+  <ellipse class="box " cx="225.9" cy="76.3" rx="6" ry="6"/>
+  <text x="232.8" y="61.5" text-anchor="middle" class="small">s0</text>
+  <ellipse class="box " cx="285.2" cy="130.6" rx="6" ry="6"/>
+  <text x="303.3" y="126.2" text-anchor="middle" class="small">s1</text>
+  <ellipse class="box " cx="288.7" cy="210.9" rx="6" ry="6"/>
+  <text x="307.5" y="221.8" text-anchor="middle" class="small">s2</text>
+  <ellipse class="box " cx="225.9" cy="273.7" rx="6" ry="6"/>
+  <text x="232.8" y="296.5" text-anchor="middle" class="small">s3</text>
+  <ellipse class="box " cx="145.6" cy="270.2" rx="6" ry="6"/>
+  <text x="137.2" y="292.3" text-anchor="middle" class="small">s0</text>
+  <ellipse class="box " cx="91.3" cy="210.9" rx="6" ry="6"/>
+  <text x="72.5" y="221.8" text-anchor="middle" class="small">s1</text>
+  <ellipse class="box " cx="94.8" cy="130.6" rx="6" ry="6"/>
+  <text x="76.7" y="126.2" text-anchor="middle" class="small">s2</text>
+  <ellipse class="box " cx="145.6" cy="79.8" rx="6" ry="6"/>
+  <text x="137.2" y="65.7" text-anchor="middle" class="small">s3</text>
+  <ellipse class="box bad" cx="292.7" cy="153.2" rx="5" ry="5"/>
+  <text x="269.2" y="162.2" text-anchor="middle" class="small">key</text>
+  <ellipse class="box muted" cx="590" cy="175" rx="105" ry="105"/>
+  <path class="line accent" style="stroke-width: 6" d="M685.2 130.6 A105 105 0 0 1 695.0 175.0"/>
+  <path class="line accent" style="stroke-width: 6" d="M545.6 270.2 A105 105 0 0 1 509.6 242.5"/>
+  <ellipse class="box " cx="625.9" cy="76.3" rx="6" ry="6"/>
+  <text x="632.8" y="61.5" text-anchor="middle" class="small">s0</text>
+  <ellipse class="box " cx="685.2" cy="130.6" rx="6" ry="6"/>
+  <text x="703.3" y="126.2" text-anchor="middle" class="small">s1</text>
+  <ellipse class="box " cx="688.7" cy="210.9" rx="6" ry="6"/>
+  <text x="707.5" y="221.8" text-anchor="middle" class="small">s2</text>
+  <ellipse class="box " cx="625.9" cy="273.7" rx="6" ry="6"/>
+  <text x="632.8" y="296.5" text-anchor="middle" class="small">s3</text>
+  <ellipse class="box " cx="545.6" cy="270.2" rx="6" ry="6"/>
+  <text x="537.2" y="292.3" text-anchor="middle" class="small">s0</text>
+  <ellipse class="box " cx="491.3" cy="210.9" rx="6" ry="6"/>
+  <text x="472.5" y="221.8" text-anchor="middle" class="small">s1</text>
+  <ellipse class="box " cx="494.8" cy="130.6" rx="6" ry="6"/>
+  <text x="476.7" y="126.2" text-anchor="middle" class="small">s2</text>
+  <ellipse class="box " cx="545.6" cy="79.8" rx="6" ry="6"/>
+  <text x="537.2" y="65.7" text-anchor="middle" class="small">s3</text>
+  <ellipse class="box accent" cx="695.0" cy="175.0" rx="6" ry="6"/>
+  <text x="715.0" y="179.0" text-anchor="middle" class="small">s4</text>
+  <ellipse class="box accent" cx="509.6" cy="242.5" rx="6" ry="6"/>
+  <text x="494.2" y="259.3" text-anchor="middle" class="small">s4</text>
+  <ellipse class="box bad" cx="692.7" cy="153.2" rx="5" ry="5"/>
+  <text x="669.2" y="162.2" text-anchor="middle" class="small">key</text>
+  <text x="190" y="315" text-anchor="middle" class="small">key's next point clockwise is s2</text>
+  <text x="590" y="315" text-anchor="middle" class="small">the highlighted arcs now belong to s4;</text>
+  <text x="590" y="331" text-anchor="middle" class="small">the key moves from s2 to s4, nothing else changes</text>
+</svg>
+<figcaption>Consistent hashing in one picture. With <code>hash mod N</code>, going from 4 to 5 shards moves about 80% of keys (the Go example below measures 79.7%). On the ring it moves about 1/5 (20.3%), and every moved key goes to the new shard, so old shards only send data, never shuffle among themselves.</figcaption>
+</figure>
+
+<h3>Logical shards: decouple "how many pieces" from "how many servers"</h3>
+<p>Real systems rarely map keys straight to servers. They create many <strong>logical shards</strong> up front and place several on each physical server. Notion, for example, sharded Postgres into 480 logical shards (one Postgres schema each) over 32 physical databases, keyed by workspace ID. Instagram's early design used thousands of logical shards as Postgres schemas on a few machines. Growing then means moving whole logical shards to new servers, with no re-hashing of keys. Vitess does a similar thing with keyspace ID ranges (shards named like <code>-80</code> and <code>80-</code>) that can be split in two. MongoDB splits data into chunks that its balancer moves between shards.</p>
+
+<h3>Choosing the shard key</h3>
+<p>This is the decision that's hardest to undo. A good key has:</p>
+<ul>
+  <li><strong>High cardinality.</strong> Many distinct values. <code>country</code> gives you about 200 buckets and one of them is huge. <code>customer_id</code> gives millions.</li>
+  <li><strong>Even load per value.</strong> Not just even row counts, even <em>traffic</em>. One celebrity account or one enterprise tenant can outweigh thousands of others.</li>
+  <li><strong>Query locality.</strong> Your hottest queries should contain the key, so they hit one shard. For a multi-tenant SaaS that is almost always <code>tenant_id</code>. For a consumer app it is usually <code>user_id</code>. Shard related tables by the <em>same</em> key (orders, order_items and payments all by <code>customer_id</code>) so their joins and transactions stay on one shard. Citus calls this co-location.</li>
+  <li><strong>Stability.</strong> The key value should never change. Changing it means moving the row to another shard.</li>
+</ul>
+
+<h3>What gets harder</h3>
+<ul>
+  <li><strong>Cross-shard queries.</strong> "Top 10 products by sales today" has to ask every shard and merge. It is slower and the slowest shard decides the latency (see <a href="#tail-latency">Tail Latency</a>). Analytics usually moves to a warehouse fed by change data capture instead.</li>
+  <li><strong>Cross-shard transactions.</strong> A transfer between two customers on different shards is no longer one <code>BEGIN … COMMIT</code>. You need two-phase commit or a saga (see <a href="#distributed-transactions">Distributed Transactions</a> and <a href="#saga-pattern">Saga Pattern</a>), or a design that avoids it.</li>
+  <li><strong>Unique IDs.</strong> Each shard's auto-increment starts at 1, so IDs collide. Options: UUIDs (UUIDv7, standardized in RFC 9562, starts with a 48-bit Unix millisecond timestamp so new IDs sort roughly by time and index well), or Snowflake-style 64-bit IDs (Twitter's layout: 41 bits of milliseconds, 10 bits of machine ID, 12 bits of sequence). Instagram's variant puts the logical shard ID inside the ID (41 bits time, 13 bits shard, 10 bits sequence), so the ID itself tells you where the row lives.</li>
+  <li><strong>Unique constraints and foreign keys.</strong> The database can only enforce them within one shard. "Email is unique across all users" needs a separate lookup table or service.</li>
+  <li><strong>Operations times N.</strong> Every migration runs N times and can half-succeed. Backups, monitoring and failover all multiply.</li>
+</ul>
+
+<h3>Strategies compared</h3>
+<table>
+  <tr><th>Strategy</th><th>Key → shard</th><th>Good at</th><th>Bad at</th><th>Seen in</th></tr>
+  <tr><td>Range</td><td>key falls in [lo, hi)</td><td>range scans, splitting a hot range</td><td>monotonic keys: all new writes hit the last shard</td><td>MongoDB ranged sharding, HBase, Bigtable, Spanner splits</td></tr>
+  <tr><td>Hash mod N</td><td><code>hash(key) % N</code></td><td>even spread, trivial to code</td><td>changing N moves ~all keys; range queries fan out</td><td>hand-rolled app sharding</td></tr>
+  <tr><td>Consistent hash</td><td>next point clockwise on a ring</td><td>adding a shard moves ~1/N of keys</td><td>needs virtual nodes to balance; range queries fan out</td><td>Cassandra, Dynamo, Riak, cache clients</td></tr>
+  <tr><td>Hash into fixed slots</td><td>hash into many logical shards, map those to servers</td><td>even spread and cheap rebalancing</td><td>slot count is fixed up front (pick it big)</td><td>Vitess keyspace IDs, Citus shards, Redis Cluster's 16384 slots</td></tr>
+  <tr><td>Directory</td><td>lookup table</td><td>move any tenant, isolate big tenants</td><td>directory is on every request's path</td><td>many multi-tenant SaaS backends</td></tr>
+  <tr><td>Geo</td><td>user's region</td><td>latency, data residency</td><td>users who move; uneven regions</td><td>global consumer apps</td></tr>
+</table>
+
+<h3>Tools that do the routing for you</h3>
+<table>
+  <tr><th>System</th><th>What it shards</th><th>Shard key term</th><th>Notes</th></tr>
+  <tr><td>Vitess</td><td>MySQL</td><td>primary vindex → keyspace ID</td><td>VTGate routes queries; lookup vindexes avoid scatter queries on secondary columns; resharding splits keyspace ID ranges online.</td></tr>
+  <tr><td>Citus</td><td>PostgreSQL (extension)</td><td>distribution column</td><td><code>create_distributed_table</code>; co-located tables join locally; small tables can be reference tables copied to every node.</td></tr>
+  <tr><td>MongoDB</td><td>collections</td><td>shard key (ranged or hashed)</td><td><code>mongos</code> routes; queries without the key are broadcast to all shards. The key can be refined (4.4+) or changed with <code>reshardCollection</code> (5.0+).</td></tr>
+  <tr><td>DynamoDB</td><td>tables, fully managed</td><td>partition key</td><td>Each partition serves at most 3,000 read units and 1,000 write units per second, so one hot key is throttled no matter how much table capacity you buy.</td></tr>
+</table>
+<pre><code>-- Citus (not executed here): shard two tables the same way so joins stay local
+SELECT create_distributed_table('customers', 'customer_id');
+SELECT create_distributed_table('orders', 'customer_id', colocate_with =&gt; 'customers');
+
+-- routed to ONE shard: the shard key is in the WHERE clause
+SELECT * FROM orders WHERE customer_id = 42 AND status = 'open';
+
+-- fans out to EVERY shard and merges: no shard key
+SELECT * FROM orders WHERE created_at &gt; now() - interval '1 hour';</code></pre>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 150" role="img" aria-label="Resharding in five steps: copy existing rows to the new shard, catch up with ongoing writes by double-writing or replaying a change log, verify by comparing rows and dark reads, cut over by flipping the shard map with a short write pause, then clean up by deleting moved rows from the old shard.">
+  <defs><marker id="arr-shd-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="10" y="30" width="134" height="90" rx="8"/>
+  <text x="77" y="55" text-anchor="middle" class="title">1. Copy</text>
+  <text x="77" y="77" text-anchor="middle" class="small">snapshot + backfill</text>
+  <text x="77" y="93" text-anchor="middle" class="small">existing rows to</text>
+  <text x="77" y="109" text-anchor="middle" class="small">the new shard</text>
+  <path class="line" d="M144 75 H164" marker-end="url(#arr-shd-2)"/>
+  <rect class="box" x="166" y="30" width="134" height="90" rx="8"/>
+  <text x="233" y="55" text-anchor="middle" class="title">2. Catch up</text>
+  <text x="233" y="77" text-anchor="middle" class="small">double-write, or</text>
+  <text x="233" y="93" text-anchor="middle" class="small">replay the change</text>
+  <text x="233" y="109" text-anchor="middle" class="small">log since snapshot</text>
+  <path class="line" d="M300 75 H320" marker-end="url(#arr-shd-2)"/>
+  <rect class="box" x="322" y="30" width="134" height="90" rx="8"/>
+  <text x="389" y="55" text-anchor="middle" class="title">3. Verify</text>
+  <text x="389" y="77" text-anchor="middle" class="small">compare row counts</text>
+  <text x="389" y="93" text-anchor="middle" class="small">and checksums;</text>
+  <text x="389" y="109" text-anchor="middle" class="small">dark reads from both</text>
+  <path class="line" d="M456 75 H476" marker-end="url(#arr-shd-2)"/>
+  <rect class="box accent" x="478" y="30" width="134" height="90" rx="8"/>
+  <text x="545" y="55" text-anchor="middle" class="title">4. Cut over</text>
+  <text x="545" y="77" text-anchor="middle" class="small">pause writes briefly,</text>
+  <text x="545" y="93" text-anchor="middle" class="small">drain the lag,</text>
+  <text x="545" y="109" text-anchor="middle" class="small">flip the shard map</text>
+  <path class="line" d="M612 75 H632" marker-end="url(#arr-shd-2)"/>
+  <rect class="box ok" x="634" y="30" width="134" height="90" rx="8"/>
+  <text x="701" y="55" text-anchor="middle" class="title">5. Clean up</text>
+  <text x="701" y="77" text-anchor="middle" class="small">delete moved rows</text>
+  <text x="701" y="93" text-anchor="middle" class="small">from the old shard,</text>
+  <text x="701" y="109" text-anchor="middle" class="small">keep a rollback path</text>
+  <text x="390" y="142" text-anchor="middle" class="small">steps 1 to 3 run while production traffic keeps flowing to the old shard</text>
+</svg>
+<figcaption>Online resharding. Vitess and MongoDB automate this; with hand-rolled sharding you build it yourself. Notion's migration followed this shape: an audit log for double-writes, a backfill of about three days, verification scripts plus dark reads, then a short planned downtime for the final cutover.</figcaption>
+</figure>
+
+<h2>Example</h2>
+<p><strong>Why consistent hashing, measured.</strong> The router below is the core of an app-side sharding layer: a naive <code>hash mod N</code> function and a consistent-hash ring with virtual nodes. It uses only the standard library.</p>
+<pre><code>package sharding
+
+import (
+	"crypto/md5"
+	"encoding/binary"
+	"slices"
+	"strconv"
+)
+
+// hash takes the first 4 bytes of MD5, like the classic ketama ring.
+// Not for security: it just spreads short, similar keys ("s1#7") evenly.
+// xxhash or murmur3 work too. Plain FNV-32 skewed this ring badly in testing.
+func hash(s string) uint32 {
+	sum := md5.Sum([]byte(s))
+	return binary.BigEndian.Uint32(sum[:4])
+}
+
+// ModN is the naive router: hash the key, take it modulo the shard count.
+func ModN(key string, n int) int {
+	return int(hash(key) % uint32(n))
+}
+
+// Ring is a consistent-hash ring. Each shard owns many points ("virtual
+// nodes"); a key belongs to the first point clockwise from its hash.
+type Ring struct {
+	vnodes int
+	points []uint32          // sorted positions on the ring
+	owner  map[uint32]string // position -&gt; shard name
+}
+
+func NewRing(vnodes int, shards ...string) *Ring {
+	r := &amp;Ring{vnodes: vnodes, owner: map[uint32]string{}}
+	for _, s := range shards {
+		r.Add(s)
+	}
+	return r
+}
+
+func (r *Ring) Add(shard string) {
+	for i := 0; i &lt; r.vnodes; i++ {
+		p := hash(shard + "#" + strconv.Itoa(i))
+		r.owner[p] = shard
+		r.points = append(r.points, p)
+	}
+	slices.Sort(r.points)
+}
+
+func (r *Ring) Get(key string) string {
+	h := hash(key)
+	i, _ := slices.BinarySearch(r.points, h) // first point &gt;= h
+	if i == len(r.points) {
+		i = 0 // wrap around the ring
+	}
+	return r.owner[r.points[i]]
+}</code></pre>
+<p>Two <code>Example</code> tests with 100,000 keys. <code>go test</code> fails if the printed output stops matching the <code>// Output:</code> comment, so these numbers are real.</p>
+<pre><code>package sharding
+
+import "fmt"
+
+const keys = 100_000
+
+func Example_reshard() {
+	names := []string{"s0", "s1", "s2", "s3"}
+
+	moved := 0
+	for i := 0; i &lt; keys; i++ {
+		k := fmt.Sprintf("user:%d", i)
+		if ModN(k, 4) != ModN(k, 5) {
+			moved++
+		}
+	}
+	fmt.Printf("hash mod N, 4 -&gt; 5 shards: %5.1f%% of keys move&#92;n", 100*float64(moved)/keys)
+
+	ring := NewRing(200, names...)
+	before := make([]string, keys)
+	for i := range before {
+		before[i] = ring.Get(fmt.Sprintf("user:%d", i))
+	}
+	ring.Add("s4")
+	moved, toNew := 0, 0
+	for i := range before {
+		if now := ring.Get(fmt.Sprintf("user:%d", i)); now != before[i] {
+			moved++
+			if now == "s4" {
+				toNew++
+			}
+		}
+	}
+	fmt.Printf("consistent hash, 4 -&gt; 5:   %5.1f%% of keys move (%d of %d to the new shard)&#92;n",
+		100*float64(moved)/keys, toNew, moved)
+	// Output:
+	// hash mod N, 4 -&gt; 5 shards:  79.7% of keys move
+	// consistent hash, 4 -&gt; 5:    20.3% of keys move (20311 of 20311 to the new shard)
+}
+
+func Example_vnodes() {
+	for _, v := range []int{1, 10, 200} {
+		ring := NewRing(v, "s0", "s1", "s2", "s3")
+		load := map[string]int{}
+		for i := 0; i &lt; keys; i++ {
+			load[ring.Get(fmt.Sprintf("user:%d", i))]++
+		}
+		fmt.Printf("%3d vnodes/shard: s0=%5d s1=%5d s2=%5d s3=%5d&#92;n",
+			v, load["s0"], load["s1"], load["s2"], load["s3"])
+	}
+	// Output:
+	// 1 vnodes/shard: s0=45069 s1= 1774 s2=26711 s3=26446
+	//  10 vnodes/shard: s0=20605 s1=24457 s2=21854 s3=33084
+	// 200 vnodes/shard: s0=23281 s1=25311 s2=26967 s3=24441
+}</code></pre>
+<pre><code>=== RUN   Example_reshard
+--- PASS: Example_reshard (0.07s)
+=== RUN   Example_vnodes
+--- PASS: Example_vnodes (0.06s)
+PASS</code></pre>
+<p>Read it like this:</p>
+<ul>
+  <li><strong>mod N: 79.7% moved.</strong> A key stays only if <code>h mod 4 == h mod 5</code>, which is true for 4 out of every 20 hash values. So 80% of rows would have to be copied between servers just to add one. Nobody can do that online.</li>
+  <li><strong>Ring: 20.3% moved, and all of them to <code>s4</code>.</strong> That is close to the ideal 1/5. The new shard takes a slice from each old one; the old shards never trade rows with each other.</li>
+  <li><strong>Virtual nodes matter.</strong> With 1 point per shard, the arcs are random sizes: one shard got 45,069 keys and another 1,774, a 25× difference. With 200 points per shard, the spread is 23–27k, within about ±8% of the ideal 25,000.</li>
+</ul>
+
+<p><strong>Real-world scenario.</strong> A B2B invoicing SaaS runs on one Postgres primary with 2 read replicas. At 9,000 writes per second at month end, the primary's disk is the bottleneck, and the invoices table is 6 TB, so a restore from backup takes most of a day. Reads are fine; writes and size are not. The team picks <code>tenant_id</code> as the shard key: 98% of queries already filter on it, and invoices, line items and payments all belong to one tenant. They create 256 logical shards (hash of <code>tenant_id</code>) spread over 4 physical primaries, so each primary takes roughly a quarter of the writes, and a restore covers 1.5 TB. Two things bite. First, one tenant is a retailer that generates 12% of all invoices. Its logical shard runs hot, so they move that tenant to a dedicated server through a directory override. Second, a "global search across all tenants" admin page now fans out to 4 servers. It moves to a search index fed by change data capture. Global invoice numbers switch from a sequence to UUIDv7.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Sharding too early.</strong> It is a one-way door. Most apps that think they need it need an index, a cache, a replica or a partitioned table. Get the numbers that prove one primary can't keep up with writes first.</li>
+  <li><strong>A key that doesn't match the queries.</strong> Shard <code>orders</code> by <code>order_id</code> and "show customer 42's orders" becomes a scatter query on every page load. Shard by what your hot paths filter on.</li>
+  <li><strong>Monotonic key with range sharding.</strong> Timestamps and auto-increment IDs send every insert to the last shard. Hash them, or prefix them with something well spread.</li>
+  <li><strong>Hot keys.</strong> Even hashing doesn't help when one key gets 10% of the traffic. Give big tenants their own shard (directory), or split a hot key with a suffix (<code>key#0..key#9</code>) and merge on read; DynamoDB's docs call this write sharding.</li>
+  <li><strong><code>hash mod N</code> in production.</strong> It works until you add a shard, then nearly everything moves. Use a ring or a fixed set of logical shards from day one.</li>
+  <li><strong>Too few logical shards.</strong> You can't split finer than the slot count you started with without re-hashing. Pick many (hundreds to thousands) and pack them onto a few servers.</li>
+  <li><strong>Assuming cross-shard work is rare.</strong> Reports, admin screens, uniqueness checks and transfers appear in every product. Plan where each lives: fan-out, a separate store, a saga.</li>
+  <li><strong>Resharding without a rollback path.</strong> Keep the old shard's data and a way to flip the map back until the new layout has run clean for a while.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Sharding spreads <em>writes and data</em> over independent servers. It is the only fix when one primary can't take the write load, and it is costly forever.</li>
+  <li>The shard key decides everything: pick high cardinality, even traffic, and the column your hot queries already filter on. Co-locate related tables on it.</li>
+  <li>Never use <code>hash mod N</code> directly. Use consistent hashing with virtual nodes, or many logical shards mapped onto few servers, so adding capacity moves ~1/N of data.</li>
+  <li>Cross-shard queries, transactions, unique constraints and IDs all need a new design. Decide on them before you split.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#partitioning">Partitioning</a> · <a href="#read-replicas">Read Replicas</a> · <a href="#distributed-transactions">Distributed Transactions</a> · <a href="#saga-pattern">Saga Pattern</a> · <a href="#horizontal-scaling">Horizontal Scaling</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
+`;
+
