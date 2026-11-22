@@ -2104,3 +2104,354 @@ PASS</code></pre>
 <p><strong>Related:</strong> <a href="#partitioning">Partitioning</a> · <a href="#read-replicas">Read Replicas</a> · <a href="#distributed-transactions">Distributed Transactions</a> · <a href="#saga-pattern">Saga Pattern</a> · <a href="#horizontal-scaling">Horizontal Scaling</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
 `;
 
+CONTENT["partitioning"] = `
+<p class="tldr"><strong>TL;DR</strong>: Partitioning splits one large table into smaller physical pieces <em>inside the same database</em>, by a partition key such as a month. Queries that filter on the key only touch the pieces they need, and deleting old data becomes dropping a piece instead of deleting billions of rows. It is like a filing cabinet with one drawer per month: you only open March's drawer to find a March invoice, and when last year's records expire you throw the whole drawer out.</p>
+
+<h2>The problem it solves</h2>
+<p>Some tables only grow: events, audit logs, orders, metrics, chat messages. At hundreds of millions of rows, three things start to hurt, even with good indexes:</p>
+<ul>
+  <li><strong>Deleting old data.</strong> "Keep 12 months" means a nightly <code>DELETE … WHERE created_at &lt; now() - interval '12 months'</code>. That touches every expired row, writes WAL for each one, leaves dead rows for vacuum to clean, and can run for hours while it fights live traffic.</li>
+  <li><strong>Big, cold indexes.</strong> Most queries ask about the last few days, but the B-tree covers years of data. Index and table pages for old data crowd hot pages out of memory.</li>
+  <li><strong>Maintenance on one giant object.</strong> <code>VACUUM</code>, <code>ANALYZE</code>, reindexing and backups all have to process the whole table at once.</li>
+</ul>
+<p>Partitioning cuts the table into pieces along the key you query and expire by. The application still sees one table called <code>order_events</code>. Under it, each month is its own table with its own indexes. This all happens on one server, which is the key difference from <a href="#sharding">Sharding</a>.</p>
+
+<h2>How it works</h2>
+<p>In PostgreSQL's declarative partitioning (version 10 and later), you create a <strong>partitioned table</strong> that holds no rows itself, then attach <strong>partitions</strong> to it, each with a bound. Every <code>INSERT</code> is routed to the partition whose bound contains the row's key. Every query is checked against the bounds: partitions that can't contain matching rows are skipped. That is <strong>partition pruning</strong>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="The partitioned table order_events holds no data itself. An INSERT for 14 May is routed to the May partition. A query for March is pruned to the March partition only; January, February, April, May and June are skipped.">
+  <defs><marker id="arr-part-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="20" width="230" height="56" rx="8"/>
+  <text x="135" y="43" text-anchor="middle" class="small">SELECT count(*) WHERE created_at</text>
+  <text x="135" y="61" text-anchor="middle" class="small">&gt;= '2026-03-01' AND &lt; '2026-04-01'</text>
+  <rect class="box" x="530" y="20" width="230" height="56" rx="8"/>
+  <text x="645" y="43" text-anchor="middle" class="small">INSERT ... created_at =</text>
+  <text x="645" y="61" text-anchor="middle" class="small">'2026-05-14 09:30'</text>
+
+  <rect class="box accent" x="240" y="110" width="300" height="56" rx="8"/>
+  <text x="390" y="134" text-anchor="middle" class="title">order_events (partitioned table)</text>
+  <text x="390" y="152" text-anchor="middle" class="small">no rows of its own; PARTITION BY RANGE (created_at)</text>
+  <path class="line" d="M135 76 L300 108" marker-end="url(#arr-part-1)"/>
+  <path class="line" d="M645 76 L480 108" marker-end="url(#arr-part-1)"/>
+
+  <rect class="box muted" x="20" y="200" width="110" height="50" rx="8"/>
+  <text x="75" y="222" text-anchor="middle">2026_01</text><text x="75" y="239" text-anchor="middle" class="small">pruned</text>
+  <rect class="box muted" x="146" y="200" width="110" height="50" rx="8"/>
+  <text x="201" y="222" text-anchor="middle">2026_02</text><text x="201" y="239" text-anchor="middle" class="small">pruned</text>
+  <rect class="box ok" x="272" y="200" width="110" height="50" rx="8"/>
+  <text x="327" y="222" text-anchor="middle" class="title">2026_03</text><text x="327" y="239" text-anchor="middle" class="small">scanned</text>
+  <rect class="box muted" x="398" y="200" width="110" height="50" rx="8"/>
+  <text x="453" y="222" text-anchor="middle">2026_04</text><text x="453" y="239" text-anchor="middle" class="small">pruned</text>
+  <rect class="box accent" x="524" y="200" width="110" height="50" rx="8"/>
+  <text x="579" y="222" text-anchor="middle" class="title">2026_05</text><text x="579" y="239" text-anchor="middle" class="small">row stored here</text>
+  <rect class="box muted" x="650" y="200" width="110" height="50" rx="8"/>
+  <text x="705" y="222" text-anchor="middle">2026_06</text><text x="705" y="239" text-anchor="middle" class="small">pruned</text>
+  <path class="line ok" d="M350 166 L327 198" marker-end="url(#arr-part-1)"/>
+  <path class="line accent" d="M450 166 L570 198" marker-end="url(#arr-part-1)"/>
+  <text x="390" y="278" text-anchor="middle" class="small">each partition is a real table with its own indexes, files and statistics</text>
+</svg>
+<figcaption>Routing and pruning. Writes go to the one partition whose range contains the key. A query that filters on the key reads only the matching partitions. A query that doesn't filter on the key still has to visit all of them.</figcaption>
+</figure>
+
+<h3>Three ways to split</h3>
+<ul>
+  <li><strong>RANGE</strong>: each partition covers <code>[from, to)</code>, lower bound included, upper excluded. Time is the classic key: one partition per day, week or month.</li>
+  <li><strong>LIST</strong>: each partition lists its key values, such as regions or tenants on different plans.</li>
+  <li><strong>HASH</strong> (PostgreSQL 11+): rows go to <code>hash(key) mod MODULUS</code>. Use it to split a huge table into evenly sized pieces when no natural range exists. You lose the easy retention story, since every partition holds data of all ages.</li>
+</ul>
+<p>A <strong>DEFAULT</strong> partition (also 11+) catches rows that match no other partition. Without one, an insert outside every bound fails, as the example below shows. Partitions can also be partitioned again (say by month, then by region), but every level adds planning work.</p>
+<pre><code>-- not executed here; the Go example below runs the same shapes for real
+CREATE TABLE order_events (
+    order_id   bigint      NOT NULL,
+    created_at timestamptz NOT NULL,
+    kind       text        NOT NULL,
+    PRIMARY KEY (order_id, created_at)        -- must contain created_at
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE order_events_2026_03 PARTITION OF order_events
+    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');   -- upper bound excluded
+
+CREATE INDEX ON order_events (kind);          -- created on every partition
+
+-- LIST: one partition per discrete value
+CREATE TABLE accounts (id bigint, region text, ...) PARTITION BY LIST (region);
+CREATE TABLE accounts_eu PARTITION OF accounts FOR VALUES IN ('eu-west', 'eu-central');
+CREATE TABLE accounts_other PARTITION OF accounts DEFAULT;  -- catches the rest
+
+-- HASH: N even buckets when there is no natural range
+CREATE TABLE carts_p0 PARTITION OF carts FOR VALUES WITH (MODULUS 4, REMAINDER 0);</code></pre>
+
+<h3>The rules that surprise people</h3>
+<ul>
+  <li><strong>Primary keys and unique constraints must include the partition key.</strong> Each partition enforces uniqueness only within itself, so PostgreSQL requires the constraint's columns to contain every partition key column. <code>PRIMARY KEY (order_id)</code> is rejected on a table partitioned by <code>created_at</code>; <code>(order_id, created_at)</code> works. There is no global index spanning partitions. MySQL has the same rule: every unique key must use every column in the partitioning expression.</li>
+  <li><strong>Indexes are per partition.</strong> An index created on the parent is created on each partition, including ones attached later. Each is smaller than one giant index, which helps vacuum and cache.</li>
+  <li><strong>Pruning needs the key in the query.</strong> <code>WHERE created_at &gt;= $1</code> prunes. <code>WHERE order_id = 42</code> visits every partition: six index lookups instead of one. Pruning also works at execution time, for values only known then (bind parameters, subquery results). <code>EXPLAIN ANALYZE</code> then reports <code>Subplans Removed</code>.</li>
+  <li><strong>More partitions isn't free.</strong> PostgreSQL's docs say the planner handles up to a few thousand partitions fairly well <em>if</em> typical queries prune all but a few. Planning time and memory grow with the partitions left after pruning, and each session loads metadata for every partition it touches. Daily partitions for ten years is 3,650 tables. Monthly is 120.</li>
+</ul>
+
+<h3>Retention: drop a partition instead of deleting rows</h3>
+<p>This is the biggest win for time-series tables. Removing a month is a metadata change: <code>DETACH PARTITION</code> removes it from the parent, and <code>DROP TABLE</code> deletes its files. There's no per-row work, no WAL per row, and no dead rows to vacuum. PostgreSQL's docs call it "far faster than a bulk operation". Plain <code>DETACH</code> takes an <code>ACCESS EXCLUSIVE</code> lock on the parent. It is brief, but it waits behind long queries and blocks everything queued after it, so set a <code>lock_timeout</code> (see <a href="#database-migrations">Database Migrations</a>). <code>DETACH … CONCURRENTLY</code> (PostgreSQL 14+) needs only <code>SHARE UPDATE EXCLUSIVE</code>, but it can't run inside a transaction block or when the parent has a default partition.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 170" role="img" aria-label="A sliding window of monthly partitions on a timeline. January is detached and dropped. February to June are live, with June receiving current writes. July is created ahead of time so inserts at midnight on July 1 have somewhere to go. A monthly cron job does both steps.">
+  <defs><marker id="arr-part-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <path class="line" d="M20 110 H760" marker-end="url(#arr-part-2)"/>
+  <text x="745" y="132" text-anchor="end" class="small">time</text>
+  <rect class="box bad" x="25" y="50" width="90" height="44" rx="6"/>
+  <text x="70" y="70" text-anchor="middle">Jan</text><text x="70" y="86" text-anchor="middle" class="small">DROP</text>
+  <rect class="box" x="125" y="50" width="90" height="44" rx="6"/><text x="170" y="77" text-anchor="middle">Feb</text>
+  <rect class="box" x="225" y="50" width="90" height="44" rx="6"/><text x="270" y="77" text-anchor="middle">Mar</text>
+  <rect class="box" x="325" y="50" width="90" height="44" rx="6"/><text x="370" y="77" text-anchor="middle">Apr</text>
+  <rect class="box" x="425" y="50" width="90" height="44" rx="6"/><text x="470" y="77" text-anchor="middle">May</text>
+  <rect class="box ok" x="525" y="50" width="90" height="44" rx="6"/>
+  <text x="570" y="70" text-anchor="middle">Jun</text><text x="570" y="86" text-anchor="middle" class="small">writes now</text>
+  <rect class="box accent" x="625" y="50" width="90" height="44" rx="6"/>
+  <text x="670" y="70" text-anchor="middle">Jul</text><text x="670" y="86" text-anchor="middle" class="small">pre-created</text>
+  <path class="line dashed" d="M125 40 H615" style="stroke: var(--line)"/>
+  <text x="370" y="30" text-anchor="middle" class="small">retention window: older data is queryable, read-mostly</text>
+  <text x="70" y="140" text-anchor="middle" class="small">detach + drop</text>
+  <text x="670" y="140" text-anchor="middle" class="small">create ahead</text>
+  <text x="390" y="160" text-anchor="middle" class="small">one scheduled job does both ends, once a month</text>
+</svg>
+<figcaption>A sliding window. Create next month's partition well before it starts (an insert with no matching partition fails), and drop the oldest one when it leaves the retention window. Tools like the <code>pg_partman</code> extension, or a small <a href="#cron-jobs">cron job</a>, automate both.</figcaption>
+</figure>
+<pre><code>-- monthly cron (not executed here): create ahead, drop behind
+CREATE TABLE IF NOT EXISTS order_events_2026_08 PARTITION OF order_events
+    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+
+ALTER TABLE order_events DETACH PARTITION order_events_2026_01 CONCURRENTLY;
+-- archive it first if you must keep it (pg_dump, COPY to object storage), then:
+DROP TABLE order_events_2026_01;</code></pre>
+
+<h3>Partitioning vs sharding vs vertical partitioning</h3>
+<p>The words get mixed up, so here are the three meanings side by side.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 230" role="img" aria-label="Three ways to split data. Vertical partitioning splits columns: a users table becomes users with hot columns and user_profiles with a large blob, both on one server. Horizontal partitioning splits rows into monthly partitions on one server. Sharding splits rows across separate servers, each with its own database.">
+  <text x="130" y="22" text-anchor="middle" class="title">Vertical partitioning</text>
+  <text x="390" y="22" text-anchor="middle" class="title">Horizontal partitioning</text>
+  <text x="650" y="22" text-anchor="middle" class="title">Sharding</text>
+  <path class="line dashed" d="M260 10 V225" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M520 10 V225" style="stroke: var(--line)"/>
+
+  <rect class="box muted" x="20" y="40" width="220" height="140" rx="8"/>
+  <text x="130" y="58" text-anchor="middle" class="small">one server</text>
+  <rect class="box" x="35" y="70" width="90" height="96" rx="6"/>
+  <text x="80" y="92" text-anchor="middle">users</text>
+  <text x="80" y="112" text-anchor="middle" class="small">id, email,</text>
+  <text x="80" y="127" text-anchor="middle" class="small">name, plan</text>
+  <rect class="box accent" x="135" y="70" width="90" height="96" rx="6"/>
+  <text x="180" y="92" text-anchor="middle">profiles</text>
+  <text x="180" y="112" text-anchor="middle" class="small">user_id,</text>
+  <text x="180" y="127" text-anchor="middle" class="small">bio, avatar</text>
+  <text x="130" y="200" text-anchor="middle" class="small">split by columns</text>
+  <text x="130" y="216" text-anchor="middle" class="small">(hot vs wide or rarely read)</text>
+
+  <rect class="box muted" x="280" y="40" width="220" height="140" rx="8"/>
+  <text x="390" y="58" text-anchor="middle" class="small">one server, one table name</text>
+  <rect class="box" x="295" y="70" width="190" height="26" rx="5"/><text x="390" y="88" text-anchor="middle" class="small">order_events_2026_04</text>
+  <rect class="box" x="295" y="102" width="190" height="26" rx="5"/><text x="390" y="120" text-anchor="middle" class="small">order_events_2026_05</text>
+  <rect class="box ok" x="295" y="134" width="190" height="26" rx="5"/><text x="390" y="152" text-anchor="middle" class="small">order_events_2026_06</text>
+  <text x="390" y="200" text-anchor="middle" class="small">split by rows; this page</text>
+  <text x="390" y="216" text-anchor="middle" class="small">(same CPU, disk, WAL)</text>
+
+  <rect class="box" x="540" y="40" width="100" height="62" rx="8"/>
+  <text x="590" y="64" text-anchor="middle">server A</text><text x="590" y="84" text-anchor="middle" class="small">customers 0..</text>
+  <rect class="box" x="660" y="40" width="100" height="62" rx="8"/>
+  <text x="710" y="64" text-anchor="middle">server B</text><text x="710" y="84" text-anchor="middle" class="small">customers ..</text>
+  <rect class="box" x="540" y="118" width="100" height="62" rx="8"/>
+  <text x="590" y="142" text-anchor="middle">server C</text><text x="590" y="162" text-anchor="middle" class="small">customers ..</text>
+  <rect class="box" x="660" y="118" width="100" height="62" rx="8"/>
+  <text x="710" y="142" text-anchor="middle">server D</text><text x="710" y="162" text-anchor="middle" class="small">customers ..</text>
+  <text x="650" y="200" text-anchor="middle" class="small">split by rows across servers</text>
+  <text x="650" y="216" text-anchor="middle" class="small">(more CPU, disk, WAL)</text>
+</svg>
+<figcaption>Partitioning makes one table easier to manage and query, but every partition still shares one machine's CPU, disk and write-ahead log. Only <a href="#sharding">sharding</a> adds write capacity. The two combine: Citus shards can be partitioned by time.</figcaption>
+</figure>
+
+<table>
+  <tr><th>Type</th><th>Bound</th><th>Typical key</th><th>Best for</th><th>Watch out for</th></tr>
+  <tr><td>RANGE</td><td><code>FROM (a) TO (b)</code>, b excluded</td><td><code>created_at</code>, date, sequential ID</td><td>time-series, logs, events; drop-a-month retention; queries on recent data</td><td>must create future partitions ahead; the newest partition takes all writes</td></tr>
+  <tr><td>LIST</td><td><code>IN ('eu', 'us')</code></td><td>region, tenant tier, status</td><td>known small sets of values; moving one value's data to other storage</td><td>new values need a partition or a DEFAULT; uneven sizes</td></tr>
+  <tr><td>HASH</td><td><code>WITH (MODULUS 4, REMAINDER 0)</code></td><td><code>customer_id</code>, UUID</td><td>splitting a huge table evenly when there is no natural range</td><td>no time-based retention; changing the modulus means rewriting data</td></tr>
+  <tr><td>DEFAULT</td><td>everything else</td><td>any</td><td>safety net for unexpected keys</td><td>adding a partition must scan it for rows that belong to the new one</td></tr>
+  <tr><td>Vertical (manual)</td><td>column sets in separate tables</td><td>primary key in both</td><td>wide rows, rarely read blobs, separating hot columns</td><td>joins to reassemble a row; not a database feature, just schema design</td></tr>
+</table>
+
+<h2>Example</h2>
+<p><strong>Monthly partitions on a real PostgreSQL.</strong> The test starts an embedded PostgreSQL 18 server with <code>fergusstrange/embedded-postgres</code> (port 15443), connects with <code>pgx</code>, and loads 521,280 order events across January–June 2026, one every 30 seconds. A small <code>TestMain</code> starts and stops the server and isn't shown. Each <code>Example</code> prints real query plans and errors, and <code>go test</code> fails if they stop matching the <code>// Output:</code> block.</p>
+<pre><code>package partitioning
+
+import (
+	"fmt"
+	"strings"
+)
+
+// setup creates order_events, one partition per month (Jan..Jun 2026),
+// and loads one event every 30 seconds: about 86k-89k rows per month.
+func setup() error {
+	_, err := conn.Exec(ctx, &#96;
+		CREATE TABLE order_events (
+			order_id   bigint      NOT NULL,
+			created_at timestamptz NOT NULL,
+			kind       text        NOT NULL,
+			PRIMARY KEY (order_id, created_at)  -- must include the partition key
+		) PARTITION BY RANGE (created_at)&#96;)
+	if err != nil {
+		return err
+	}
+	for m := 1; m &lt;= 6; m++ {
+		_, err = conn.Exec(ctx, fmt.Sprintf(&#96;
+			CREATE TABLE order_events_2026_%02d PARTITION OF order_events
+			FOR VALUES FROM ('2026-%02d-01') TO ('2026-%02d-01')&#96;, m, m, m+1))
+		if err != nil {
+			return err
+		}
+	}
+	_, err = conn.Exec(ctx, &#96;
+		INSERT INTO order_events
+		SELECT n, '2026-01-01'::timestamptz + n * interval '30 seconds', 'paid'
+		FROM generate_series(0, 521279) AS n;  -- up to 2026-06-30 23:59:30
+		ANALYZE order_events&#96;)
+	return err
+}
+
+// explain prints a plan without costs, so the output is stable.
+func explain(query string) {
+	rows, _ := conn.Query(ctx, "EXPLAIN (COSTS OFF) "+query)
+	for rows.Next() {
+		var line string
+		rows.Scan(&amp;line)
+		fmt.Println(line)
+	}
+}
+
+func Example_pruning() {
+	fmt.Println("-- filter on the partition key: one partition scanned")
+	explain(&#96;SELECT count(*) FROM order_events
+	         WHERE created_at &gt;= '2026-03-01' AND created_at &lt; '2026-04-01'&#96;)
+	fmt.Println("-- no partition key in WHERE: every partition scanned")
+	explain(&#96;SELECT * FROM order_events WHERE order_id = 42&#96;)
+	// Output:
+	// -- filter on the partition key: one partition scanned
+	// Aggregate
+	//   -&gt;  Seq Scan on order_events_2026_03 order_events
+	//         Filter: ((created_at &gt;= '2026-03-01 00:00:00+00'::timestamp with time zone) AND (created_at &lt; '2026-04-01 00:00:00+00'::timestamp with time zone))
+	// -- no partition key in WHERE: every partition scanned
+	// Append
+	//   -&gt;  Index Scan using order_events_2026_01_pkey on order_events_2026_01 order_events_1
+	//         Index Cond: (order_id = 42)
+	//   -&gt;  Index Scan using order_events_2026_02_pkey on order_events_2026_02 order_events_2
+	//         Index Cond: (order_id = 42)
+	//   -&gt;  Index Scan using order_events_2026_03_pkey on order_events_2026_03 order_events_3
+	//         Index Cond: (order_id = 42)
+	//   -&gt;  Index Scan using order_events_2026_04_pkey on order_events_2026_04 order_events_4
+	//         Index Cond: (order_id = 42)
+	//   -&gt;  Index Scan using order_events_2026_05_pkey on order_events_2026_05 order_events_5
+	//         Index Cond: (order_id = 42)
+	//   -&gt;  Index Scan using order_events_2026_06_pkey on order_events_2026_06 order_events_6
+	//         Index Cond: (order_id = 42)
+}
+
+func Example_rules() {
+	_, err := conn.Exec(ctx, &#96;
+		CREATE TABLE bad (id bigint PRIMARY KEY, created_at timestamptz NOT NULL)
+		PARTITION BY RANGE (created_at)&#96;)
+	fmt.Println("PK without partition key:", err)
+
+	_, err = conn.Exec(ctx, &#96;INSERT INTO order_events VALUES (1, '2026-07-02', 'paid')&#96;)
+	fmt.Println("row for July:", err)
+	// Output:
+	// PK without partition key: ERROR: unique constraint on partitioned table must include all partitioning columns (SQLSTATE 0A000)
+	// row for July: ERROR: no partition of relation "order_events" found for row (SQLSTATE 23514)
+}
+
+func Example_hash() {
+	conn.Exec(ctx, &#96;CREATE TABLE carts (customer_id bigint, items int) PARTITION BY HASH (customer_id)&#96;)
+	for r := 0; r &lt; 4; r++ {
+		conn.Exec(ctx, fmt.Sprintf(&#96;CREATE TABLE carts_p%d PARTITION OF carts
+			FOR VALUES WITH (MODULUS 4, REMAINDER %d)&#96;, r, r))
+	}
+	conn.Exec(ctx, &#96;INSERT INTO carts SELECT n, 1 FROM generate_series(1, 10000) n&#96;)
+	rows, _ := conn.Query(ctx, &#96;SELECT tableoid::regclass::text, count(*) FROM carts GROUP BY 1 ORDER BY 1&#96;)
+	for rows.Next() {
+		var p string
+		var n int
+		rows.Scan(&amp;p, &amp;n)
+		fmt.Printf("%s: %d rows&#92;n", p, n)
+	}
+	// Output:
+	// carts_p0: 2489 rows
+	// carts_p1: 2527 rows
+	// carts_p2: 2530 rows
+	// carts_p3: 2454 rows
+}
+
+func Example_retention() {
+	size := func(t string) string {
+		var s string
+		conn.QueryRow(ctx, "SELECT pg_size_pretty(pg_relation_size($1))", t).Scan(&amp;s)
+		return s
+	}
+	// The slow way: DELETE a month row by row.
+	before := size("order_events_2026_01")
+	tag, _ := conn.Exec(ctx, &#96;DELETE FROM order_events WHERE created_at &lt; '2026-02-01'&#96;)
+	fmt.Printf("DELETE: %d rows, table file %s -&gt; %s (dead rows wait for VACUUM)&#92;n",
+		tag.RowsAffected(), before, size("order_events_2026_01"))
+
+	// The partition way: detach and drop whole months. No per-row work.
+	for _, p := range []string{"order_events_2026_01", "order_events_2026_02"} {
+		conn.Exec(ctx, "ALTER TABLE order_events DETACH PARTITION "+p)
+		conn.Exec(ctx, "DROP TABLE "+p)
+	}
+	rows, _ := conn.Query(ctx, &#96;SELECT tableoid::regclass::text FROM order_events GROUP BY 1 ORDER BY 1&#96;)
+	var left []string
+	for rows.Next() {
+		var p string
+		rows.Scan(&amp;p)
+		left = append(left, p)
+	}
+	fmt.Println("partitions left:", strings.Join(left, ", "))
+	// Output:
+	// DELETE: 89280 rows, table file 4552 kB -&gt; 4552 kB (dead rows wait for VACUUM)
+	// partitions left: order_events_2026_03, order_events_2026_04, order_events_2026_05, order_events_2026_06
+}</code></pre>
+<pre><code>=== RUN   Example_pruning
+--- PASS: Example_pruning (0.00s)
+=== RUN   Example_rules
+--- PASS: Example_rules (0.00s)
+=== RUN   Example_hash
+--- PASS: Example_hash (0.01s)
+=== RUN   Example_retention
+--- PASS: Example_retention (0.04s)
+PASS</code></pre>
+<p>What the output shows:</p>
+<ul>
+  <li><strong>Pruning works.</strong> The March query plans a single <code>Seq Scan on order_events_2026_03</code>. The other five partitions don't appear in the plan at all. The <code>order_id = 42</code> query has no partition key, so it gets an <code>Append</code> over all six partitions' indexes: six lookups where an unpartitioned table needs one.</li>
+  <li><strong>The rules are enforced.</strong> A primary key without <code>created_at</code> is rejected, and a July row fails because no partition covers July and there's no DEFAULT.</li>
+  <li><strong>HASH spreads evenly.</strong> 10,000 sequential customer IDs land 2,454–2,530 per partition.</li>
+  <li><strong>DELETE vs DROP.</strong> Deleting January's 89,280 rows leaves the partition's file at 4,552 kB: the space stays until vacuum, and every row was written to WAL. Detaching and dropping removes whole months and their files at once.</li>
+</ul>
+
+<p><strong>Real-world scenario.</strong> A delivery platform writes about 25 M tracking events a day into one <code>tracking_events</code> table and keeps 90 days, about 2.2 B rows. The nightly <code>DELETE</code> of the oldest day runs for 3 hours, generates tens of GB of WAL that makes replicas lag, and leaves bloat that autovacuum never fully clears. Moving to daily RANGE partitions on <code>event_time</code> changes three things. Retention becomes "detach and drop yesterday's 91st day", which takes well under a second. The "last 24 hours for this parcel" query prunes to one or two partitions, and their indexes fit in memory. Vacuum runs per partition, mostly on today's. The migration is the hard part. An existing table can't be turned into a partitioned table in place. One option is to attach the old table as a single big partition (with a matching <code>CHECK</code> constraint so the attach doesn't scan it) and let it age out. This team instead creates the partitioned table, writes to both for a short period, copies history in batches, and switches reads (the expand/contract steps in <a href="#database-migrations">Database Migrations</a>). They also find one query that filtered only on <code>parcel_id</code>. After partitioning it scanned 90 partitions, so they add <code>event_time</code> to it.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Partitioning on a key your queries don't use.</strong> No pruning means every query visits every partition, which is slower than one table. Pick the column that appears in nearly every hot <code>WHERE</code> clause, and that you expire data by.</li>
+  <li><strong>Forgetting to create future partitions.</strong> At midnight on the first of the month, every insert fails with "no partition of relation … found for row". Create partitions weeks ahead and alert when fewer than N future partitions exist. A DEFAULT partition is a safety net, but adding a partition then scans it, and fails if it already holds rows that belong in the new partition. You have to move those rows out first.</li>
+  <li><strong>Too many, too small partitions.</strong> Hourly partitions for years means tens of thousands of tables, slow planning and high per-session memory. Size partitions so typical queries hit one or a few, and each holds a meaningful amount of data.</li>
+  <li><strong>Expecting global uniqueness.</strong> "<code>order_id</code> is unique" can't be enforced across partitions unless the constraint includes the partition key. Use an ID generator you trust (sequence, UUIDv7), or a separate unique table.</li>
+  <li><strong>Functions on the key kill pruning.</strong> <code>WHERE date_trunc('month', created_at) = '2026-03-01'</code> can't be matched against the bounds. Write ranges: <code>created_at &gt;= '2026-03-01' AND created_at &lt; '2026-04-01'</code> (see <a href="#query-optimization">Query Optimization</a>).</li>
+  <li><strong>Using partitioning to scale writes.</strong> All partitions share one server. If the primary's CPU or disk is saturated by writes, you need <a href="#sharding">Sharding</a>, not more partitions.</li>
+  <li><strong>Plain DETACH during peak traffic.</strong> Its <code>ACCESS EXCLUSIVE</code> lock waits behind long queries and stalls everything queued after it. Use <code>CONCURRENTLY</code> where you can, and <code>lock_timeout</code> always.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Partitioning splits one table into pieces on the same server. The app still sees one table.</li>
+  <li>The wins come from pruning (queries filtering on the key read only matching partitions) and from dropping whole partitions for retention instead of mass <code>DELETE</code>s.</li>
+  <li>Choose the key that hot queries filter on and data expires by. Usually that's time with RANGE. Primary keys must include it.</li>
+  <li>It doesn't add write capacity; that is sharding. Automate partition creation ahead of time, and keep the count in the hundreds to low thousands.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#sharding">Sharding</a> · <a href="#database-indexing">Database Indexing</a> · <a href="#query-optimization">Query Optimization</a> · <a href="#database-migrations">Database Migrations</a> · <a href="#cron-jobs">Cron Jobs</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
+`;
+
