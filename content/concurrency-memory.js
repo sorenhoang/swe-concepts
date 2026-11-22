@@ -617,3 +617,334 @@ func WorkOne(ctx context.Context, db *pgxpool.Pool, worker int, lock string, pro
 
 <p><strong>Related:</strong> <a href="#optimistic-locking">Optimistic Locking</a> · <a href="#deadlocks">Deadlocks</a> · <a href="#thread-safety">Thread Safety</a> · <a href="#distributed-locks">Distributed Locks</a> · <a href="#message-queues">Message Queues</a> · <a href="#connection-pooling">Connection Pooling</a></p>
 `;
+CONTENT["race-conditions"] = `
+<p class="tldr"><strong>TL;DR</strong>: A race is a bug whose result depends on who gets there first. Two people take the last coffee cup from a shelf at the same moment: both saw one cup, both reached for it, and the shop's count is now wrong. In Go there are two kinds: a <em>data race</em> (two goroutines touch the same memory without synchronisation, and the race detector can find it) and a <em>race condition</em> (correctly synchronised steps that still interleave badly, like check-then-act, which no tool will catch for you).</p>
+
+<h2>The problem it solves</h2>
+<p>Code that is correct when one thing runs at a time can be wrong when two run at once. Your HTTP server runs each request in its own goroutine, the database serves many connections, and you run several pods, so "at once" is the normal case. These bugs are <strong>intermittent</strong>: the test passes 999 times, then production double-charges a customer during a sale. This page is about recognising the two kinds of race, finding them, and picking the fix; the fixes themselves have their own pages.</p>
+<table>
+  <tr><th></th><th>Data race</th><th>Race condition</th></tr>
+  <tr><td>Definition</td><td>Two goroutines access the same memory location at the same time, at least one writes, and nothing orders them (no lock, channel or atomic).</td><td>The program's result depends on the timing or order of events, and some orders give a wrong result.</td></tr>
+  <tr><td>Level</td><td>Memory (one variable, map, slice)</td><td>Logic (a sequence of steps, often across processes or a database)</td></tr>
+  <tr><td>Typical shape</td><td><code>x++</code> on a shared int; a map written from two goroutines</td><td>check-then-act, read-modify-write, TOCTOU</td></tr>
+  <tr><td>Found by <code>go test -race</code>?</td><td>Yes, if the racy path actually runs during the test</td><td>No. Every access can be properly locked and the logic still be wrong</td></tr>
+  <tr><td>Can be undefined behaviour?</td><td>Yes: torn values, memory corruption, crashes</td><td>No; each step is well defined, the <em>combination</em> is wrong</td></tr>
+</table>
+<p>A data race usually causes a race condition, but a program with zero data races can still have one. The database example below is exactly that.</p>
+
+<h2>How it works</h2>
+<h3>Why <code>x++</code> loses updates</h3>
+<p><code>x++</code> looks like one step. The CPU does three: load <code>x</code> into a register, add one, store it back. If two goroutines interleave those steps, both load the same old value and both store the same new value. Two increments happened; the counter moved by one.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 320" role="img" aria-label="Timeline of a lost update. Goroutine A reads x equal to 5. Goroutine B reads x equal to 5. Both compute 5 plus 1 equals 6 in a register. A writes 6. B writes 6. Two increments ran but x only went from 5 to 6.">
+  <defs><marker id="arr-race-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="70" y="16" width="160" height="36" rx="6"/><text x="150" y="39" text-anchor="middle" class="title">goroutine A</text>
+  <rect class="box" x="310" y="16" width="160" height="36" rx="6"/><text x="390" y="39" text-anchor="middle" class="title">x in memory</text>
+  <rect class="box accent" x="550" y="16" width="160" height="36" rx="6"/><text x="630" y="39" text-anchor="middle" class="title">goroutine B</text>
+  <path class="line dashed" d="M150 52 V286" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M390 52 V286" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M630 52 V286" style="stroke: var(--line)"/>
+
+  <rect class="box" x="350" y="78" width="80" height="24" rx="4"/><text x="390" y="95" text-anchor="middle">x = 5</text>
+  <path class="line" d="M350 90 H154" marker-end="url(#arr-race-1)"/><text x="252" y="82" text-anchor="middle" class="small">load: 5</text>
+
+  <rect class="box" x="350" y="118" width="80" height="24" rx="4"/><text x="390" y="135" text-anchor="middle">x = 5</text>
+  <path class="line" d="M430 130 H626" marker-end="url(#arr-race-1)"/><text x="528" y="122" text-anchor="middle" class="small">load: 5</text>
+
+  <rect class="box" x="95" y="158" width="110" height="24" rx="4"/><text x="150" y="175" text-anchor="middle">5 + 1 = 6</text>
+  <rect class="box" x="575" y="158" width="110" height="24" rx="4"/><text x="630" y="175" text-anchor="middle">5 + 1 = 6</text>
+
+  <path class="line" d="M154 214 H348" marker-end="url(#arr-race-1)"/><text x="252" y="206" text-anchor="middle" class="small">store: 6</text>
+  <rect class="box ok" x="350" y="202" width="80" height="24" rx="4"/><text x="390" y="219" text-anchor="middle">x = 6</text>
+
+  <path class="line bad" d="M626 254 H432" marker-end="url(#arr-race-1)"/><text x="528" y="246" text-anchor="middle" class="small">store: 6</text>
+  <rect class="box bad" x="350" y="242" width="80" height="24" rx="4"/><text x="390" y="259" text-anchor="middle">x = 6</text>
+
+  <text x="390" y="308" text-anchor="middle">Two increments ran; x went from 5 to 6. A's update was overwritten.</text>
+</svg>
+<figcaption>The lost update, in memory. The same shape appears in a database when two requests <code>SELECT</code> a value, change it in code, and <code>UPDATE</code> it back.</figcaption>
+</figure>
+
+<h3>The Go memory model in plain words</h3>
+<p>The <a href="https://go.dev/ref/mem">Go memory model</a> defines a data race as "a write to a memory location happening concurrently with another read or write to that same location, unless all the accesses involved are atomic data accesses as provided by the <code>sync/atomic</code> package." The practical rules:</p>
+<ul>
+  <li><strong>Without synchronisation, there is no "before".</strong> If goroutine A writes <code>x</code> and B reads it, B is not guaranteed to see the write (or see writes in A's order) unless something links them. Compilers and CPUs reorder freely.</li>
+  <li><strong>Synchronisation creates "happens before" edges.</strong> The spec lists them: a send on a channel is synchronised before the matching receive completes; the n'th <code>Unlock</code> of a mutex before the next <code>Lock</code>; the function run by <code>once.Do(f)</code> completes before any <code>once.Do(f)</code> returns; atomic operations are ordered too.</li>
+  <li><strong>Race-free programs are easy to reason about.</strong> "Data-race-free programs execute in a sequentially consistent manner" (DRF-SC): as if the goroutines took turns on one processor. Racy programs get no such promise. Races on multi-word values (strings, slices, interfaces, maps) can produce values that no goroutine ever wrote, which "can in turn lead to arbitrary memory corruption".</li>
+</ul>
+<p>The memory model page's own advice: "If you must read the rest of this document to understand the behavior of your program, you are being too clever. Don't be clever."</p>
+
+<h3>Race conditions: the shapes to recognise</h3>
+<p>Most logical races are one of three patterns. Learn to spot them in code review:</p>
+<ul>
+  <li><strong>Check-then-act.</strong> <code>if !exists(email) { insert(email) }</code>, <code>if balance &gt;= amount { debit(amount) }</code>, <code>if cache[k] == nil { cache[k] = load() }</code>. Between the check and the act, another goroutine or request can make the check false.</li>
+  <li><strong>Read-modify-write.</strong> Read a value, compute a new one in code, write it back: <code>x++</code>, or <code>SELECT stock</code> then <code>UPDATE stock = $new</code>. Concurrent writers overwrite each other (the lost update).</li>
+  <li><strong>TOCTOU (time of check to time of use).</strong> The check-then-act pattern against something outside your process: a file, a permission, a URL you validated and then fetch. The world can change between the two.</li>
+</ul>
+<pre><code>// CreateNaive is TOCTOU: another process can create path between Stat and
+// Create, and Create would then truncate that file.
+func CreateNaive(path string) (*os.File, error) {
+	if _, err := os.Stat(path); err == nil { // time of check
+		return nil, fs.ErrExist
+	}
+	return os.Create(path) // time of use
+}
+
+// CreateExclusive asks the OS to check and create in one step.
+// If the file exists, the error matches fs.ErrExist.
+func CreateExclusive(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+}</code></pre>
+<p>The fix is the same every time: make the check and the act <strong>one indivisible step</strong>, by putting them under one lock, into one atomic operation, into one SQL statement, or behind a constraint the database enforces.</p>
+
+<h3>Finding races</h3>
+<ul>
+  <li><strong>The race detector.</strong> Add <code>-race</code> to <code>go test</code>, <code>go run</code> or <code>go build</code>. It instruments every memory access and reports two conflicting accesses with no "happens before" between them, with both stack traces. It is built on ThreadSanitizer. The Go docs put its cost at "memory usage may increase by 5-10x and execution time by 2-20x" for a typical program, so run it in CI and in a canary, not on your whole fleet. It "only finds races that happen at runtime": an untested path stays unchecked.</li>
+  <li><strong>Make races likely to happen.</strong> Tests that hit shared state from many goroutines at once (<code>t.Parallel()</code>, a loop of goroutines), run repeatedly: <code>go test -race -count=50 -run TestCheckout</code>.</li>
+  <li><strong>Force the bad interleaving.</strong> For logical races, don't wait for luck. Put a hook between the check and the act and make both callers wait there (the <code>meet</code> helper below). The test then fails every time, and passes every time once fixed.</li>
+  <li><strong>Read the data.</strong> In production, a race condition usually shows up first as data that "can't happen": duplicate rows, negative stock.</li>
+</ul>
+
+<h3>Fixes: pick by where the shared state lives</h3>
+<table>
+  <tr><th>Fix</th><th>What it makes indivisible</th><th>Use it for</th><th>More</th></tr>
+  <tr><td><code>sync.Mutex</code> / <code>RWMutex</code></td><td>Any block of code (the critical section)</td><td>In-process state with several fields or invariants</td><td><a href="#thread-safety">Thread Safety</a></td></tr>
+  <tr><td><code>sync/atomic</code> (<code>atomic.Int64</code>, <code>CompareAndSwap</code>)</td><td>One read-modify-write on one word</td><td>Counters, flags, swapping a pointer to an immutable snapshot</td><td><a href="#thread-safety">Thread Safety</a></td></tr>
+  <tr><td>Channels / one owner goroutine</td><td>Everything, because only one goroutine touches the data</td><td>Pipelines, state owned by a worker</td><td><a href="#thread-safety">Thread Safety</a></td></tr>
+  <tr><td>Conditional SQL (<code>UPDATE … WHERE balance &gt;= $1</code>), check rows affected</td><td>Check and write, in one statement</td><td>Counters, balances, stock in the database</td><td>Example below</td></tr>
+  <tr><td>Unique constraint / <code>INSERT … ON CONFLICT</code></td><td>"Doesn't exist yet" and the insert</td><td>Sign-ups, one-per-user rules, dedup tables</td><td>Example below</td></tr>
+  <tr><td>Version column (<code>WHERE version = $n</code>)</td><td>Read and later write, by detecting interference</td><td>Edits with user think-time; low contention</td><td><a href="#optimistic-locking">Optimistic Locking</a></td></tr>
+  <tr><td><code>SELECT … FOR UPDATE</code></td><td>Read and later write, by blocking others</td><td>Hot rows; multi-step logic in one transaction</td><td><a href="#pessimistic-locking">Pessimistic Locking</a></td></tr>
+  <tr><td>Idempotency key</td><td>"Has this request already been done?" and doing it</td><td>Retries and double-clicks on payments</td><td><a href="#idempotency">Idempotency</a></td></tr>
+  <tr><td>Distributed lock / leader</td><td>Work across processes and machines</td><td>Cron jobs on several pods, singleton workers</td><td><a href="#distributed-locks">Distributed Locks</a></td></tr>
+</table>
+<p>Order of preference: don't share the state at all; else push the check into whatever owns the data (an atomic, one SQL statement, a constraint); use explicit locks when the logic is too big for one step.</p>
+
+<h2>Example</h2>
+<p><strong>1. A data race, caught.</strong> Eight goroutines each increment a counter 100,000 times, three ways. <code>run</code> is just the fan-out; the three closures are what differ.</p>
+<pre><code>package race
+
+import (
+	"sync"
+	"sync/atomic"
+)
+
+// run starts workers goroutines; each calls inc perWorker times.
+func run(workers, perWorker int, inc func()) {
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for range perWorker {
+				inc()
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// RacyCount has a data race: x++ is a load, an add and a store,
+// and nothing stops two goroutines from interleaving those steps.
+func RacyCount(workers, perWorker int) int {
+	x := 0
+	run(workers, perWorker, func() { x++ })
+	return x
+}
+
+// AtomicCount makes the read-modify-write one indivisible step.
+func AtomicCount(workers, perWorker int) int64 {
+	var x atomic.Int64
+	run(workers, perWorker, func() { x.Add(1) })
+	return x.Load()
+}
+
+// MutexCount lets one goroutine at a time run the critical section.
+func MutexCount(workers, perWorker int) int {
+	x := 0
+	var mu sync.Mutex
+	run(workers, perWorker, func() {
+		mu.Lock()
+		x++
+		mu.Unlock()
+	})
+	return x
+}</code></pre>
+<p>The racy version, run three times on a 12-core laptop without <code>-race</code>. The test "passes" because nothing checks the value:</p>
+<pre><code>    race_test.go:18: RacyCount(8, 100000) = 202709, want 800000
+    race_test.go:18: RacyCount(8, 100000) = 105952, want 800000
+    race_test.go:18: RacyCount(8, 100000) = 196032, want 800000
+ok  	example.com/race	7.160s</code></pre>
+<p>Between 75% and 87% of the increments vanished, and the number changes on every run. The same test with <code>-race</code> (one real run, paths shortened, the second report cut):</p>
+<pre><code>$ RACE_DEMO=1 go test -race -run TestRacyCount .
+==================
+WARNING: DATA RACE
+Read at 0x00c000b7f178 by goroutine 32:
+  example.com/race.RacyCount.func1()
+      …/counter.go:25 +0x2c
+  example.com/race.run.func1()
+      …/counter.go:14 +0x40
+
+Previous write at 0x00c000b7f178 by goroutine 31:
+  example.com/race.RacyCount.func1()
+      …/counter.go:25 +0x3c
+  example.com/race.run.func1()
+      …/counter.go:14 +0x40
+
+Goroutine 32 (running) created at:
+  sync.(*WaitGroup).Go()
+      $GOROOT/src/sync/waitgroup.go:238 +0x6c
+  example.com/race.RacyCount()
+      …/counter.go:25 +0xa8
+  example.com/race.TestRacyCount()
+  …
+==================
+--- FAIL: TestRacyCount (0.08s)
+    race_test.go:18: RacyCount(8, 100000) = 287049, want 800000
+    race_test.go:18: RacyCount(8, 100000) = 300464, want 800000
+    race_test.go:18: RacyCount(8, 100000) = 356861, want 800000
+    testing.go:1865: race detected during execution of test
+FAIL</code></pre>
+<p>Read it top down: <em>what</em> raced (a read and a write at the same address, both at <code>counter.go:25</code>, the <code>x++</code> inside the closure), then <em>where each goroutine was started</em>. The lost counts differ from run to run and between modes; never trust one green run. The fixed versions are exact every time, and clean under <code>-race</code>:</p>
+<pre><code>func ExampleAtomicCount() {
+	fmt.Println("atomic:", AtomicCount(8, 100_000))
+	fmt.Println("mutex: ", MutexCount(8, 100_000))
+	// Output:
+	// atomic: 800000
+	// mutex:  800000
+}</code></pre>
+
+<p><strong>2. A race condition with no data race: double spend.</strong> An account has 100. Two requests each withdraw 80. The naive code checks the balance in Go, then writes the new balance. Every statement is fine and there is no shared memory, so <code>-race</code> has nothing to report.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="Left: check then act. Request A and B both SELECT balance 100, both check 100 is at least 80, both run UPDATE SET balance equals 20. Both succeed and 160 is paid from an account of 100. Right: one conditional UPDATE. Request A's UPDATE WHERE balance at least 80 matches one row, balance becomes 20. Request B's UPDATE waits for A's row lock, re-checks the WHERE clause on the new row, 20 is less than 80, so zero rows are updated and B gets insufficient funds.">
+  <defs><marker id="arr-race-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="195" y="20" text-anchor="middle" class="title">Check, then act (2 statements)</text>
+  <text x="590" y="20" text-anchor="middle" class="title">One conditional UPDATE</text>
+  <path class="line dashed" d="M395 8 V282" style="stroke: var(--line)"/>
+
+  <rect class="box accent" x="20" y="34" width="80" height="28" rx="5"/><text x="60" y="53" text-anchor="middle">request A</text>
+  <rect class="box" x="155" y="34" width="80" height="28" rx="5"/><text x="195" y="53" text-anchor="middle">accounts</text>
+  <rect class="box accent" x="290" y="34" width="80" height="28" rx="5"/><text x="330" y="53" text-anchor="middle">request B</text>
+  <path class="line dashed" d="M60 62 V232" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M195 62 V232" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M330 62 V232" style="stroke: var(--line)"/>
+  <path class="line" d="M193 92 H64" marker-end="url(#arr-race-2)"/><text x="128" y="85" text-anchor="middle" class="small">SELECT → 100</text>
+  <path class="line" d="M197 120 H326" marker-end="url(#arr-race-2)"/><text x="262" y="113" text-anchor="middle" class="small">SELECT → 100</text>
+  <rect class="box" x="22" y="138" width="76" height="24" rx="4"/><text x="60" y="154" text-anchor="middle" class="small">100 ≥ 80 ✓</text>
+  <rect class="box" x="292" y="138" width="76" height="24" rx="4"/><text x="330" y="154" text-anchor="middle" class="small">100 ≥ 80 ✓</text>
+  <path class="line" d="M64 192 H191" marker-end="url(#arr-race-2)"/><text x="128" y="185" text-anchor="middle" class="small">SET balance = 20</text>
+  <path class="line bad" d="M326 220 H199" marker-end="url(#arr-race-2)"/><text x="262" y="213" text-anchor="middle" class="small">SET balance = 20</text>
+  <rect class="box bad" x="30" y="242" width="330" height="34" rx="6"/><text x="195" y="264" text-anchor="middle">both succeed: 160 paid out of 100</text>
+
+  <rect class="box accent" x="420" y="34" width="80" height="28" rx="5"/><text x="460" y="53" text-anchor="middle">request A</text>
+  <rect class="box" x="550" y="34" width="80" height="28" rx="5"/><text x="590" y="53" text-anchor="middle">accounts</text>
+  <rect class="box accent" x="680" y="34" width="80" height="28" rx="5"/><text x="720" y="53" text-anchor="middle">request B</text>
+  <path class="line dashed" d="M460 62 V232" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M590 62 V232" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M720 62 V232" style="stroke: var(--line)"/>
+  <path class="line" d="M464 92 H586" marker-end="url(#arr-race-2)"/><text x="525" y="85" text-anchor="middle" class="small">UPDATE … ≥ 80</text>
+  <path class="line" d="M716 120 H594" marker-end="url(#arr-race-2)"/><text x="655" y="113" text-anchor="middle" class="small">UPDATE … ≥ 80</text>
+  <rect class="box muted" x="530" y="136" width="120" height="24" rx="4"/><text x="590" y="152" text-anchor="middle" class="small">B waits: row locked</text>
+  <path class="line ok" d="M586 192 H464" marker-end="url(#arr-race-2)"/><text x="525" y="185" text-anchor="middle" class="small">1 row · now 20</text>
+  <path class="line" d="M594 220 H716" marker-end="url(#arr-race-2)"/><text x="655" y="213" text-anchor="middle" class="small">0 rows: 20 &lt; 80</text>
+  <rect class="box ok" x="425" y="242" width="330" height="34" rx="6"/><text x="590" y="264" text-anchor="middle">A paid 80; B gets "insufficient funds"</text>
+</svg>
+<figcaption>The same two requests. On the left, the check uses a value that is already stale when the write lands. On the right, the database does the check at write time, on the latest row.</figcaption>
+</figure>
+<pre><code>package race
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+var ErrInsufficient = errors.New("insufficient funds")
+
+// WithdrawNaive is check-then-act across two statements. pause() is a
+// test hook that holds the goroutine between the check and the act.
+func WithdrawNaive(ctx context.Context, db *sql.DB, id, amount int, pause func()) error {
+	var balance int
+	err := db.QueryRowContext(ctx, "SELECT balance FROM accounts WHERE id = $1", id).Scan(&amp;balance)
+	if err != nil {
+		return err
+	}
+	if balance &lt; amount { // check
+		return ErrInsufficient
+	}
+	pause()
+	_, err = db.ExecContext(ctx, "UPDATE accounts SET balance = $1 WHERE id = $2", // act
+		balance-amount, id)
+	return err
+}
+
+// Withdraw puts the check and the act in one statement. If another UPDATE
+// holds the row, Postgres waits for it, then re-checks the WHERE clause
+// against the new version of the row (READ COMMITTED behaviour).
+func Withdraw(ctx context.Context, db *sql.DB, id, amount int) error {
+	res, err := db.ExecContext(ctx,
+		"UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance &gt;= $1", amount, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrInsufficient
+	}
+	return nil
+}</code></pre>
+<p>The test uses a real PostgreSQL (<code>embedded-postgres</code>, pgx driver). <code>twice</code> runs a function in two goroutines and returns both outcomes, sorted; <code>meet</code> makes both goroutines finish their check before either one acts, so the bad interleaving happens on every run instead of once in a while. It is an <code>Example</code> test, so the output is checked by <code>go test</code>; the whole package also passes under <code>-race</code>.</p>
+<pre><code>func meet(n int) func() {
+	var wg sync.WaitGroup
+	wg.Add(n)
+	return func() { wg.Done(); wg.Wait() }
+}
+
+func ExampleWithdraw() {
+	ctx := context.Background()
+	db, _ := sql.Open("pgx", dsn)
+	defer db.Close()
+	db.Exec("DROP TABLE IF EXISTS accounts")
+	db.Exec("CREATE TABLE accounts (id int PRIMARY KEY, balance int NOT NULL)")
+	var balance int
+
+	db.Exec("INSERT INTO accounts VALUES (1, 100)")
+	pause := meet(2)
+	errs := twice(func() error { return WithdrawNaive(ctx, db, 1, 80, pause) })
+	db.QueryRow("SELECT balance FROM accounts WHERE id = 1").Scan(&amp;balance)
+	fmt.Println("naive:", errs, "balance:", balance)
+
+	db.Exec("UPDATE accounts SET balance = 100 WHERE id = 1")
+	errs = twice(func() error { return Withdraw(ctx, db, 1, 80) })
+	db.QueryRow("SELECT balance FROM accounts WHERE id = 1").Scan(&amp;balance)
+	fmt.Println("atomic:", errs, "balance:", balance)
+	// Output:
+	// naive: [ok ok] balance: 20
+	// atomic: [insufficient funds ok] balance: 20
+}</code></pre>
+<p>Read the naive line carefully: both withdrawals report success, 160 left the account, and the balance says 20. No error, no crash, no race report. The conditional <code>UPDATE</code> gives one success and one clean "insufficient funds". <code>ExampleSignup</code> in the same package does check-then-insert (<code>SELECT EXISTS</code>, then <code>INSERT</code>): two concurrent sign-ups for <code>ana@example.com</code> both pass <code>SELECT EXISTS</code>. Without a constraint the real output is <code>[ok ok] rows: 2</code>; after <code>ADD CONSTRAINT users_email_key UNIQUE (email)</code>, the same code gives <code>[email already registered ok] rows: 1</code>, because the loser's <code>INSERT</code> fails with SQLSTATE <code>23505</code> (unique_violation). Keep the <code>SELECT</code> for a friendly fast path; the constraint is what makes it correct.</p>
+
+<p><strong>Real-world scenario.</strong> A ticketing API sells seats with "read remaining, if &gt; 0 then decrement"; 300 requests arrive in the first second for 50 seats. Under burst, many requests read <code>remaining = 1</code> within the same milliseconds and each sells "the last seat"; tests and <code>-race</code> stay green because the race lives between two SQL statements. The fix is one statement: <code>UPDATE events SET remaining = remaining - 1 WHERE id = $1 AND remaining &gt; 0</code>, treat 0 rows affected as "sold out", and a <code>UNIQUE (event_id, seat_no)</code> constraint on tickets as a second line of defence.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>"The race detector is clean, so we have no races."</strong> It only sees data races, and only on executed paths. Check-then-act across SQL statements, files or services is invisible to it.</li>
+  <li><strong>"It's only a counter / a flag / a debug stat."</strong> A data race in Go is not just a wrong number. On strings, slices, interfaces and maps it can corrupt memory. Concurrent map writes crash the process with a fatal error. Use <code>atomic</code> even for "harmless" counters.</li>
+  <li><strong>Fixing a race with <code>time.Sleep</code>.</strong> A sleep changes the odds, not the logic.</li>
+  <li><strong>Locking each step separately.</strong> <code>if c.Has(k) { c.Set(k, v) }</code> on a thread-safe cache is still check-then-act: each call is locked, the pair is not. Offer a compound method (<code>SetIfAbsent</code>, <code>LoadOrStore</code>) instead.</li>
+  <li><strong>Read-modify-write in SQL.</strong> <code>SELECT</code> then <code>UPDATE … SET x = $computed</code> loses updates at the default READ COMMITTED level. Write <code>SET x = x - $1</code> with a guard in <code>WHERE</code>, or use a version check or <code>FOR UPDATE</code>.</li>
+  <li><strong>Trusting an in-process mutex across pods.</strong> A <code>sync.Mutex</code> protects one process. With three replicas you have three mutexes. Shared state across instances needs the database (constraints, row locks) or a <a href="#distributed-locks">distributed lock</a>.</li>
+</ul>
+
+<div class="callout warn"><strong>Constraints are the last line of defence.</strong> If a rule must never be broken (one account per email, one ticket per seat, stock never negative), state it as a database constraint (<code>UNIQUE</code>, <code>CHECK (stock &gt;= 0)</code>). Application checks can race; the constraint can't be bypassed by timing.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>A data race is unsynchronised access to the same memory; a race condition is a timing-dependent wrong result. You can have the second without the first.</li>
+  <li>Watch for check-then-act, read-modify-write and TOCTOU. The fix is always to make the check and the act one indivisible step.</li>
+  <li>Run <code>go test -race</code> in CI with concurrent tests; for logical races, force the interleaving in a test instead of hoping for it.</li>
+  <li>For shared data in a database, prefer conditional <code>UPDATE</code>s and constraints over checks in Go code.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#thread-safety">Thread Safety</a> · <a href="#optimistic-locking">Optimistic Locking</a> · <a href="#pessimistic-locking">Pessimistic Locking</a> · <a href="#idempotency">Idempotency</a> · <a href="#distributed-locks">Distributed Locks</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
+`;
+
