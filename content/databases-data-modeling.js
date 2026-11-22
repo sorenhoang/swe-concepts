@@ -1020,3 +1020,363 @@ batched orders=100 items=300 queries=2 time on the wire &gt;= 2ms</code></pre>
 
 <p><strong>Related:</strong> <a href="#query-optimization">Query Optimization</a> · <a href="#connection-pooling">Connection Pooling</a> · <a href="#database-indexing">Database Indexing</a> · <a href="#distributed-tracing">Distributed Tracing</a> · <a href="#caching">Caching</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
 `;
+CONTENT["connection-pooling"] = `
+<p class="tldr"><strong>TL;DR</strong>: Opening a database connection is slow and each one costs the server real memory, so you open a few, keep them, and lend them out query by query. A pool is a taxi rank: cars wait at the stand, passengers take one for a trip and give it back, and when every car is out, the next passenger queues. The pool size is also a <em>limit</em> that protects the database from your own app.</p>
+
+<h2>The problem it solves</h2>
+<p>A database connection is not a cheap function call. Before the first query can run, the client and server go through several round trips:</p>
+<ul>
+  <li><strong>TCP handshake</strong>, then usually a <strong>TLS handshake</strong> (one or two more round trips, plus crypto on both sides).</li>
+  <li><strong>Startup and authentication.</strong> Postgres's SCRAM password auth alone is a challenge-response exchange.</li>
+  <li><strong>A new server process.</strong> PostgreSQL uses a process-per-connection model: the postmaster forks one backend process for every client connection. That process holds its own memory (caches, sort buffers, catalog cache), whether it is busy or idle.</li>
+</ul>
+<p>Without a pool, every request pays that setup. In the example below, 200 tiny queries took about 3 s when each opened its own connection, and 26 ms when connections were reused (laptop, localhost, no TLS; a real network makes the gap bigger). The server also has a hard ceiling, <code>max_connections</code>, which defaults to <strong>100</strong> in PostgreSQL. Past it, clients get <code>FATAL: sorry, too many clients already</code>. Raising it doesn't buy throughput: 8 cores run about 8 queries at once, and the rest wait inside the database holding memory and locks.</p>
+<p>A connection pool fixes both. It opens connections once, keeps them open, lends one out per query or transaction, and caps the total. When the cap is reached, extra callers wait <em>in your app</em>, where waiting is cheap and has a timeout.</p>
+
+<h2>How it works</h2>
+<p>In Go, <code>*sql.DB</code> <em>is</em> the pool. <code>sql.Open</code> doesn't connect to anything; it creates the pool. Each <code>Query</code>, <code>Exec</code> or <code>Begin</code> takes a connection out, and gives it back when the work is done: after <code>Exec</code> returns, after <code>rows.Close()</code> (or the last <code>rows.Next()</code>), after <code>tx.Commit()</code> or <code>tx.Rollback()</code>. That's why you create one <code>*sql.DB</code> per database at startup and share it. Never open one per request.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 320" role="img" aria-label="Twenty handler goroutines share a database/sql pool capped at five connections. Handlers 1 to 5 each hold one connection, and each connection maps to one PostgreSQL backend process. Handlers 6 to 20 wait in the pool's wait queue, which increments WaitCount. PostgreSQL's max_connections defaults to 100.">
+  <defs><marker id="arr-pool-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="85" y="62" text-anchor="middle" class="title">Goroutines</text>
+  <text x="85" y="78" text-anchor="middle" class="small">HTTP handlers</text>
+  <rect class="box" x="20" y="92" width="130" height="162" rx="6"/><text x="85" y="168" text-anchor="middle">handlers 1–5</text><text x="85" y="184" text-anchor="middle" class="small">running a query</text>
+  <rect class="box bad" x="20" y="266" width="130" height="32" rx="5"/><text x="85" y="287" text-anchor="middle">handlers 6–20</text>
+
+  <rect class="box muted" x="200" y="40" width="290" height="270" rx="10"/>
+  <text x="345" y="62" text-anchor="middle" class="title">*sql.DB pool</text>
+  <text x="345" y="78" text-anchor="middle" class="small">SetMaxOpenConns(5)</text>
+  <rect class="box accent" x="230" y="92" width="230" height="26" rx="5"/><text x="345" y="110" text-anchor="middle">conn 1 · in use</text>
+  <rect class="box accent" x="230" y="126" width="230" height="26" rx="5"/><text x="345" y="144" text-anchor="middle">conn 2 · in use</text>
+  <rect class="box accent" x="230" y="160" width="230" height="26" rx="5"/><text x="345" y="178" text-anchor="middle">conn 3 · in use</text>
+  <rect class="box accent" x="230" y="194" width="230" height="26" rx="5"/><text x="345" y="212" text-anchor="middle">conn 4 · in use</text>
+  <rect class="box accent" x="230" y="228" width="230" height="26" rx="5"/><text x="345" y="246" text-anchor="middle">conn 5 · in use</text>
+  <rect class="box bad" x="230" y="266" width="230" height="32" rx="5"/><text x="345" y="287" text-anchor="middle">wait queue (WaitCount += 15)</text>
+
+  <path class="line" d="M150 105 H228" marker-end="url(#arr-pool-1)"/>
+  <path class="line" d="M150 139 H228" marker-end="url(#arr-pool-1)"/>
+  <path class="line" d="M150 173 H228" marker-end="url(#arr-pool-1)"/>
+  <path class="line" d="M150 207 H228" marker-end="url(#arr-pool-1)"/>
+  <path class="line" d="M150 241 H228" marker-end="url(#arr-pool-1)"/>
+  <path class="line bad dashed" d="M150 282 H228" marker-end="url(#arr-pool-1)"/>
+
+  <rect class="box" x="560" y="40" width="200" height="270" rx="10"/>
+  <text x="660" y="62" text-anchor="middle" class="title">PostgreSQL</text>
+  <text x="660" y="78" text-anchor="middle" class="small">one OS process per connection</text>
+  <rect class="box ok" x="590" y="92" width="140" height="26" rx="5"/><text x="660" y="110" text-anchor="middle">backend 1</text>
+  <rect class="box ok" x="590" y="126" width="140" height="26" rx="5"/><text x="660" y="144" text-anchor="middle">backend 2</text>
+  <rect class="box ok" x="590" y="160" width="140" height="26" rx="5"/><text x="660" y="178" text-anchor="middle">backend 3</text>
+  <rect class="box ok" x="590" y="194" width="140" height="26" rx="5"/><text x="660" y="212" text-anchor="middle">backend 4</text>
+  <rect class="box ok" x="590" y="228" width="140" height="26" rx="5"/><text x="660" y="246" text-anchor="middle">backend 5</text>
+  <text x="660" y="280" text-anchor="middle" class="small">max_connections = 100</text>
+  <text x="660" y="296" text-anchor="middle" class="small">(the default)</text>
+  <path class="line" d="M460 105 H588"/>
+  <path class="line" d="M460 139 H588"/>
+  <path class="line" d="M460 173 H588"/>
+  <path class="line" d="M460 207 H588"/>
+  <path class="line" d="M460 241 H588"/>
+</svg>
+<figcaption>The exact situation of the first example below: 20 goroutines, a cap of 5. Five run, fifteen queue inside the app, and the database never sees more than five connections.</figcaption>
+</figure>
+
+<h3>The life of a pooled connection</h3>
+<p>Each connection moves between a few states, and each of the four knobs controls one transition:</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 262" role="img" aria-label="Connection lifecycle. A new connection is dialed (TCP, TLS, auth) when no idle connection exists and the pool is under its cap; at the cap, callers wait. It is then in use. Closing rows, committing or closing the conn returns it to idle. An idle connection is reused without a handshake. An idle connection is closed if it sits idle too long or there are too many idle. On release, a connection older than ConnMaxLifetime or broken is closed.">
+  <defs><marker id="arr-pool-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box" x="20" y="100" width="120" height="56" rx="8"/><text x="80" y="124" text-anchor="middle" class="title">dial</text><text x="80" y="142" text-anchor="middle" class="small">TCP + TLS + auth</text>
+  <text x="80" y="176" text-anchor="middle" class="small">at MaxOpenConns:</text>
+  <text x="80" y="190" text-anchor="middle" class="small">wait (WaitCount++)</text>
+
+  <rect class="box accent" x="210" y="100" width="110" height="56" rx="8"/><text x="265" y="124" text-anchor="middle" class="title">in use</text><text x="265" y="142" text-anchor="middle" class="small">Stats().InUse</text>
+  <rect class="box ok" x="420" y="100" width="110" height="56" rx="8"/><text x="475" y="124" text-anchor="middle" class="title">idle</text><text x="475" y="142" text-anchor="middle" class="small">Stats().Idle</text>
+  <rect class="box bad" x="670" y="100" width="90" height="56" rx="8"/><text x="715" y="133" text-anchor="middle" class="title">closed</text>
+
+  <text x="175" y="96" text-anchor="middle" class="small">none idle,</text>
+  <text x="175" y="110" text-anchor="middle" class="small">under cap</text>
+  <path class="line" d="M140 128 H208" marker-end="url(#arr-pool-2)"/>
+
+  <path class="line" d="M285 100 Q370 40 455 100" marker-end="url(#arr-pool-2)"/>
+  <text x="370" y="60" text-anchor="middle" class="small">rows.Close · tx.Commit · Exec returns</text>
+  <path class="line ok" d="M455 156 Q370 216 285 156" marker-end="url(#arr-pool-2)"/>
+  <text x="370" y="206" text-anchor="middle" class="small">reused: no handshake</text>
+
+  <text x="599" y="96" text-anchor="middle" class="small">ConnMaxIdleTime or</text>
+  <text x="599" y="110" text-anchor="middle" class="small">over MaxIdleConns</text>
+  <path class="line" d="M530 128 H668" marker-end="url(#arr-pool-2)"/>
+
+  <path class="line dashed" d="M250 156 V232 H715 V158" marker-end="url(#arr-pool-2)"/>
+  <text x="560" y="250" text-anchor="middle" class="small">on release: older than ConnMaxLifetime, or the conn is broken</text>
+</svg>
+<figcaption>The green arrow is the whole point of pooling. Every other arrow either costs a handshake (dial) or exists to stop old, idle or broken connections from piling up.</figcaption>
+</figure>
+
+<h3>The four knobs (and pgxpool's equivalents)</h3>
+<table>
+  <tr><th>What it limits</th><th><code>database/sql</code></th><th>Default</th><th><code>pgxpool</code></th><th>Default</th></tr>
+  <tr><td>Total connections (the cap)</td><td><code>SetMaxOpenConns</code></td><td>0 = unlimited</td><td><code>MaxConns</code></td><td>greater of 4 and <code>runtime.NumCPU()</code></td></tr>
+  <tr><td>Warm connections kept</td><td><code>SetMaxIdleConns</code> (an upper bound on idle)</td><td>2</td><td><code>MinConns</code> (a lower bound kept open)</td><td>0</td></tr>
+  <tr><td>Age of a connection</td><td><code>SetConnMaxLifetime</code></td><td>0 = forever</td><td><code>MaxConnLifetime</code></td><td>1 hour</td></tr>
+  <tr><td>Idle time before closing</td><td><code>SetConnMaxIdleTime</code></td><td>0 = forever</td><td><code>MaxConnIdleTime</code></td><td>30 minutes</td></tr>
+  <tr><td>Where to look</td><td><code>db.Stats()</code>: <code>InUse</code>, <code>Idle</code>, <code>WaitCount</code>, <code>WaitDuration</code>, <code>MaxIdleClosed</code>…</td><td></td><td><code>pool.Stat()</code>: <code>AcquiredConns</code>, <code>EmptyAcquireCount</code>, <code>AcquireDuration</code>…</td><td></td></tr>
+</table>
+<p>Both <code>database/sql</code> defaults bite. <strong>Unlimited open connections</strong> lets a spike open one connection per concurrent request until Postgres refuses them. <strong>Only 2 idle</strong> means that at a steady concurrency of 20, the pool keeps closing connections and re-dialing them a millisecond later. If <code>MaxIdleClosed</code> climbs steadily, set <code>SetMaxIdleConns</code> equal to the cap.</p>
+<p><code>SetConnMaxLifetime</code> exists for the world outside your process: after a failover the DNS name points to a new primary, a load balancer wants to rebalance, a firewall silently drops long-idle TCP flows. Minutes (5–30) is the usual range. Connections are closed when they're released, so a lifetime doesn't kill a running query.</p>
+
+<h3>How big should the pool be?</h3>
+<p>Start from <strong>Little's law</strong>: busy connections = queries per second × average time a connection is held. At 2,000 queries/s and 5 ms per query, about 10 connections are busy on average. Allow headroom for bursts, and that's your per-instance cap. If the number comes out huge, the fix is usually shorter hold times (faster queries, no network calls inside transactions), not a bigger pool.</p>
+<p>Then do the fleet math, which is where most outages come from: <strong>cap per instance × number of instances (at the autoscaler's maximum) + cron jobs + migrations + admin sessions must stay under <code>max_connections</code></strong>. Each app instance has its own pool and knows nothing of the others.</p>
+<p>For the database side, the HikariCP wiki ("About Pool Sizing") quotes a starting point from the PostgreSQL project: <code>connections = (core_count × 2) + effective_spindle_count</code>, with spindles = 0 when the data is cached. It is a starting point for load tests, not a law. The idea holds, though: 16 cores don't go faster with 500 active connections than with 40. They usually go slower, from context switching and lock contention.</p>
+
+<h3>External poolers: PgBouncer and friends</h3>
+<p>An in-app pool limits connections per process. With dozens of pods, serverless functions or several services on one database, the total is still too high. An external pooler sits between all of them and Postgres and multiplexes thousands of cheap client connections onto a few real server connections.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" role="img" aria-label="Left: without a pooler, 30 pods with pools of 10 open 300 connections to PostgreSQL whose max_connections is 100, and new clients get FATAL sorry, too many clients already. Right: with PgBouncer in transaction mode, the same 300 client connections go to PgBouncer, which uses 20 server connections to PostgreSQL. A client holds a server connection only for the length of one transaction.">
+  <defs><marker id="arr-pool-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="195" y="24" text-anchor="middle" class="title">Without a pooler</text>
+  <text x="595" y="24" text-anchor="middle" class="title">With PgBouncer (transaction mode)</text>
+  <path class="line dashed" d="M390 10 V290" style="stroke: var(--line)"/>
+
+  <rect class="box" x="30" y="50" width="110" height="40" rx="6"/><text x="85" y="67" text-anchor="middle">pod 1</text><text x="85" y="82" text-anchor="middle" class="small">pool of 10</text>
+  <rect class="box" x="30" y="100" width="110" height="40" rx="6"/><text x="85" y="117" text-anchor="middle">pod 2</text><text x="85" y="132" text-anchor="middle" class="small">pool of 10</text>
+  <text x="85" y="160" text-anchor="middle">⋮</text>
+  <rect class="box" x="30" y="170" width="110" height="40" rx="6"/><text x="85" y="187" text-anchor="middle">pod 30</text><text x="85" y="202" text-anchor="middle" class="small">pool of 10</text>
+  <path class="line bad" d="M140 70 L238 112" marker-end="url(#arr-pool-3)"/>
+  <path class="line bad" d="M140 120 L238 128" marker-end="url(#arr-pool-3)"/>
+  <path class="line bad" d="M140 190 L238 146" marker-end="url(#arr-pool-3)"/>
+  <rect class="box bad" x="240" y="90" width="130" height="76" rx="8"/>
+  <text x="305" y="114" text-anchor="middle" class="title">PostgreSQL</text>
+  <text x="305" y="134" text-anchor="middle">300 wanted</text>
+  <text x="305" y="152" text-anchor="middle" class="small">max_connections 100</text>
+  <text x="195" y="244" text-anchor="middle" class="small">connection 101 gets:</text>
+  <text x="195" y="262" text-anchor="middle" class="small">FATAL: sorry, too many clients already</text>
+
+  <rect class="box" x="420" y="50" width="100" height="40" rx="6"/><text x="470" y="67" text-anchor="middle">pod 1</text><text x="470" y="82" text-anchor="middle" class="small">pool of 10</text>
+  <rect class="box" x="420" y="100" width="100" height="40" rx="6"/><text x="470" y="117" text-anchor="middle">pod 2</text><text x="470" y="132" text-anchor="middle" class="small">pool of 10</text>
+  <text x="470" y="160" text-anchor="middle">⋮</text>
+  <rect class="box" x="420" y="170" width="100" height="40" rx="6"/><text x="470" y="187" text-anchor="middle">pod 30</text><text x="470" y="202" text-anchor="middle" class="small">pool of 10</text>
+  <path class="line" d="M520 70 L568 112" marker-end="url(#arr-pool-3)"/>
+  <path class="line" d="M520 120 L568 128" marker-end="url(#arr-pool-3)"/>
+  <path class="line" d="M520 190 L568 146" marker-end="url(#arr-pool-3)"/>
+  <rect class="box accent" x="570" y="90" width="90" height="76" rx="8"/>
+  <text x="615" y="114" text-anchor="middle" class="title">PgBouncer</text>
+  <text x="615" y="134" text-anchor="middle" class="small">300 clients</text>
+  <text x="615" y="152" text-anchor="middle" class="small">→ 20 servers</text>
+  <path class="line ok" d="M660 128 H688" marker-end="url(#arr-pool-3)"/>
+  <rect class="box ok" x="690" y="90" width="76" height="76" rx="8"/>
+  <text x="728" y="124" text-anchor="middle" class="title">Postgres</text>
+  <text x="728" y="142" text-anchor="middle" class="small">20 conns</text>
+  <text x="595" y="244" text-anchor="middle" class="small">a client gets a server connection only</text>
+  <text x="595" y="262" text-anchor="middle" class="small">for the length of one transaction</text>
+</svg>
+<figcaption>Same fleet, same per-pod pools. The pooler turns "300 connections that are mostly idle" into "20 connections that are mostly busy". It works because most app connections sit idle between transactions.</figcaption>
+</figure>
+<p>The price: in PgBouncer's two aggressive modes, your next transaction may run on a different server connection, so anything stored in the <em>session</em> doesn't follow you.</p>
+<table>
+  <tr><th>Mode</th><th>Server connection is held for</th><th>Works</th><th>Breaks</th><th>Use when</th></tr>
+  <tr><td><strong>session</strong></td><td>the whole client connection</td><td>every Postgres feature</td><td>nothing, but there is little multiplexing: idle clients still hold a server connection</td><td>you need session features; you mainly want to cap and queue connections</td></tr>
+  <tr><td><strong>transaction</strong></td><td>one transaction</td><td>normal queries and transactions, <code>NOTIFY</code>, <code>SET LOCAL</code>, <code>ON COMMIT DROP</code> temp tables, protocol-level prepared statements once <code>max_prepared_statements</code> is non-zero (PgBouncer 1.21+)</td><td>session <code>SET</code>/<code>RESET</code>, <code>LISTEN</code>, SQL-level <code>PREPARE</code>/<code>DEALLOCATE</code>, <code>WITH HOLD</code> cursors, session advisory locks (<code>pg_advisory_lock</code>), temp tables that outlive a transaction, <code>LOAD</code></td><td>the usual choice for many app instances or serverless</td></tr>
+  <tr><td><strong>statement</strong></td><td>one statement</td><td>autocommit single statements</td><td>everything above, plus multi-statement transactions (they are refused)</td><td>rare; built for PL/Proxy-style setups</td></tr>
+</table>
+<pre><code>; pgbouncer.ini  (illustration, not executed here)
+[databases]
+orders = host=10.0.0.5 port=5432 dbname=orders
+
+[pgbouncer]
+listen_port = 6432
+pool_mode = transaction        ; server conn is held only for one transaction
+default_pool_size = 20         ; server conns per (database, user) pair
+max_client_conn = 2000         ; app-side conns PgBouncer will accept
+max_prepared_statements = 200  ; &gt;0 enables prepared statements in transaction mode (1.21+)</code></pre>
+<p>Keep the app's own pool in front of PgBouncer; it saves the TCP/TLS setup to PgBouncer. One Go trap: pgx's default mode prepares and caches named statements per server connection. Behind PgBouncer in transaction mode without prepared statement support (before 1.21, or <code>max_prepared_statements = 0</code>), you get errors about prepared statements that don't exist or already exist. Enable the support, or pick a pgx mode without named statements:</p>
+<pre><code>// Behind an old PgBouncer (&lt; 1.21) in transaction mode, stop pgx from
+// using named prepared statements, which live on one server connection:
+dsn := "postgres://app@pgbouncer:6432/orders?default_query_exec_mode=exec"
+// or in code: cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec</code></pre>
+<p><strong>Amazon RDS Proxy</strong> also multiplexes at transaction boundaries. When it sees session state, it <strong>pins</strong> the client to one database connection until disconnect. For PostgreSQL, AWS lists session <code>SET</code> (not <code>SET LOCAL</code> in a transaction), <code>PREPARE</code>, temp tables, cursors, <code>LISTEN</code> and session advisory locks. Watch the <code>DatabaseConnectionsCurrentlySessionPinned</code> metric.</p>
+
+<h2>Example</h2>
+<p><strong>Saturating and leaking a real pool.</strong> These tests start a real PostgreSQL with <code>embedded-postgres</code> and talk to it through <code>database/sql</code> with the pgx driver. <code>Burst</code> runs 20 goroutines through a pool of 5. <code>FirstOrderLeaky</code> has the most common pool bug in Go: it returns without closing <code>rows</code>.</p>
+<pre><code>package connpool
+
+import (
+	"context"
+	"database/sql"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver for database/sql
+)
+
+// Open returns a database/sql pool with all four knobs set explicitly.
+func Open(dsn string, maxOpen int) (*sql.DB, error) {
+	db, err := sql.Open("pgx", dsn) // no connection is made yet
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(maxOpen)             // hard cap: callers queue beyond this
+	db.SetMaxIdleConns(maxOpen)             // keep them warm (default is only 2)
+	db.SetConnMaxLifetime(30 * time.Minute) // recycle: DNS changes, failover, LB rebalancing
+	db.SetConnMaxIdleTime(5 * time.Minute)  // shrink after a burst
+	return db, nil
+}
+
+// Burst runs &#96;workers&#96; goroutines that each hold a connection for &#96;hold&#96;.
+// It returns the highest number of queries that ran at the same time.
+func Burst(ctx context.Context, db *sql.DB, workers int, hold time.Duration) int {
+	var mu sync.Mutex
+	running, peak := 0, 0
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			conn, err := db.Conn(ctx) // waits here when the pool is empty
+			if err != nil {
+				return
+			}
+			defer conn.Close() // returns it to the pool
+			mu.Lock()
+			running++
+			peak = max(peak, running)
+			mu.Unlock()
+			conn.ExecContext(ctx, "SELECT pg_sleep($1)", hold.Seconds())
+			mu.Lock()
+			running--
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+	return peak
+}
+
+// FirstOrderLeaky has the classic bug: it returns early without rows.Close(),
+// so the connection never goes back to the pool.
+func FirstOrderLeaky(ctx context.Context, db *sql.DB) (int, error) {
+	rows, err := db.QueryContext(ctx, "SELECT id FROM orders ORDER BY id")
+	if err != nil {
+		return 0, err
+	}
+	var id int
+	if rows.Next() {
+		err = rows.Scan(&amp;id)
+		return id, err // BUG: rows still open, connection still checked out
+	}
+	return 0, rows.Err()
+}
+
+// FirstOrder is the fix: defer rows.Close() right after the error check.
+func FirstOrder(ctx context.Context, db *sql.DB) (int, error) {
+	rows, err := db.QueryContext(ctx, "SELECT id FROM orders ORDER BY id")
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var id int
+	if rows.Next() {
+		err = rows.Scan(&amp;id)
+		return id, err // deferred Close runs here: connection goes back
+	}
+	return 0, rows.Err()
+}
+
+// NewPgxPool is the pgx-native pool; same ideas, different knob names.
+func NewPgxPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxConns = 10 // default: max(4, runtime.NumCPU())
+	cfg.MinConns = 2
+	cfg.MaxConnLifetime = 30 * time.Minute
+	cfg.MaxConnIdleTime = 5 * time.Minute
+	return pgxpool.NewWithConfig(ctx, cfg)
+}</code></pre>
+<p>The tests are <code>Example</code> functions: <code>go test</code> fails if the printed output differs from the <code>// Output:</code> block, so those lines are real.</p>
+<pre><code>func ExampleBurst() {
+	ctx := context.Background()
+	db, _ := Open(dsn, 5)
+	defer db.Close()
+	var maxConns int
+	db.QueryRow("SHOW max_connections").Scan(&amp;maxConns)
+	fmt.Println("server max_connections:", maxConns)
+
+	peak := Burst(ctx, db, 20, 100*time.Millisecond)
+	s := db.Stats()
+	fmt.Println("workers: 20, pool cap:", s.MaxOpenConnections)
+	fmt.Println("peak concurrent queries:", peak)
+	fmt.Println("open connections:", s.OpenConnections, "idle:", s.Idle)
+	fmt.Println("WaitCount:", s.WaitCount)
+	fmt.Println("waited &gt; 1s in total:", s.WaitDuration &gt; time.Second)
+	// Output:
+	// server max_connections: 100
+	// workers: 20, pool cap: 5
+	// peak concurrent queries: 5
+	// open connections: 5 idle: 5
+	// WaitCount: 15
+	// waited &gt; 1s in total: true
+}
+
+func ExampleFirstOrderLeaky() {
+	ctx := context.Background()
+	db, _ := Open(dsn, 2)
+	defer db.Close()
+	db.Exec("CREATE TABLE IF NOT EXISTS orders (id int PRIMARY KEY)")
+	db.Exec("INSERT INTO orders SELECT g FROM generate_series(1, 10) g ON CONFLICT DO NOTHING")
+
+	for i := 1; i &lt;= 2; i++ {
+		id, err := FirstOrderLeaky(ctx, db) // e.g. a background job: ctx never ends
+		fmt.Printf("leaky call %d: id=%d err=%v inUse=%d&#92;n", i, id, err, db.Stats().InUse)
+	}
+	c, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	_, err := FirstOrderLeaky(c, db) // a request with a 500 ms budget
+	cancel()
+	fmt.Printf("leaky call 3: err=%v waits=%d&#92;n", err, db.Stats().WaitCount)
+
+	db2, _ := Open(dsn, 2)
+	defer db2.Close()
+	for i := 1; i &lt;= 3; i++ {
+		id, err := FirstOrder(ctx, db2)
+		fmt.Printf("fixed call %d: id=%d err=%v inUse=%d&#92;n", i, id, err, db2.Stats().InUse)
+	}
+	// Output:
+	// leaky call 1: id=1 err=&lt;nil&gt; inUse=1
+	// leaky call 2: id=1 err=&lt;nil&gt; inUse=2
+	// leaky call 3: err=context deadline exceeded waits=1
+	// fixed call 1: id=1 err=&lt;nil&gt; inUse=0
+	// fixed call 2: id=1 err=&lt;nil&gt; inUse=0
+	// fixed call 3: id=1 err=&lt;nil&gt; inUse=0
+}</code></pre>
+<p>A third test, <code>TestReuse</code>, runs <code>SELECT 1</code> 200 times through a pool with <code>SetMaxIdleConns(0)</code>, then with 5, and logs the time (laptop, Postgres on localhost, no TLS):</p>
+<pre><code>    pool_test.go:74: maxIdle=0: 2.942s, connections thrown away: 200
+    pool_test.go:74: maxIdle=5: 26ms, connections thrown away: 0
+ok  	example.com/connpool	11.549s</code></pre>
+<ul>
+  <li><strong>Reuse.</strong> With <code>maxIdle=0</code>, every query dialed, authenticated and got a freshly forked backend: about 15 ms each, even on localhost. Reusing connections took about 1% of the time.</li>
+  <li><strong>Saturation.</strong> Never more than 5 queries ran at once, and exactly 15 goroutines waited (<code>WaitCount: 15</code>). That queue is the pool working. In production, watch <code>WaitCount</code> and <code>WaitDuration</code> <em>growing</em> between scrapes.</li>
+  <li><strong>Leak.</strong> Each leaky call left a connection checked out. The third call never got one: <code>context deadline exceeded</code> while the database sat idle. The fixed version always ends at <code>inUse=0</code>.</li>
+</ul>
+<p><code>database/sql</code> does close a <code>Rows</code> when the context given to <code>QueryContext</code> is cancelled, so in an HTTP handler a forgotten <code>rows.Close()</code> leaks only until the request ends. With <code>context.Background()</code> it leaks for good, as above. Always <code>defer rows.Close()</code>.</p>
+
+<p><strong>Real-world scenario.</strong> An orders API runs 8 pods with <code>SetMaxOpenConns(20)</code>: 160 connections against <code>max_connections = 200</code>. On a sale day the autoscaler goes to 24 pods, 480 potential connections. Once about ten pods are up, new ones fail readiness with <code>too many clients already</code>, and the old ones slow down because Postgres is juggling ~190 backends on 16 cores. The fix: PgBouncer in transaction mode with <code>default_pool_size = 40</code>, each pod capped at 10 with <code>SetMaxIdleConns(10)</code>, and a dashboard panel for <code>WaitDuration</code>. Postgres now sees at most 40 busy connections; the waiting moves into PgBouncer and the pods' pools, where it is visible and bounded by request timeouts.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Forgetting the fleet math.</strong> A pool size is per process. Multiply by the maximum replica count, add workers, cron jobs and migrations, and compare with <code>max_connections</code>. Autoscaling app pods can take the database down.</li>
+  <li><strong>Leaking connections.</strong> Missing <code>rows.Close()</code>, a <code>tx</code> that is never committed or rolled back on an error path, a <code>*sql.Conn</code> never closed. The symptom is timeouts waiting for a connection while the database looks idle. <code>InUse</code> stuck near the cap with low database CPU is the tell.</li>
+  <li><strong>Holding a connection across slow work.</strong> A transaction that calls a payment API or another service holds a connection (and its locks) for the whole call. Do the network call outside the transaction, then open a short one to write the result.</li>
+  <li><strong>"Just make the pool bigger."</strong> If queries are slow because the database is saturated, more connections add contention and make each query slower. Fix the queries (see <a href="#query-optimization">Query Optimization</a>, <a href="#n-1-queries">N+1 Queries</a>) or add capacity.</li>
+  <li><strong>No deadline on getting a connection.</strong> Without one, a caller can wait in the pool's queue forever. Pass a request context with a deadline to every query (see <a href="#timeouts">Timeouts</a>).</li>
+</ul>
+
+<div class="callout warn"><strong>A pool timeout is not a database timeout.</strong> "context deadline exceeded" on a query can mean the query ran too long, or that it never got a connection. Check <code>db.Stats().WaitDuration</code> before you go hunting for a slow query.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Connections are expensive to open and cost server memory; a pool reuses them and caps how many exist.</li>
+  <li>In Go, <code>*sql.DB</code> is the pool: create one, share it, and set all four knobs. The defaults are unlimited open connections and only 2 idle.</li>
+  <li>Size with Little's law and the fleet sum: cap × instances must fit under <code>max_connections</code>. Smaller and busy beats bigger and contended.</li>
+  <li>With many instances, put PgBouncer (transaction mode) or RDS Proxy in front, and stop relying on session state.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#read-replicas">Read Replicas</a> · <a href="#query-optimization">Query Optimization</a> · <a href="#n-1-queries">N+1 Queries</a> · <a href="#timeouts">Timeouts</a> · <a href="#backpressure">Backpressure</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
+`;
