@@ -1952,3 +1952,280 @@ func HeaderCopy(upload []byte) []byte { return bytes.Clone(upload[:16]) }</code>
 
 <p><strong>Related:</strong> <a href="#garbage-collection">Garbage Collection</a> · <a href="#timeouts">Timeouts</a> · <a href="#caching">Caching</a> · <a href="#kubernetes">Kubernetes</a> · <a href="#metrics">Metrics</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
 `;
+CONTENT["garbage-collection"] = `
+<p class="tldr"><strong>TL;DR</strong>: A garbage collector (GC) finds memory your program can no longer reach and reuses it, so you never call <code>free</code>. Go's GC is like a cleaner who walks the office <em>while people keep working</em>, tagging every desk someone still uses, then clears the rest. You pay in CPU and extra memory instead of in crashes, and you control the bill mainly by <strong>allocating less</strong>.</p>
+
+<h2>The problem it solves</h2>
+<p>Every program allocates memory for values whose lifetime the compiler can't predict: a request body, a cache entry, a node in a tree. Someone has to give that memory back. There are three ways to do it:</p>
+<ul>
+  <li><strong>Manual</strong> (C <code>malloc</code>/<code>free</code>). Fast and predictable, but free too early and you get use-after-free; free twice and you corrupt the heap; forget and you leak.</li>
+  <li><strong>Reference counting</strong> (CPython, Swift, Rust's <code>Rc</code>/<code>Arc</code>). Each object counts who points to it and is freed when the count hits zero. Memory comes back immediately, but every pointer copy updates a counter, and a cycle (A points to B, B points to A) never reaches zero on its own.</li>
+  <li><strong>Tracing GC</strong> (Go, Java, .NET, JavaScript). Every so often, start from the <em>roots</em> (globals, goroutine stacks, registers), follow every pointer, and mark what you reach. Whatever isn't marked is garbage. Cycles are not a problem: an unreachable cycle is just unreachable.</li>
+</ul>
+<p>Tracing GC costs CPU (the marking work), memory (garbage waits around until the next cycle) and sometimes latency (pauses). Go chose short pauses and simple tuning.</p>
+
+<h2>How it works</h2>
+<p>Go uses a <strong>concurrent tri-color mark-and-sweep</strong> collector. In the runtime's own words (<code>runtime/mgc.go</code>): concurrent with the program, type-precise, parallel, using a write barrier, and <strong>non-generational and non-compacting</strong>. Objects never move, so a pointer stays valid for an object's whole life.</p>
+<p>Marking uses three colors. <strong>White</strong>: not reached yet. <strong>Grey</strong>: reached, but its pointers haven't been scanned. <strong>Black</strong>: reached and fully scanned. Marking is just "take a grey object, shade its children grey, turn it black" until no grey is left.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="Tri-color marking in three snapshots. Objects A to E start white. 1: roots point to A, which turns grey. 2: A is scanned and turns black; its children B and C turn grey. 3: B and C are scanned and turn black. D and E, which only point to each other, are never reached, stay white and are freed by the sweep.">
+  <defs><marker id="arr-gcol-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="130" y="30" text-anchor="middle" class="title">1. Start</text>
+  <rect class="box muted" x="20" y="56" width="56" height="30" rx="6"/><text x="48" y="76" text-anchor="middle">roots</text>
+  <rect class="box accent" x="100" y="56" width="44" height="30" rx="6"/><text x="122" y="76" text-anchor="middle">A</text>
+  <rect class="box" x="180" y="56" width="44" height="30" rx="6"/><text x="202" y="76" text-anchor="middle">B</text>
+  <rect class="box" x="100" y="126" width="44" height="30" rx="6"/><text x="122" y="146" text-anchor="middle">C</text>
+  <rect class="box" x="100" y="196" width="44" height="30" rx="6"/><text x="122" y="216" text-anchor="middle">D</text>
+  <rect class="box" x="180" y="196" width="44" height="30" rx="6"/><text x="202" y="216" text-anchor="middle">E</text>
+  <path class="line" d="M76 71 H98" marker-end="url(#arr-gcol-1)"/>
+  <path class="line" d="M144 71 H178" marker-end="url(#arr-gcol-1)"/>
+  <path class="line" d="M122 86 V124" marker-end="url(#arr-gcol-1)"/>
+  <path class="line" d="M144 211 H178" marker-end="url(#arr-gcol-1)"/>
+  <text x="130" y="252" text-anchor="middle" class="small">roots shade what they</text>
+  <text x="130" y="267" text-anchor="middle" class="small">point to grey</text>
+  <text x="390" y="30" text-anchor="middle" class="title">2. Marking</text>
+  <rect class="box muted" x="280" y="56" width="56" height="30" rx="6"/><text x="308" y="76" text-anchor="middle">roots</text>
+  <rect class="box ok" x="360" y="56" width="44" height="30" rx="6"/><text x="382" y="76" text-anchor="middle">A</text>
+  <rect class="box accent" x="440" y="56" width="44" height="30" rx="6"/><text x="462" y="76" text-anchor="middle">B</text>
+  <rect class="box accent" x="360" y="126" width="44" height="30" rx="6"/><text x="382" y="146" text-anchor="middle">C</text>
+  <rect class="box" x="360" y="196" width="44" height="30" rx="6"/><text x="382" y="216" text-anchor="middle">D</text>
+  <rect class="box" x="440" y="196" width="44" height="30" rx="6"/><text x="462" y="216" text-anchor="middle">E</text>
+  <path class="line" d="M336 71 H358" marker-end="url(#arr-gcol-1)"/>
+  <path class="line" d="M404 71 H438" marker-end="url(#arr-gcol-1)"/>
+  <path class="line" d="M382 86 V124" marker-end="url(#arr-gcol-1)"/>
+  <path class="line" d="M404 211 H438" marker-end="url(#arr-gcol-1)"/>
+  <text x="390" y="252" text-anchor="middle" class="small">scan a grey object: its</text>
+  <text x="390" y="267" text-anchor="middle" class="small">children go grey, it goes black</text>
+  <text x="650" y="30" text-anchor="middle" class="title">3. Mark done</text>
+  <rect class="box muted" x="540" y="56" width="56" height="30" rx="6"/><text x="568" y="76" text-anchor="middle">roots</text>
+  <rect class="box ok" x="620" y="56" width="44" height="30" rx="6"/><text x="642" y="76" text-anchor="middle">A</text>
+  <rect class="box ok" x="700" y="56" width="44" height="30" rx="6"/><text x="722" y="76" text-anchor="middle">B</text>
+  <rect class="box ok" x="620" y="126" width="44" height="30" rx="6"/><text x="642" y="146" text-anchor="middle">C</text>
+  <rect class="box bad" x="620" y="196" width="44" height="30" rx="6"/><text x="642" y="216" text-anchor="middle">D</text>
+  <rect class="box bad" x="700" y="196" width="44" height="30" rx="6"/><text x="722" y="216" text-anchor="middle">E</text>
+  <path class="line" d="M596 71 H618" marker-end="url(#arr-gcol-1)"/>
+  <path class="line" d="M664 71 H698" marker-end="url(#arr-gcol-1)"/>
+  <path class="line" d="M642 86 V124" marker-end="url(#arr-gcol-1)"/>
+  <path class="line" d="M664 211 H698" marker-end="url(#arr-gcol-1)"/>
+  <text x="650" y="252" text-anchor="middle" class="small">no grey left: anything still</text>
+  <text x="650" y="267" text-anchor="middle" class="small">white is garbage, sweep frees it</text>
+  <path class="line dashed" d="M265 20 V240" style="stroke: var(--line)"/>
+  <path class="line dashed" d="M525 20 V240" style="stroke: var(--line)"/>
+</svg>
+<figcaption>Plain boxes are white, orange are grey, green are black, red are white objects left at the end: garbage. D and E point to each other, which would fool reference counting, but nothing reaches them, so tracing frees them.</figcaption>
+</figure>
+<p><strong>The write barrier.</strong> Marking runs while your goroutines keep changing pointers. Picture this: the GC has already scanned A (black). Your code stores a pointer to white object W into A, then deletes the only other pointer to W, from a grey object. The GC won't rescan A, never sees W, and frees memory still in use. To prevent this, while marking is on, the compiler-inserted <strong>write barrier</strong> runs on every pointer write in the heap and shades the objects involved grey. Go's is a hybrid barrier: it shades both the object whose reference is being overwritten (Yuasa-style) and the object being written (Dijkstra-style). It costs a little on each pointer write, only during marking.</p>
+
+<h3>One GC cycle</h3>
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="Timeline of one GC cycle with the heap size above it. The program allocates and the heap grows from the live heap toward the goal. Before the goal, a short stop-the-world sweep termination starts the cycle. Concurrent marking follows, with the write barrier on, about 25 percent of CPU for background workers, and mark assists from goroutines that allocate. A short stop-the-world mark termination ends marking. Sweeping then runs lazily and concurrently, the in-use heap falls back to the live heap, and the program keeps allocating.">
+  <defs><marker id="arr-gcol-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <path class="line" d="M60 170 V30" marker-end="url(#arr-gcol-2)"/>
+  <text x="52" y="40" text-anchor="end" class="small">heap</text>
+  <path class="line bad dashed" d="M60 62 H740"/>
+  <text x="70" y="55" class="small">goal = live + (live + roots) × GOGC/100</text>
+  <path class="line ok dashed" d="M60 150 H740"/>
+  <text x="70" y="166" class="small">live heap (what marking found reachable last cycle)</text>
+  <path class="line accent" d="M60 150 L330 84 L520 70 L640 150 L740 112"/>
+  <text x="430" y="54" text-anchor="middle" class="small">allocation keeps going during marking</text>
+
+  <rect class="box" x="60" y="190" width="270" height="40" rx="4"/><text x="195" y="215" text-anchor="middle">program runs and allocates</text>
+  <rect class="box bad" x="330" y="190" width="10" height="40"/>
+  <rect class="box accent" x="340" y="190" width="180" height="40" rx="4"/><text x="430" y="207" text-anchor="middle">concurrent mark</text><text x="430" y="223" text-anchor="middle" class="small">write barrier · assists</text>
+  <rect class="box bad" x="520" y="190" width="10" height="40"/>
+  <rect class="box ok" x="530" y="190" width="110" height="40" rx="4"/><text x="585" y="215" text-anchor="middle">sweep</text>
+  <rect class="box" x="640" y="190" width="100" height="40" rx="4"/><text x="690" y="215" text-anchor="middle">allocates</text>
+  <path class="line bad" d="M335 232 V246"/><text x="335" y="260" text-anchor="middle" class="small">STW: sweep termination</text>
+  <path class="line bad" d="M525 232 V262"/><text x="525" y="276" text-anchor="middle" class="small">STW: mark termination</text>
+</svg>
+<figcaption>Only the two thin red slices stop the world; the Go GC guide calls them brief pauses at the transitions between mark and sweep. Marking starts <em>before</em> the heap reaches the goal, so that it can finish around the goal while the program keeps allocating.</figcaption>
+</figure>
+<ul>
+  <li><strong>The pacer</strong> decides when to start. It aims to finish marking just as the heap reaches the goal, based on how fast the program allocated and how long marking took last time.</li>
+  <li><strong>Background workers</strong> get about 25% of the CPU (of <code>GOMAXPROCS</code>) during marking. The GC guide lists this as a latency source: the GC takes 25% of CPU during the mark phase.</li>
+  <li><strong>Mark assists</strong>: a goroutine that allocates fast during marking is made to do some marking itself, in proportion to what it allocates. That is why allocation-heavy requests slow down during a GC.</li>
+  <li><strong>Sweeping</strong> is lazy: spans are swept in the background or when the allocator needs them. Memory is reused within the process first and returned to the OS gradually.</li>
+  <li><strong>Green Tea.</strong> Go 1.25 shipped a new marking implementation, the Green Tea GC, as an experiment; Go 1.26 made it the default. Per the release notes it marks and scans small objects with better locality and CPU scalability (they expect 10–40% less GC overhead in GC-heavy programs). The model above is unchanged.</li>
+</ul>
+
+<h3>The two knobs: GOGC and GOMEMLIMIT</h3>
+<p><strong><code>GOGC</code></strong> (default 100) sets how much the heap may grow past the live heap before the next cycle. The GC guide's formula: <em>target heap = live heap + (live heap + GC roots) × GOGC / 100</em>. With 50 MiB live and GOGC=100, the next GC targets about 100 MiB. GOGC=200 lets it reach about 150 MiB: half as many GCs, more memory. Fewer GCs means less GC CPU; the price is memory. <code>GOGC=off</code> disables the GC.</p>
+<p><strong><code>GOMEMLIMIT</code></strong> (Go 1.19) sets a <em>soft</em> limit on all memory the Go runtime manages (heap, stacks, runtime metadata; not cgo memory or the binary itself). When total memory nears the limit, the GC runs more often regardless of GOGC. The limit is soft for a reason: if the live heap itself is close to the limit, the GC would run back to back and the program would make no progress. The GC guide calls this <strong>thrashing</strong>, and caps GC CPU at roughly 50% (over a <code>2 × GOMAXPROCS</code> CPU-second window), so a too-low limit slows the program by at most about 2× instead of freezing it. Past that, memory grows over the limit, and the container may OOM.</p>
+<table>
+  <tr><th>Setting</th><th>Behaviour</th><th>Use when</th></tr>
+  <tr><td><code>GOGC=100</code> (default), no limit</td><td>Heap peaks around 2× live</td><td>You don't know the memory budget (CLIs, libraries, shared hosts)</td></tr>
+  <tr><td><code>GOGC=200…400</code></td><td>Fewer GCs, higher peak</td><td>GC CPU is a real cost and there is spare memory</td></tr>
+  <tr><td><code>GOGC=100</code> + <code>GOMEMLIMIT</code></td><td>Normal, but GCs harder near the limit</td><td>Containers: a safety net against OOMKill during spikes</td></tr>
+  <tr><td><code>GOGC=off</code> + <code>GOMEMLIMIT</code></td><td>GC runs only when near the limit</td><td>Memory is reserved for this process alone and you want the fewest GCs; risky if the live heap can approach the limit</td></tr>
+  <tr><td><code>GOGC=off</code>, no limit</td><td>No GC at all</td><td>Short-lived batch tools only; heap grows without bound</td></tr>
+</table>
+<p>The GC guide's advice: <strong>do</strong> set a memory limit when the program owns its environment, like a container with a fixed memory limit, and leave 5–10% headroom for memory the runtime doesn't know about. <strong>Don't</strong> use it for CLI tools or anything whose memory depends on its input, and don't use it to rescue a program that is already close to its environment's limit: it will thrash. Both are also settable at runtime with <code>debug.SetGCPercent</code> and <code>debug.SetMemoryLimit</code>.</p>
+
+<h3>How Go compares</h3>
+<table>
+  <tr><th>Runtime</th><th>Approach</th><th>Moves objects?</th><th>Generational?</th><th>Main knobs</th></tr>
+  <tr><td><strong>Go</strong></td><td>Concurrent tri-color mark-sweep, short STW pauses</td><td>No</td><td>No</td><td><code>GOGC</code>, <code>GOMEMLIMIT</code></td></tr>
+  <tr><td><strong>JVM G1</strong></td><td>Region-based, mostly-concurrent marking, copying (evacuating) collection of regions; the default collector since JDK 9</td><td>Yes (compacts)</td><td>Yes</td><td>Heap size (<code>-Xmx</code>), pause-time goal, many more</td></tr>
+  <tr><td><strong>JVM ZGC</strong></td><td>Concurrent marking <em>and</em> relocation, very short pauses largely independent of heap size</td><td>Yes, concurrently</td><td>Yes (since JDK 21; the only mode since JDK 24)</td><td>Heap size</td></tr>
+  <tr><td><strong>.NET</strong></td><td>Generational (gen 0/1/2 plus a large object heap), workstation and server modes, background GC</td><td>Yes (compacts)</td><td>Yes</td><td>GC mode, heap limits</td></tr>
+  <tr><td><strong>CPython</strong></td><td>Reference counting frees most objects immediately; a separate cycle collector finds reference cycles</td><td>No</td><td>Cycle collector only</td><td><code>gc</code> module thresholds</td></tr>
+  <tr><td><strong>Rust</strong></td><td>No GC: ownership frees values when their owner goes out of scope; <code>Rc</code>/<code>Arc</code> are opt-in refcounting (cycles leak unless broken with <code>Weak</code>)</td><td>No</td><td>n/a</td><td>None: the compiler decides</td></tr>
+</table>
+<p>Why no generations or compaction? Objects that never move keep cgo, <code>unsafe</code> and interior pointers simple, and escape analysis already keeps many short-lived values on the stack, which is part of what a young generation is for. The trade: no compaction of a fragmented heap, and every cycle marks the whole live heap.</p>
+
+<h2>Example</h2>
+<p><strong>1. The same workload under four settings.</strong> <code>gcload</code> keeps 50 MiB alive and churns through 2 GiB of short-lived 1 MiB buffers, sampling the heap through <code>runtime/metrics</code> (cheap, unlike <code>ReadMemStats</code>, which stops the world).</p>
+<pre><code>// imports: fmt, math, runtime, runtime/debug, runtime/metrics
+var live [][]byte // long-lived data: 50 MiB
+
+func main() {
+	for range 50 {
+		live = append(live, make([]byte, 1&lt;&lt;20))
+	}
+	sample := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	var peak uint64
+	var sink []byte
+	for i := range 2 &lt;&lt; 10 { // 2048 x 1 MiB of garbage
+		sink = make([]byte, 1&lt;&lt;20)
+		sink[0] = byte(i)
+		metrics.Read(sample) // cheap, no stop-the-world (unlike ReadMemStats)
+		peak = max(peak, sample[0].Value.Uint64())
+	}
+	var m runtime.MemStats
+	runtime.ReadMemStats(&amp;m)
+	fmt.Printf("GCs=%-3d peak heap=%3dMiB  GC CPU=%.1f%%  (GOGC=%d, limit set: %v)&#92;n",
+		m.NumGC, peak&gt;&gt;20, m.GCCPUFraction*100,
+		debug.SetGCPercent(-1), debug.SetMemoryLimit(-1) != math.MaxInt64)
+}</code></pre>
+<p>Laptop run (Apple M4 Pro, 12 P). GC counts are stable across runs; peak heap and GC CPU vary by about ±20%:</p>
+<pre><code>$ GOGC=100 ./gcload
+$ GOGC=400 ./gcload
+$ GOGC=off GOMEMLIMIT=120MiB ./gcload
+$ GOGC=off ./gcload
+GCs=43  peak heap=136MiB  GC CPU=4.7%  (GOGC=100, limit set: false)
+GCs=10  peak heap=364MiB  GC CPU=0.9%  (GOGC=400, limit set: false)
+GCs=36  peak heap=115MiB  GC CPU=5.7%  (GOGC=-1, limit set: true)
+GCs=0   peak heap=2098MiB  GC CPU=0.0%  (GOGC=-1, limit set: false)</code></pre>
+<ul>
+  <li><strong>GOGC=100</strong>: 43 cycles. The goal is about 2× the 50 MiB live set; the peak lands above it because the program keeps allocating while marking runs.</li>
+  <li><strong>GOGC=400</strong>: a quarter of the cycles and a fraction of the GC CPU, for 2.5–3× the peak memory. That is the whole trade in one line.</li>
+  <li><strong>GOGC=off + 120 MiB limit</strong>: the GC only runs near the limit, and the peak stays around it. (It can overshoot slightly; the limit is soft and the sample counts heap objects only.)</li>
+  <li><strong>GOGC=off, no limit</strong>: zero GCs and a 2 GiB heap for a 50 MiB live set. In a 512 MiB container this process gets OOMKilled.</li>
+</ul>
+<p><strong>2. Reading <code>gctrace</code>.</strong> <code>GODEBUG=gctrace=1</code> prints one line per cycle to stderr. One real line from the GOGC=100 run:</p>
+<pre><code>$ GODEBUG=gctrace=1 ./gcload     (one line, wrapped here)
+gc 21 @0.008s 3%: 0.013+0.068+0.008 ms clock,
+    0.16+0.012/0.056/0.010+0.10 ms cpu,
+    104-&gt;111-&gt;57 MB, 108 MB goal,
+    0 MB stacks, 0 MB globals, 12 P</code></pre>
+<table>
+  <tr><th>Field</th><th>Meaning (from the <code>runtime</code> package docs)</th></tr>
+  <tr><td><code>gc 21</code></td><td>The 21st GC since the program started</td></tr>
+  <tr><td><code>@0.008s</code></td><td>Seconds since program start</td></tr>
+  <tr><td><code>3%</code></td><td>Share of time spent in GC since program start</td></tr>
+  <tr><td><code>0.013+0.068+0.008 ms clock</code></td><td>Wall time of STW sweep termination + concurrent mark and scan + STW mark termination. The two pauses here are 13 µs and 8 µs.</td></tr>
+  <tr><td><code>0.16+0.012/0.056/0.010+0.10 ms cpu</code></td><td>CPU time of the same phases; the middle is split into assist / background / idle GC time</td></tr>
+  <tr><td><code>104-&gt;111-&gt;57 MB</code></td><td>Heap at GC start, heap at GC end, and live heap. The heap grew 7 MB <em>during</em> marking; 57 MB survived.</td></tr>
+  <tr><td><code>108 MB goal</code></td><td>The heap goal for this cycle (from the previous cycle's live heap)</td></tr>
+  <tr><td><code>0 MB stacks, 0 MB globals</code></td><td>Scannable stack and global sizes, also counted in the goal</td></tr>
+  <tr><td><code>12 P</code></td><td>Processors used (<code>GOMAXPROCS</code>)</td></tr>
+</table>
+<p>The docs say the format may change between releases. The <em>live heap</em> number (the third one) is the one to watch for leaks: if it climbs cycle after cycle under steady load, see <a href="#memory-leaks">Memory Leaks</a>.</p>
+
+<p><strong>3. Allocate less: the knob you own.</strong> GC cost is driven by how much you allocate (how often cycles run) and how much is live and full of pointers (how long marking takes). The compiler's <em>escape analysis</em> decides what goes on the heap: a value whose address outlives the function, or whose size isn't known at compile time, escapes.</p>
+<pre><code>type Point struct{ X, Y int }
+
+// NewPoint returns a pointer that outlives the call: the Point must live on the heap.
+func NewPoint(x, y int) *Point { return &amp;Point{X: x, Y: y} }
+
+// Dist keeps its Point local: it stays on the stack, zero GC work.
+func Dist(x, y int) int {
+	p := Point{X: x, Y: y}
+	return p.X*p.X + p.Y*p.Y
+}
+
+// IDsGrow appends to a nil slice: it reallocates each time capacity runs out.
+func IDsGrow(n int) []int {
+	var ids []int
+	for i := range n {
+		ids = append(ids, i)
+	}
+	return ids
+}
+
+// IDsPrealloc sizes the slice once.
+func IDsPrealloc(n int) []int {
+	ids := make([]int, 0, n)
+	for i := range n {
+		ids = append(ids, i)
+	}
+	return ids
+}
+
+var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+// RenderPooled reuses buffers across calls instead of allocating one per call.
+func RenderPooled(ids []int) int {
+	buf := bufPool.Get().(*bytes.Buffer)
+	defer func() { buf.Reset(); bufPool.Put(buf) }()
+	for _, id := range ids {
+		buf.Write(strconv.AppendInt(buf.AvailableBuffer(), int64(id), 10))
+		buf.WriteByte(',')
+	}
+	return buf.Len()
+}
+
+// RenderFresh (not shown) is the same loop with a fresh bytes.Buffer per call.</code></pre>
+<pre><code>$ go build -gcflags=-m .   (inlining lines removed; line numbers are in the full alloc.go)
+./alloc.go:38:53: new(bytes.Buffer) escapes to heap
+./alloc.go:12:41: &amp;Point{...} escapes to heap
+./alloc.go:24:15: append escapes to heap
+./alloc.go:31:13: make([]int, 0, n) escapes to heap
+./alloc.go:33:15: append escapes to heap
+./alloc.go:41:19: ids does not escape
+./alloc.go:52:18: ids does not escape</code></pre>
+<p><code>NewPoint</code>'s <code>&amp;Point{…}</code> escapes because the pointer is returned. <code>Dist</code> has no line at all: its <code>Point</code> lives on the stack and the GC never sees it. Both <code>IDs</code> functions escape because they return the slice. The difference is <em>how many times</em>:</p>
+<pre><code>package gcdemo
+
+import (
+	"fmt"
+	"testing"
+)
+
+var sink []int // keeps results alive so the compiler can't drop them
+
+func Example_allocs() {
+	grow := testing.AllocsPerRun(100, func() { sink = IDsGrow(1000) })
+	pre := testing.AllocsPerRun(100, func() { sink = IDsPrealloc(1000) })
+	fmt.Println("append to nil slice:", grow, "allocs per call")
+	fmt.Println("make(.., 0, n):     ", pre, "allocs per call")
+	// Output:
+	// append to nil slice: 9 allocs per call
+	// make(.., 0, n):      1 allocs per call
+}</code></pre>
+<pre><code>$ go test -bench Render -benchmem
+cpu: Apple M4 Pro
+BenchmarkRenderFresh-12     	  157954	      7753 ns/op	    8168 B/op	      12 allocs/op
+BenchmarkRenderPooled-12    	  176229	      6811 ns/op	       0 B/op	       0 allocs/op</code></pre>
+<p>Growing a slice from nil reallocated 9 times for 1,000 elements; preallocating needed one allocation. <code>sync.Pool</code> took the buffer allocation and its regrowth out of the hot path: 12 allocations and 8 KB per call went to zero (laptop benchmark numbers). A pool is a cache the runtime may drop at any GC, not a free list: only put objects in it that are cheap to recreate, and <code>Reset</code> them before reuse.</p>
+<p><strong>Real-world scenario.</strong> A JSON API pod has a 1 GiB container limit and a 300 MiB live heap. With the default GOGC=100 the heap peaks near 600 MiB, and profiling shows 18% of CPU in GC because each request allocates about 2 MB. Setting <code>GOMEMLIMIT=920MiB</code> (about 10% headroom) and <code>GOGC=200</code> cuts GC cycles roughly in half while the limit protects against spikes. Then a <code>-benchmem</code> pass on the hot handler (preallocated slices, a pooled encoder buffer) halves allocations per request again.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>Treating GC as free.</strong> It isn't: 25% of CPU during marking, assists that slow allocating goroutines, and a heap that peaks at about 2× live by default. Profile allocations (<code>pprof -sample_index=alloc_space</code>) before blaming the GC.</li>
+  <li><strong>Calling <code>runtime.GC()</code> to "help".</strong> It forces a full, blocking cycle. Outside tests and benchmarks it almost always makes things worse.</li>
+  <li><strong>A memory limit far above the container limit, or none at all.</strong> Without <code>GOMEMLIMIT</code>, the GC doesn't know about the container's limit and can let a spike's garbage push the pod over it. Set it at 90–95% of the container limit.</li>
+  <li><strong>A memory limit too close to the live heap.</strong> The GC thrashes (up to about 50% CPU) and latency goes up for everyone. If the live heap really needs the memory, give the container more.</li>
+  <li><strong>Pointer-heavy data structures.</strong> A map with millions of entries of <code>*Item</code> makes every cycle chase millions of pointers. Values instead of pointers, slices of structs, or IDs instead of pointers make marking cheaper.</li>
+</ul>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>A tracing GC frees what is unreachable from the roots. Go's is concurrent tri-color mark-sweep, non-moving and non-generational, with two short stop-the-world pauses per cycle and a write barrier during marking.</li>
+  <li><code>GOGC</code> trades memory for CPU (default 100: heap peaks around 2× live). <code>GOMEMLIMIT</code> is a soft ceiling for containers; leave 5–10% headroom.</li>
+  <li>The biggest lever is allocating less: check escapes with <code>-gcflags=-m</code>, preallocate, pool hot buffers, and measure with <code>-benchmem</code>.</li>
+  <li>Watch the live heap in <code>gctrace</code> or metrics: if it climbs under steady load, you have a leak, not a GC problem.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#memory-leaks">Memory Leaks</a> · <a href="#latency">Latency</a> · <a href="#p99-latency">P99 Latency</a> · <a href="#kubernetes">Kubernetes</a> · <a href="#metrics">Metrics</a> · <a href="#real-world-concurrent-service">Real-World Concurrent Service</a></p>
+`;
