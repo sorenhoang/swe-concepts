@@ -2455,3 +2455,417 @@ PASS</code></pre>
 <p><strong>Related:</strong> <a href="#sharding">Sharding</a> · <a href="#database-indexing">Database Indexing</a> · <a href="#query-optimization">Query Optimization</a> · <a href="#database-migrations">Database Migrations</a> · <a href="#cron-jobs">Cron Jobs</a> · <a href="#real-world-data-layer">Real-World Data Layer</a></p>
 `;
 
+CONTENT["database-migrations"] = `
+<p class="tldr"><strong>TL;DR</strong>: A database migration is a small, numbered script that changes the schema. Migrations live in git next to the code, run in order, and a table in the database records which ones have run, so every environment ends up with the same schema. The hard part isn't the runner. It's changing a table that live traffic is using: do it in small, backward-compatible steps (<strong>expand, migrate, contract</strong>), and never let a DDL statement wait for a lock without a timeout. Think of renovating a restaurant kitchen while it keeps serving: you add the new stove first, move the cooks over, and only then remove the old one.</p>
+
+<h2>The problem it solves</h2>
+<p>The schema is part of your program, but it lives in a different place. The code is rebuilt from git on every deploy. The database is not: it keeps every change ever made to it. Without a system, schema changes go wrong in predictable ways:</p>
+<ul>
+  <li><strong>Drift.</strong> Someone runs an <code>ALTER TABLE</code> by hand in staging and forgets production, or adds a hotfix index nobody wrote down. Now nobody can say what the "real" schema is.</li>
+  <li><strong>No order and no history.</strong> Change B assumes change A already happened. A new developer's laptop, a fresh CI database and a disaster-recovery restore all need to replay every change, in the same order.</li>
+  <li><strong>Downtime.</strong> A schema change on a busy table can lock it. Every request that touches the table waits, the connection pool fills up, and the service goes down, even when the change itself is "instant".</li>
+  <li><strong>Old and new code at the same time.</strong> During a rolling deploy, the previous release is still serving traffic while the new one starts. Whatever the schema is at that moment, <em>both</em> releases must work with it.</li>
+</ul>
+<p>Migrations fix the first two problems almost for free. The last two need discipline, and that's most of this page.</p>
+
+<h2>How it works</h2>
+<p>Each change is a file with a version number: a timestamp or a counter, such as <code>00003_index_last_name.sql</code>. A migration tool (the <em>runner</em>) compares the files it has with a tracking table in the database, then applies the missing ones in order. After each one it records the version. Running it twice does nothing the second time.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 240" role="img" aria-label="Three migration files in the repository, where file 3 is new in this release. A runner takes an advisory lock, reads the version table, sees the database is at version 2, applies only file 3, and records version 3 in the goose_db_version table.">
+  <defs><marker id="arr-mig-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="120" y="22" text-anchor="middle" class="title">Repository (git)</text>
+  <text x="390" y="22" text-anchor="middle" class="title">Runner</text>
+  <text x="660" y="22" text-anchor="middle" class="title">Database</text>
+
+  <rect class="box" x="20" y="40" width="200" height="34" rx="6"/><text x="120" y="61" text-anchor="middle" class="small">00001_create_customers.sql</text>
+  <rect class="box" x="20" y="84" width="200" height="34" rx="6"/><text x="120" y="105" text-anchor="middle" class="small">00002_expand_name_columns.sql</text>
+  <rect class="box accent" x="20" y="128" width="200" height="34" rx="6"/><text x="120" y="149" text-anchor="middle" class="small">00003_index_last_name.sql</text>
+  <text x="120" y="184" text-anchor="middle" class="small">file 3 is new in this release</text>
+
+  <rect class="box accent" x="300" y="56" width="180" height="104" rx="6"/>
+  <text x="390" y="80" text-anchor="middle" class="title">goose up</text>
+  <text x="390" y="102" text-anchor="middle" class="small">1. take an advisory lock</text>
+  <text x="390" y="120" text-anchor="middle" class="small">2. read the version table</text>
+  <text x="390" y="138" text-anchor="middle" class="small">3. apply pending files</text>
+  <path class="line" d="M222 108 H298" marker-end="url(#arr-mig-1)"/>
+  <text x="260" y="100" text-anchor="middle" class="small">files</text>
+
+  <path class="line accent" d="M482 92 H558" marker-end="url(#arr-mig-1)"/>
+  <text x="520" y="84" text-anchor="middle" class="small">apply 3</text>
+  <path class="line dashed" d="M558 128 H482" marker-end="url(#arr-mig-1)"/>
+  <text x="520" y="146" text-anchor="middle" class="small">at v2</text>
+
+  <rect class="box" x="560" y="40" width="200" height="162" rx="6"/>
+  <text x="660" y="60" text-anchor="middle" class="title">goose_db_version</text>
+  <rect class="box ok" x="575" y="70" width="170" height="22" rx="4"/><text x="660" y="85" text-anchor="middle" class="small">version 1, applied</text>
+  <rect class="box ok" x="575" y="98" width="170" height="22" rx="4"/><text x="660" y="113" text-anchor="middle" class="small">version 2, applied</text>
+  <rect class="box accent" x="575" y="126" width="170" height="22" rx="4"/><text x="660" y="141" text-anchor="middle" class="small">version 3, applied now</text>
+  <text x="660" y="172" text-anchor="middle" class="small">customers table</text>
+  <text x="660" y="188" text-anchor="middle" class="small">now matches the code</text>
+  <text x="390" y="228" text-anchor="middle" class="small">A laptop, CI, staging and production all run the same files in the same order, so they end up with the same schema.</text>
+</svg>
+<figcaption>The version table is the database's memory of which files it has seen. The lock stops two runners (say, two pods starting at once) from applying the same file twice.</figcaption>
+</figure>
+
+<h3>The tools</h3>
+<p>Every tool does the same core job. They differ in file format, in how much they generate for you, and in what they do when a migration fails halfway.</p>
+<table>
+  <tr><th>Tool</th><th>Migrations are</th><th>Tracking table</th><th>Rollback</th><th>Notes</th></tr>
+  <tr><td><strong>golang-migrate</strong></td><td>pairs of files: <code>{version}_{title}.up.sql</code> and <code>.down.sql</code></td><td><code>schema_migrations</code> (current version + a <code>dirty</code> flag)</td><td>run the <code>.down</code> files</td><td>Go library + CLI. A failed migration marks the database <em>dirty</em>; you fix it by hand and run <code>force VERSION</code>.</td></tr>
+  <tr><td><strong>goose</strong></td><td>one SQL file with <code>-- +goose Up</code> / <code>Down</code> sections, or Go functions</td><td><code>goose_db_version</code> (one row per applied version)</td><td><code>down</code> / <code>down-to</code></td><td>Go library + CLI, files can be embedded. <code>-- +goose NO TRANSACTION</code> per file. Used below.</td></tr>
+  <tr><td><strong>Atlas</strong></td><td>versioned SQL files, or a desired-state schema (declarative)</td><td>its own revisions table</td><td>generates or plans changes</td><td>Writes the migration by diffing a desired schema (<code>atlas migrate diff</code>), lints risky changes, and an <code>atlas.sum</code> file catches edited history.</td></tr>
+  <tr><td><strong>Flyway</strong></td><td><code>V1__name.sql</code> (versioned) and <code>R__name.sql</code> (repeatable)</td><td><code>flyway_schema_history</code> (with a checksum per file)</td><td>undo migrations (<code>U</code> prefix) in some editions; roll forward otherwise</td><td>JVM. Errors if an applied file's checksum changed; <code>repair</code> fixes the history.</td></tr>
+  <tr><td><strong>Liquibase</strong></td><td>changelogs in SQL, XML, YAML or JSON</td><td><code>DATABASECHANGELOG</code> + <code>DATABASECHANGELOGLOCK</code></td><td>rollback blocks per change set</td><td>JVM. Database-agnostic change types.</td></tr>
+</table>
+<p>Pick one and use it everywhere. The choice matters much less than never changing the schema outside it.</p>
+
+<h3>Running migrations in CI/CD</h3>
+<ul>
+  <li><strong>Before the new code, as its own step.</strong> The usual pipeline is: build, run migrations, then deploy the new release. That only works if the <em>old</em> release still runs on the new schema, which is what expand/contract (below) guarantees.</li>
+  <li><strong>One runner at a time.</strong> A dedicated job (a CI step, a Kubernetes Job, a pre-deploy hook) is the simplest. Running migrations at app startup also works, but then ten pods race for it, so the tool must take a lock. goose's Postgres session locker and golang-migrate both use Postgres advisory locks for this.</li>
+  <li><strong>Test them.</strong> Run every migration from zero in CI against the same engine and version as production, and run risky ones against production-sized data.</li>
+</ul>
+
+<h3>Zero downtime: expand, migrate, contract</h3>
+<p>Renaming a column looks like one statement. In production it's a breaking change: the moment it runs, every running instance that still says <code>full_name</code> starts failing. The fix is to split one breaking change into several compatible ones, each shipped as its own deploy. Martin Fowler's site calls this <em>parallel change</em>; most teams call it <strong>expand/contract</strong>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 290" role="img" aria-label="Five deploys in a row: expand, dual write, backfill, switch reads, contract. Below, bars show that the old column exists until the contract step, the new columns exist from the expand step on, and rolling back the application is safe at every step except after the contract step.">
+  <defs><marker id="arr-mig-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <rect class="box accent" x="15" y="30" width="140" height="74" rx="6"/>
+  <text x="85" y="54" text-anchor="middle" class="title">1. Expand</text>
+  <text x="85" y="74" text-anchor="middle" class="small">add new columns,</text>
+  <text x="85" y="90" text-anchor="middle" class="small">nullable, no default</text>
+  <rect class="box" x="170" y="30" width="140" height="74" rx="6"/>
+  <text x="240" y="54" text-anchor="middle" class="title">2. Dual write</text>
+  <text x="240" y="74" text-anchor="middle" class="small">app writes old</text>
+  <text x="240" y="90" text-anchor="middle" class="small">and new columns</text>
+  <rect class="box" x="325" y="30" width="140" height="74" rx="6"/>
+  <text x="395" y="54" text-anchor="middle" class="title">3. Backfill</text>
+  <text x="395" y="74" text-anchor="middle" class="small">copy old rows</text>
+  <text x="395" y="90" text-anchor="middle" class="small">in small batches</text>
+  <rect class="box" x="480" y="30" width="140" height="74" rx="6"/>
+  <text x="550" y="54" text-anchor="middle" class="title">4. Switch reads</text>
+  <text x="550" y="74" text-anchor="middle" class="small">read new columns,</text>
+  <text x="550" y="90" text-anchor="middle" class="small">stop writing old</text>
+  <rect class="box bad" x="635" y="30" width="140" height="74" rx="6"/>
+  <text x="705" y="54" text-anchor="middle" class="title">5. Contract</text>
+  <text x="705" y="74" text-anchor="middle" class="small">drop old column</text>
+  <text x="705" y="90" text-anchor="middle" class="small">once N-1 is gone</text>
+  <path class="line" d="M156 67 H168" marker-end="url(#arr-mig-2)"/>
+  <path class="line" d="M311 67 H323" marker-end="url(#arr-mig-2)"/>
+  <path class="line" d="M466 67 H478" marker-end="url(#arr-mig-2)"/>
+  <path class="line" d="M621 67 H633" marker-end="url(#arr-mig-2)"/>
+
+  <text x="15" y="138" class="small">old column (full_name)</text>
+  <rect class="box ok" x="15" y="146" width="605" height="24" rx="4"/><text x="317" y="162" text-anchor="middle" class="small">exists, so the previous release keeps working</text>
+  <rect class="box bad" x="635" y="146" width="140" height="24" rx="4"/><text x="705" y="162" text-anchor="middle" class="small">dropped</text>
+
+  <text x="15" y="194" class="small">new columns (first_name, last_name)</text>
+  <rect class="box accent" x="15" y="202" width="760" height="24" rx="4"/><text x="395" y="218" text-anchor="middle" class="small">exist from step 1; filled for new rows from step 2, for all rows after step 3</text>
+
+  <text x="15" y="250" class="small">roll back the app?</text>
+  <rect class="box ok" x="15" y="258" width="605" height="24" rx="4"/><text x="317" y="274" text-anchor="middle" class="small">safe: redeploy the previous release, no data lost</text>
+  <rect class="box bad" x="635" y="258" width="140" height="24" rx="4"/><text x="705" y="274" text-anchor="middle" class="small">point of no return</text>
+</svg>
+<figcaption>Each box is a separate deploy, and you can stop between any two. Only the last step destroys anything, so do it last and do it late.</figcaption>
+</figure>
+<ol>
+  <li><strong>Expand.</strong> Add new structure that old code doesn't notice: a nullable column, a new table, an index.</li>
+  <li><strong>Dual write.</strong> Release code that writes both old and new columns but still reads the old one. New rows are now complete.</li>
+  <li><strong>Backfill.</strong> Copy old rows in small batches (see the example). One giant <code>UPDATE</code> holds row locks for its whole run, floods the replicas with WAL and leaves dead rows for vacuum.</li>
+  <li><strong>Switch reads.</strong> Read the new columns, stop writing the old one, and check the two agree. Add constraints (<code>NOT NULL</code>, foreign keys) the safe way shown below.</li>
+  <li><strong>Contract.</strong> Drop the old column once no code, report or job uses it, at least one release later, so rolling back still works.</li>
+</ol>
+<p>The same five steps cover renaming a table, splitting one, changing a column's type and moving data to a new store. The rule underneath is the one from <a href="#schema-versioning">Schema Versioning</a>: at every moment, the schema must work with release N <em>and</em> release N-1.</p>
+
+<h3>The lock that takes production down</h3>
+<p>In Postgres, most forms of <code>ALTER TABLE</code> take an <code>ACCESS EXCLUSIVE</code> lock, which conflicts with everything, including plain <code>SELECT</code>s. Many of them are "instant": since PostgreSQL 11, <code>ADD COLUMN</code> with a non-volatile default only writes metadata, with no table rewrite. So people assume they're safe. The danger is not how long the change takes. It's how long it <em>waits</em>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 232" role="img" aria-label="A lock queue on the orders table. A long report transaction holds ACCESS SHARE and is granted. An ALTER TABLE asks for ACCESS EXCLUSIVE and waits behind it. Two ordinary app SELECTs, which only need ACCESS SHARE, wait behind the ALTER. With lock_timeout the ALTER gives up and the app queries run.">
+  <defs><marker id="arr-mig-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10z"/></marker></defs>
+  <text x="330" y="22" text-anchor="middle" class="small">lock queue on the table, oldest request on the right</text>
+  <rect class="box bad" x="10" y="40" width="130" height="56" rx="6"/><text x="75" y="63" text-anchor="middle" class="title">app SELECT</text><text x="75" y="82" text-anchor="middle" class="small">waits</text>
+  <rect class="box bad" x="160" y="40" width="130" height="56" rx="6"/><text x="225" y="63" text-anchor="middle" class="title">app SELECT</text><text x="225" y="82" text-anchor="middle" class="small">waits</text>
+  <rect class="box bad" x="310" y="40" width="150" height="56" rx="6"/><text x="385" y="63" text-anchor="middle" class="title">ALTER TABLE</text><text x="385" y="82" text-anchor="middle" class="small">ACCESS EXCLUSIVE, waits</text>
+  <rect class="box ok" x="480" y="40" width="150" height="56" rx="6"/><text x="555" y="63" text-anchor="middle" class="title">report tx</text><text x="555" y="82" text-anchor="middle" class="small">ACCESS SHARE, granted</text>
+  <rect class="box" x="650" y="40" width="120" height="56" rx="6"/><text x="710" y="73" text-anchor="middle" class="title">orders</text>
+  <path class="line" d="M141 68 H158" marker-end="url(#arr-mig-3)"/>
+  <path class="line" d="M291 68 H308" marker-end="url(#arr-mig-3)"/>
+  <path class="line" d="M461 68 H478" marker-end="url(#arr-mig-3)"/>
+  <path class="line ok" d="M631 68 H648" marker-end="url(#arr-mig-3)"/>
+  <text x="390" y="126" text-anchor="middle" class="small">A SELECT only needs ACCESS SHARE, which the report already holds, so on its own it would run.</text>
+  <text x="390" y="144" text-anchor="middle" class="small">It waits because it conflicts with the ALTER queued ahead of it. Every new query joins the line.</text>
+  <rect class="box accent" x="110" y="166" width="560" height="50" rx="6"/>
+  <text x="390" y="186" text-anchor="middle">Fix: SET lock_timeout = '2s' for the migration session</text>
+  <text x="390" y="204" text-anchor="middle" class="small">the ALTER fails fast, the queue drains, and the runner retries later</text>
+</svg>
+<figcaption>The "instant" migration never ran a single row of work, yet every query on the table stopped until the report finished. The example below reproduces this on a real Postgres.</figcaption>
+</figure>
+<p>Set <code>lock_timeout</code> for every migration session, so a blocked DDL statement fails within seconds instead of taking the table hostage. Retry it, ideally when traffic is low. Also watch for the opposite case: a lock you <em>did</em> get, held too long, because the statement rewrites the table.</p>
+
+<h3>Safe and unsafe operations (Postgres)</h3>
+<table>
+  <tr><th>You want to…</th><th>Risky way</th><th>Safer way</th></tr>
+  <tr><td>Add a column</td><td>with a volatile default such as <code>clock_timestamp()</code> or a random value: rewrites the whole table under <code>ACCESS EXCLUSIVE</code></td><td>nullable, or with a constant default (metadata only since PG 11); still set <code>lock_timeout</code></td></tr>
+  <tr><td>Add an index</td><td><code>CREATE INDEX</code>: blocks writes (not reads) until it finishes</td><td><code>CREATE INDEX CONCURRENTLY</code>: no write lock, two table scans, can't run in a transaction block, leaves an <code>INVALID</code> index on failure that you must drop and retry</td></tr>
+  <tr><td>Make a column <code>NOT NULL</code></td><td><code>SET NOT NULL</code> directly: full scan under <code>ACCESS EXCLUSIVE</code></td><td><code>CHECK (col IS NOT NULL) NOT VALID</code>, then <code>VALIDATE CONSTRAINT</code>, then <code>SET NOT NULL</code> (skips the scan when a valid check proves it)</td></tr>
+  <tr><td>Add a foreign key or check</td><td>plain <code>ADD CONSTRAINT</code>: scans the table while holding its lock</td><td>add it <code>NOT VALID</code> (instant), then <code>VALIDATE CONSTRAINT</code>, which takes only <code>SHARE UPDATE EXCLUSIVE</code> and lets reads and writes continue</td></tr>
+  <tr><td>Change a column type</td><td><code>ALTER COLUMN TYPE</code>: usually rewrites the table and rebuilds its indexes</td><td>expand/contract with a new column; in-place is fine only for binary-compatible changes, such as raising a <code>varchar</code> limit</td></tr>
+</table>
+<p>MySQL has its own rules. Many <code>ALTER TABLE</code> forms can run with <code>ALGORITHM=INSTANT</code> or <code>INPLACE</code>, and the ones that can't are usually done with an online schema change tool. <strong>pt-online-schema-change</strong> builds a copy of the table and keeps it in sync with triggers. <strong>gh-ost</strong> (GitHub) builds the same "ghost" table but follows the binary log instead of using triggers, so it can pause and throttle its own load. Both swap tables at the end.</p>
+
+<h3>Rollbacks: down migrations vs roll forward</h3>
+<p>Most tools let you pair every <em>up</em> with a <em>down</em>. Handy in development, weaker in production: a down that drops a column also drops everything written to it since the up ran, some changes (dropped data, lossy type changes) can't be reversed at all, and an untested down is a second outage. Teams with zero-downtime deploys usually <strong>roll forward</strong>: fix a bad migration with a new one, and keep the code rollback-safe with expand/contract, so rolling back the <em>app</em> never needs a schema rollback. Your real recovery plan is tested <a href="#backups">backups</a>.</p>
+
+<h2>Example</h2>
+<p><strong>goose on a real Postgres, plus a batched backfill and the lock queue.</strong> The test starts a real PostgreSQL 18 server in-process with <code>fergusstrange/embedded-postgres</code>, then uses <code>pressly/goose/v3</code> to apply three migrations: create a table, expand it with two new columns, and index one of them concurrently.</p>
+<pre><code>-- migrations/00001_create_customers.sql
+-- +goose Up
+CREATE TABLE customers (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    full_name  TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- +goose Down
+DROP TABLE customers;
+
+-- migrations/00002_expand_name_columns.sql
+-- Expand step: new nullable columns. Old code ignores them, so this
+-- is safe to run while the previous release is still serving traffic.
+-- +goose Up
+ALTER TABLE customers ADD COLUMN first_name TEXT;
+ALTER TABLE customers ADD COLUMN last_name  TEXT;
+
+-- +goose Down
+ALTER TABLE customers DROP COLUMN last_name;
+ALTER TABLE customers DROP COLUMN first_name;
+
+-- migrations/00003_index_last_name.sql
+-- CREATE INDEX CONCURRENTLY cannot run inside a transaction block.
+-- +goose NO TRANSACTION
+-- +goose Up
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_customers_last_name
+    ON customers (last_name);
+
+-- +goose Down
+DROP INDEX CONCURRENTLY IF EXISTS idx_customers_last_name;</code></pre>
+<p>The files are embedded in the binary, so what runs is what was reviewed. The backfill walks the primary key in batches of 1,000 rows (keyset, not <code>OFFSET</code>) and commits each batch on its own.</p>
+<pre><code>package migrations
+
+import (
+	"context"
+	"database/sql"
+	"embed"
+	"io/fs"
+	"time"
+
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
+)
+
+//go:embed migrations/*.sql
+var embedded embed.FS
+
+// NewMigrator returns a goose provider over the SQL files compiled into
+// the binary. The session locker takes a Postgres advisory lock, so if
+// several pods start at once only one of them applies migrations.
+func NewMigrator(db *sql.DB) (*goose.Provider, error) {
+	dir, err := fs.Sub(embedded, "migrations")
+	if err != nil {
+		return nil, err
+	}
+	locker, err := lock.NewPostgresSessionLocker()
+	if err != nil {
+		return nil, err
+	}
+	return goose.NewProvider(goose.DialectPostgres, db, dir,
+		goose.WithSessionLocker(locker))
+}
+
+// Backfill fills first_name/last_name in small batches. Each batch is its
+// own short transaction, so row locks are held for milliseconds and
+// replicas can keep up. It walks the primary key (keyset), never OFFSET.
+func Backfill(ctx context.Context, db *sql.DB, batchSize int, pause time.Duration) (batches, rows int, err error) {
+	const q = &#96;
+WITH batch AS (
+    SELECT id FROM customers
+    WHERE id &gt; $1 AND first_name IS NULL
+    ORDER BY id
+    LIMIT $2
+), done AS (
+    UPDATE customers c
+    SET first_name = split_part(c.full_name, ' ', 1),
+        last_name  = substr(c.full_name, strpos(c.full_name, ' ') + 1)
+    FROM batch WHERE c.id = batch.id
+    RETURNING c.id
+)
+SELECT count(*), coalesce(max(id), 0) FROM done&#96;
+
+	var lastID int64
+	for {
+		var n int
+		var maxID int64
+		if err := db.QueryRowContext(ctx, q, lastID, batchSize).Scan(&amp;n, &amp;maxID); err != nil {
+			return batches, rows, err
+		}
+		if n == 0 {
+			return batches, rows, nil
+		}
+		batches++
+		rows += n
+		lastID = maxID
+		select { // throttle: give the primary and the replicas room to breathe
+		case &lt;-ctx.Done():
+			return batches, rows, ctx.Err()
+		case &lt;-time.After(pause):
+		}
+	}
+}</code></pre>
+<p>The test applies the migrations, prints the version table, runs <code>Up</code> a second time, then backfills 10,000 rows that the "old release" inserted without the new columns. The <code>// Output:</code> block is checked by <code>go test</code>.</p>
+<pre><code>package migrations
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func Example_migrateAndBackfill() {
+	ctx := context.Background()
+	m, err := NewMigrator(db)
+	if err != nil {
+		panic(err)
+	}
+	results, err := m.Up(ctx)
+	if err != nil {
+		panic(err)
+	}
+	for _, r := range results {
+		fmt.Println("applied", r.Source.Path)
+	}
+
+	// The tracking table goose keeps: one row per applied version.
+	rows, _ := db.QueryContext(ctx,
+		&#96;SELECT version_id, is_applied FROM goose_db_version ORDER BY id&#96;)
+	for rows.Next() {
+		var v int64
+		var ok bool
+		rows.Scan(&amp;v, &amp;ok)
+		fmt.Printf("goose_db_version: version_id=%d is_applied=%t&#92;n", v, ok)
+	}
+	rows.Close()
+
+	// Running it again is a no-op: every file is already recorded.
+	again, _ := m.Up(ctx)
+	fmt.Println("second run applied:", len(again))
+
+	// 10,000 existing rows written by the old release.
+	db.ExecContext(ctx, &#96;INSERT INTO customers (full_name)
+		SELECT (ARRAY['Ada','Grace','Alan','Edsger'])[1 + g % 4] || ' Example' || g
+		FROM generate_series(1, 10000) g&#96;)
+
+	batches, n, err := Backfill(ctx, db, 1000, time.Millisecond)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("backfill: %d rows in %d batches&#92;n", n, batches)
+
+	var missing int
+	db.QueryRowContext(ctx,
+		&#96;SELECT count(*) FROM customers WHERE last_name IS NULL&#96;).Scan(&amp;missing)
+	var first, last string
+	db.QueryRowContext(ctx,
+		&#96;SELECT first_name, last_name FROM customers WHERE id = 42&#96;).Scan(&amp;first, &amp;last)
+	fmt.Printf("rows still NULL: %d, id 42 -&gt; %q %q&#92;n", missing, first, last)
+
+	// Output:
+	// applied 00001_create_customers.sql
+	// applied 00002_expand_name_columns.sql
+	// applied 00003_index_last_name.sql
+	// goose_db_version: version_id=0 is_applied=true
+	// goose_db_version: version_id=1 is_applied=true
+	// goose_db_version: version_id=2 is_applied=true
+	// goose_db_version: version_id=3 is_applied=true
+	// second run applied: 0
+	// backfill: 10000 rows in 10 batches
+	// rows still NULL: 0, id 42 -&gt; "Alan" "Example42"
+}</code></pre>
+<p>Version 0 is the row goose writes when it creates its table. The second <code>Up</code> applies nothing, which is what makes "run migrations on every deploy" safe.</p>
+<p>The second test reproduces the lock queue from the diagram. A report transaction holds an <code>ACCESS SHARE</code> lock on <code>orders</code>. An <code>ALTER TABLE … ADD COLUMN … DEFAULT 'basic'</code>, which is metadata-only, queues behind it. Then an ordinary <code>SELECT</code> with a 300 ms deadline tries its luck. (Helpers not shown: <code>waitingOnLocks</code> polls <code>pg_stat_activity</code> for <code>wait_event_type = 'Lock'</code>; <code>readWithin</code> runs <code>SELECT count(*)</code> under a deadline.)</p>
+<pre><code>func Example_lockQueue() {
+	ctx := context.Background()
+	db.ExecContext(ctx, &#96;CREATE TABLE orders (id int, total_cents int)&#96;)
+
+	// 1. A long-running report holds ACCESS SHARE on orders until it commits.
+	report, _ := db.BeginTx(ctx, nil)
+	report.ExecContext(ctx, &#96;SELECT count(*) FROM orders&#96;)
+
+	// 2. A migration without lock_timeout wants ACCESS EXCLUSIVE and queues.
+	migration, _ := db.Conn(ctx)
+	done := make(chan error, 1)
+	go func() {
+		_, err := migration.ExecContext(ctx,
+			&#96;ALTER TABLE orders ADD COLUMN tier TEXT NOT NULL DEFAULT 'basic'&#96;)
+		done &lt;- err
+	}()
+	fmt.Println("sessions waiting on a lock:", waitingOnLocks(ctx))
+
+	// 3. Now every plain SELECT queues behind the ALTER, not just the report.
+	fmt.Println("no lock_timeout:", readWithin(ctx, 300*time.Millisecond))
+
+	report.Rollback()
+	fmt.Println("ALTER after report ends:", errText(&lt;-done))
+	migration.ExecContext(ctx, &#96;ALTER TABLE orders DROP COLUMN tier&#96;)
+
+	// 4. Same situation, but the migration gives up after 200ms instead.
+	report, _ = db.BeginTx(ctx, nil)
+	report.ExecContext(ctx, &#96;SELECT count(*) FROM orders&#96;)
+	migration.ExecContext(ctx, &#96;SET lock_timeout = '200ms'&#96;)
+	_, err := migration.ExecContext(ctx,
+		&#96;ALTER TABLE orders ADD COLUMN tier TEXT NOT NULL DEFAULT 'basic'&#96;)
+	fmt.Println("ALTER with lock_timeout:", errText(err))
+	fmt.Println("with lock_timeout:", readWithin(ctx, 300*time.Millisecond))
+	report.Rollback()
+	migration.Close()
+
+	// Output:
+	// sessions waiting on a lock: 1
+	// no lock_timeout: app read BLOCKED (context deadline exceeded)
+	// ALTER after report ends: OK
+	// ALTER with lock_timeout: ERROR: canceling statement due to lock timeout (SQLSTATE 55P03)
+	// with lock_timeout: app read OK
+}</code></pre>
+<p>Real output of <code>go test -v</code> (timings are from a laptop run; most of the 7 s is starting Postgres):</p>
+<pre><code>=== RUN   Example_lockQueue
+--- PASS: Example_lockQueue (0.62s)
+=== RUN   Example_migrateAndBackfill
+--- PASS: Example_migrateAndBackfill (0.11s)
+PASS
+ok  	example.com/migrations	7.160s</code></pre>
+<p>Without <code>lock_timeout</code>, a read that has nothing to do with the migration is blocked until the report ends. With <code>lock_timeout = '200ms'</code>, the migration fails with SQLSTATE <code>55P03</code> and the same read goes straight through. The runner can retry the migration later; a timed-out migration costs you a retry, a queued one costs you an outage.</p>
+
+<p><strong>Real-world scenario.</strong> Picture an orders service with a 60 M-row <code>orders</code> table and about 2,000 queries per second on it. A developer adds <code>ALTER TABLE orders ADD COLUMN source TEXT DEFAULT 'web'</code>. In review it looks instant, and on PG 11+ it is. The deploy runs at 14:00, while a finance export has been reading <code>orders</code> in one transaction for 20 minutes. The <code>ALTER</code> queues, and so does every query behind it. Within a few seconds the app's connection pool is full of waiting queries, health checks time out, and the load balancer starts failing requests. Nothing recovers until someone cancels the export or the migration. The same migration with <code>SET lock_timeout = '2s'</code> fails once, the deploy pipeline retries a few minutes later, and nobody notices. The index on <code>source</code> goes in a separate <code>CONCURRENTLY</code> migration, and the backfill of old rows (if any are needed) runs in batches of 5,000 with a short sleep while someone watches replica lag.</p>
+
+<h2>Trade-offs &amp; pitfalls</h2>
+<ul>
+  <li><strong>DDL with no <code>lock_timeout</code>.</strong> The most common way a "trivial" migration causes an outage. One long transaction plus one queued <code>ACCESS EXCLUSIVE</code> request stops every query on the table. Set it in every migration session (and a <code>statement_timeout</code> too).</li>
+  <li><strong>Deploying code and a breaking schema change together.</strong> Renames and drops break the release that is still running during a rolling deploy, and they break your rollback. Use expand/contract, and drop things one release later.</li>
+  <li><strong>Mixing <code>CREATE INDEX CONCURRENTLY</code> with a transaction.</strong> It fails inside a transaction block, and most runners wrap each file in one. Mark the file (goose: <code>-- +goose NO TRANSACTION</code>) and give it a file of its own. Check for leftover <code>INVALID</code> indexes after a failure.</li>
+  <li><strong>One huge backfill <code>UPDATE</code>.</strong> Long row locks, replica lag, bloat, and if it fails after 40 minutes, it all rolls back. Batch it, commit per batch, make it resumable (keyset on the primary key, <code>WHERE new_col IS NULL</code>) and idempotent.</li>
+  <li><strong>Editing a migration that already ran.</strong> Production ran the old text, so environments silently diverge. Flyway and Atlas catch it with checksums; with goose and golang-migrate only review does. Write a new migration.</li>
+  <li><strong>Testing only on an empty database.</strong> A migration that takes 50 ms in CI can take 30 minutes on production data. Test risky ones against a production-sized copy, and read the lock level of each statement in the docs before you ship it.</li>
+</ul>
+
+<div class="callout warn"><strong>"Instant" DDL can still stop the world.</strong> A metadata-only <code>ALTER TABLE</code> needs an <code>ACCESS EXCLUSIVE</code> lock for a moment. If it has to wait for that moment, everything else waits behind it. <code>lock_timeout</code> is not optional.</div>
+
+<div class="callout tip"><strong>Key takeaways</strong>
+<ul>
+  <li>Migrations are versioned files in git, applied in order by one runner, and recorded in a table. Never change the schema any other way, and never edit an applied file.</li>
+  <li>Every schema state must work with the current and the previous release. Split breaking changes into expand, dual write, backfill, switch reads, contract.</li>
+  <li>The danger is lock waits, not just long rewrites: set <code>lock_timeout</code>, use <code>CONCURRENTLY</code> and <code>NOT VALID</code> + <code>VALIDATE</code>, and backfill in small batches.</li>
+  <li>Plan to roll forward. Rollback-safe code beats down migrations.</li>
+</ul></div>
+
+<p><strong>Related:</strong> <a href="#schema-versioning">Schema Versioning</a> · <a href="#rolling-deployments">Rolling Deployments</a> · <a href="#ci-cd">CI/CD</a> · <a href="#rollbacks">Rollbacks</a> · <a href="#database-indexing">Database Indexing</a> · <a href="#backups">Backups</a></p>
+`;
